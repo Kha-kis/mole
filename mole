@@ -2171,14 +2171,15 @@ Examples:
         return cmd_stop(args)
     elif args.command == "logs":
         return cmd_logs(args)
-    elif args.command == "run" or args.command is None:
-        # Default to run
+    elif args.command == "run":
         config_path = getattr(args, 'config', DEFAULT_CONFIG_FILE)
         mole = Mole(config_path)
         asyncio.run(mole.run())
         return 0
-
-    return 0
+    else:
+        # No command provided - show help
+        parser.print_help()
+        return 1
 
 
 if __name__ == "__main__":
