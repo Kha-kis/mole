@@ -1,0 +1,72 @@
+# MOLE Configuration Example
+# Copy this to /etc/mole/config and fill in your values
+# Or run: sudo mole init
+
+# ═══════════════════════════════════════════════════════════════════
+# VPN Provider
+# ═══════════════════════════════════════════════════════════════════
+
+# Currently supported: pia
+VPN_PROVIDER=pia
+
+# ═══════════════════════════════════════════════════════════════════
+# PIA (Private Internet Access) Settings
+# ═══════════════════════════════════════════════════════════════════
+
+PIA_USER=your_pia_username
+PIA_PASS=your_pia_password
+
+# Region ID (see: https://serverlist.piaservers.net/vpninfo/servers/v6)
+# Examples: us_east, us_west, ca_toronto, uk_london, nl_amsterdam, de_berlin
+PIA_REGION=ca_toronto
+
+# ═══════════════════════════════════════════════════════════════════
+# Network Namespace Settings
+# ═══════════════════════════════════════════════════════════════════
+
+# Namespace name
+NETNS_NAME=vpn
+
+# veth pair IP addresses (host <-> vpn namespace communication)
+VETH_HOST_IP=10.200.200.1
+VETH_VPN_IP=10.200.200.2
+
+# Host network interface for NAT masquerade
+# Find yours with: ip route | grep default
+HOST_INTERFACE=eth0
+
+# ═══════════════════════════════════════════════════════════════════
+# Torrent Client Settings
+# ═══════════════════════════════════════════════════════════════════
+
+# Currently supported: qbittorrent
+TORRENT_CLIENT=qbittorrent
+
+# qBittorrent Web API URL
+# Default port is 8080, adjust if you changed it
+QB_API_URL=http://localhost:8080/api/v2/app
+
+# ═══════════════════════════════════════════════════════════════════
+# Timing Settings (in seconds)
+# ═══════════════════════════════════════════════════════════════════
+
+# How often to renew VPN token/connection (default: 20 hours)
+RENEWAL_INTERVAL=72000
+
+# How often to refresh port forwarding (default: 15 minutes)
+# PIA requires refresh every 15 min to keep port alive
+KEEPALIVE_INTERVAL=900
+
+# How often to check VPN health (default: 1 minute)
+WATCHDOG_INTERVAL=60
+
+# How many health check failures before reconnecting
+WATCHDOG_MAX_FAILURES=3
+
+# ═══════════════════════════════════════════════════════════════════
+# Advanced Settings (usually don't need to change)
+# ═══════════════════════════════════════════════════════════════════
+
+# CONFIG_DIR=/etc/mole
+# STATE_DIR=/var/lib/mole
+# WG_CONF=/etc/wireguard/mole.conf

@@ -1,0 +1,1148 @@
+#!/usr/bin/env python3
+"""
+╔═══════════════════════════════════════════════════════════════════════════╗
+║  MOLE - Managed Obfuscated Link Environment                               ║
+║  A VPN tunnel manager with port forwarding and torrent client integration ║
+╚═══════════════════════════════════════════════════════════════════════════╝
+"""
+
+import asyncio
+import subprocess
+import json
+import base64
+import logging
+import signal
+import sys
+import os
+from abc import ABC, abstractmethod
+from pathlib import Path
+from datetime import datetime, timedelta
+from dataclasses import dataclass
+from typing import Optional, Dict, Any
+import urllib.request
+import urllib.parse
+import ssl
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Version
+# ═══════════════════════════════════════════════════════════════════════════
+
+VERSION = "0.1.0"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Default Paths (FHS compliant)
+# ═══════════════════════════════════════════════════════════════════════════
+
+DEFAULT_CONFIG_DIR = "/etc/mole"
+DEFAULT_CONFIG_FILE = "/etc/mole/config"
+DEFAULT_STATE_DIR = "/var/lib/mole"
+DEFAULT_WG_CONF = "/etc/wireguard/mole.conf"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIA CA Certificate (embedded for init)
+# ═══════════════════════════════════════════════════════════════════════════
+
+PIA_CA_CERT = """-----BEGIN CERTIFICATE-----
+MIIHqzCCBZOgAwIBAgIJAJ0u+vODZJntMA0GCSqGSIb3DQEBDQUAMIHoMQswCQYD
+VQQGEwJVUzELMAkGA1UECBMCQ0ExEzARBgNVBAcTCkxvc0FuZ2VsZXMxIDAeBgNV
+BAoTF1ByaXZhdGUgSW50ZXJuZXQgQWNjZXNzMSAwHgYDVQQLExdQcml2YXRlIElu
+dGVybmV0IEFjY2VzczEgMB4GA1UEAxMXUHJpdmF0ZSBJbnRlcm5ldCBBY2Nlc3Mx
+IDAeBgNVBCkTF1ByaXZhdGUgSW50ZXJuZXQgQWNjZXNzMS8wLQYJKoZIhvcNAQkB
+FiBzZWN1cmVAcHJpdmF0ZWludGVybmV0YWNjZXNzLmNvbTAeFw0xNDA0MTcxNzQw
+MzNaFw0zNDA0MTIxNzQwMzNaMIHoMQswCQYDVQQGEwJVUzELMAkGA1UECBMCQ0Ex
+EzARBgNVBAcTCkxvc0FuZ2VsZXMxIDAeBgNVBAoTF1ByaXZhdGUgSW50ZXJuZXQg
+QWNjZXNzMSAwHgYDVQQLExdQcml2YXRlIEludGVybmV0IEFjY2VzczEgMB4GA1UE
+AxMXUHJpdmF0ZSBJbnRlcm5ldCBBY2Nlc3MxIDAeBgNVBCkTF1ByaXZhdGUgSW50
+ZXJuZXQgQWNjZXNzMS8wLQYJKoZIhvcNAQkBFiBzZWN1cmVAcHJpdmF0ZWludGVy
+bmV0YWNjZXNzLmNvbTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIBALVk
+hjumaqBbL8aSgj6xbX1QPTfTd1qHsAZd2B97m8Vw31c/2yQgZNf5qZY0+jOIHULN
+De4R9TIvyBEbvnAg/OkPw8n/+ScgYOeH876VUXzjLDBnDb8DLr/+w9oVsuDeFJ9K
+V2UFM1OYX0SnkHnrYAN2QLF98ESK4NCSU01h5zkcgmQ+qKSfA9Ny0/UpsKPBFqsQ
+25NvjDWFhCpeqCHKUJ4Be27CDbSl7lAkBuHMPHJs8f8xPgAbHRXZOxVCpayZ2SND
+fCwsnGWpWFoMGvdMbygngCn6jA/W1VSFOlRlfLuuGe7QFfDwA0jaLCxuWt/BgZyl
+p7tAzYKR8lnWmtUCPm4+BtjyVDYtDCiGBD9Z4P13RFWvJHw5aapx/5W/CuvVyI7p
+Kwvc2IT+KPxCUhH1XI8ca5RN3C9NoPJJf6qpg4g0rJH3aaWkoMRrYvQ+5PXXYUzj
+tRHImghRGd/ydERYoAZXuGSbPkm9Y/p2X8unLcW+F0xpJD98+ZI+tzSsI99Zs5wi
+jSUGYr9/j18KHFTMQ8n+1jauc5bCCegN27dPeKXNSZ5riXFL2XX6BkY68y58UaNz
+meGMiUL9BOV1iV+PMb7B7PYs7oFLjAhh0EdyvfHkrh/ZV9BEhtFa7yXp8XR0J6vz
+1YV9R6DYJmLjOEbhU8N0gc3tZm4Qz39lIIG6w3FDAgMBAAGjggFUMIIBUDAdBgNV
+HQ4EFgQUrsRtyWJftjpdRM0+925Y6Cl08SUwggEfBgNVHSMEggEWMIIBEoAUrsRt
+yWJftjpdRM0+925Y6Cl08SWhge6kgeswgegxCzAJBgNVBAYTAlVTMQswCQYDVQQI
+EwJDQTETMBEGA1UEBxMKTG9zQW5nZWxlczEgMB4GA1UEChMXUHJpdmF0ZSBJbnRl
+cm5ldCBBY2Nlc3MxIDAeBgNVBAsTF1ByaXZhdGUgSW50ZXJuZXQgQWNjZXNzMSAw
+HgYDVQQDExdQcml2YXRlIEludGVybmV0IEFjY2VzczEgMB4GA1UEKRMXUHJpdmF0
+ZSBJbnRlcm5ldCBBY2Nlc3MxLzAtBgkqhkiG9w0BCQEWIHNlY3VyZUBwcml2YXRl
+aW50ZXJuZXRhY2Nlc3MuY29tggkAnS7684Nkme0wDAYDVR0TBAUwAwEB/zANBgkq
+hkiG9w0BAQ0FAAOCAgEAJsfhsPk3r8kLXLxY+v+vHzbr4ufNtqnL9/1Uuf8NrsCt
+pXAoyZ0YqfbkWx3NHTZ7OE9ZRhdMP/RqHQE1p4N4Sa1nZKhTKasV6KhHDqSCt/dv
+Em89xWm2MVA7nyzQxVlHa9AkcBaemcXEiyT19XdpiXOP4Vhs+J1R5m8zQOxZlV1G
+tF9vsXmJqWZpOVPmZ8f35BCsYPvv4yMewnrtAC8PFEK/bOPeYcKN50bol22QYaZu
+LfpkHfNiFTnfMh8sl/ablPyNY7DUNiP5DRcMdIwmfGQxR5WEQoHL3yPJ42LkB5zs
+6jIm26DGNXfwura/mi105+ENH1CaROtRYwkiHb08U6qLXXJz80mWJkT90nr8Asj3
+5xN2cUppg74nG3YVav/38P48T56hG1NHbYF5uOCske19F6wi9maUoto/3vEr0rnX
+JUp2KODmKdvBI7co245lHBABWikk8VfejQSlCtDBXn644ZMtAdoxKNfR2WTFVEwJ
+iyd1Fzx0yujuiXDROLhISLQDRjVVAvawrAtLZWYK31bY7KlezPlQnl/D9Asxe85l
+8jO5+0LdJ6VyOs/Hd4w52alDW/MFySDZSfQHMTIc30hLBJ8OnCEIvluVQQ2UQvoW
++no177N9L2Y+M9TcTA62ZyMXShHQGeh20rb4kK8f+iFX8NxtdHVSkxMEFSfDDyQ=
+-----END CERTIFICATE-----
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Template Config
+# ═══════════════════════════════════════════════════════════════════════════
+
+CONFIG_TEMPLATE = """# MOLE Configuration
+# https://github.com/your-repo/mole
+
+# VPN Provider (currently only 'pia' supported)
+VPN_PROVIDER=pia
+
+# PIA Credentials
+PIA_USER=your_username
+PIA_PASS=your_password
+PIA_REGION=ca_toronto
+
+# Network Namespace
+NETNS_NAME=vpn
+VETH_HOST_IP=10.200.200.1
+VETH_VPN_IP=10.200.200.2
+
+# Host network interface (for NAT)
+HOST_INTERFACE=eth0
+
+# Torrent Client
+TORRENT_CLIENT=qbittorrent
+QB_API_URL=http://localhost:8080/api/v2/app
+
+# Timing (seconds)
+RENEWAL_INTERVAL=72000
+KEEPALIVE_INTERVAL=900
+WATCHDOG_INTERVAL=60
+WATCHDOG_MAX_FAILURES=3
+"""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════
+
+def load_config(config_path: str = DEFAULT_CONFIG_FILE) -> Dict[str, str]:
+    """Load configuration from config file and environment variables"""
+    config = {}
+
+    # Load from config file
+    config_file = Path(config_path)
+    if config_file.exists():
+        with open(config_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    key, _, value = line.partition('=')
+                    config[key.strip()] = value.strip()
+
+    # Environment variables override config file
+    for key in config.keys():
+        if key in os.environ:
+            config[key] = os.environ[key]
+
+    # Also check for any MOLE_ prefixed env vars
+    for key, value in os.environ.items():
+        if key.startswith('MOLE_'):
+            config[key[5:]] = value  # Strip MOLE_ prefix
+
+    return config
+
+
+class Config:
+    """Application configuration"""
+    def __init__(self, config_path: str = DEFAULT_CONFIG_FILE):
+        self._data = load_config(config_path)
+
+    def get(self, key: str, default: Any = None) -> Any:
+        return self._data.get(key, default)
+
+    def get_int(self, key: str, default: int = 0) -> int:
+        try:
+            return int(self._data.get(key, default))
+        except (ValueError, TypeError):
+            return default
+
+    @property
+    def vpn_provider(self) -> str:
+        return self.get('VPN_PROVIDER', 'pia')
+
+    @property
+    def netns(self) -> str:
+        return self.get('NETNS_NAME', 'vpn')
+
+    @property
+    def veth_host_ip(self) -> str:
+        return self.get('VETH_HOST_IP', '10.200.200.1')
+
+    @property
+    def veth_vpn_ip(self) -> str:
+        return self.get('VETH_VPN_IP', '10.200.200.2')
+
+    @property
+    def host_interface(self) -> str:
+        return self.get('HOST_INTERFACE', 'eth0')
+
+    @property
+    def wg_conf(self) -> str:
+        return self.get('WG_CONF', DEFAULT_WG_CONF)
+
+    @property
+    def config_dir(self) -> str:
+        return self.get('CONFIG_DIR', DEFAULT_CONFIG_DIR)
+
+    @property
+    def state_dir(self) -> str:
+        return self.get('STATE_DIR', DEFAULT_STATE_DIR)
+
+    @property
+    def torrent_client(self) -> str:
+        return self.get('TORRENT_CLIENT', 'qbittorrent')
+
+    @property
+    def qb_api_url(self) -> str:
+        return self.get('QB_API_URL', 'http://localhost:8080/api/v2/app')
+
+    @property
+    def renewal_interval(self) -> int:
+        return self.get_int('RENEWAL_INTERVAL', 72000)
+
+    @property
+    def keepalive_interval(self) -> int:
+        return self.get_int('KEEPALIVE_INTERVAL', 900)
+
+    @property
+    def watchdog_interval(self) -> int:
+        return self.get_int('WATCHDOG_INTERVAL', 60)
+
+    @property
+    def watchdog_max_failures(self) -> int:
+        return self.get_int('WATCHDOG_MAX_FAILURES', 3)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Logging Setup
+# ═══════════════════════════════════════════════════════════════════════════
+
+def setup_logging(quiet: bool = False):
+    level = logging.WARNING if quiet else logging.INFO
+    logging.basicConfig(
+        level=level,
+        format='%(asctime)s [%(levelname)s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    return logging.getLogger("mole")
+
+log = logging.getLogger("mole")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# State Management
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class VPNState:
+    """Current VPN connection state"""
+    token: Optional[str] = None
+    token_expires: Optional[datetime] = None
+    server_ip: Optional[str] = None
+    server_hostname: Optional[str] = None
+    server_vip: Optional[str] = None
+    peer_ip: Optional[str] = None
+    port: Optional[int] = None
+    port_payload: Optional[str] = None
+    port_signature: Optional[str] = None
+    port_expires: Optional[datetime] = None
+    connected: bool = False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Utilities
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_cmd(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a shell command"""
+    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def run_in_netns(cmd: list, netns: str, check: bool = True) -> subprocess.CompletedProcess:
+    """Run a command inside a network namespace"""
+    return run_cmd(["ip", "netns", "exec", netns] + cmd, check=check)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# VPN Provider Interface
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VPNProvider(ABC):
+    """Abstract base class for VPN providers"""
+
+    def __init__(self, config: Config, state: VPNState):
+        self.config = config
+        self.state = state
+
+    @abstractmethod
+    async def authenticate(self) -> bool:
+        """Authenticate with the VPN provider and get a token"""
+        pass
+
+    @abstractmethod
+    async def get_server(self) -> bool:
+        """Get server information for connection"""
+        pass
+
+    @abstractmethod
+    async def register_wireguard(self) -> bool:
+        """Register WireGuard keys and get connection config"""
+        pass
+
+    @abstractmethod
+    async def setup_port_forward(self) -> bool:
+        """Setup port forwarding"""
+        pass
+
+    @abstractmethod
+    async def refresh_port_forward(self) -> bool:
+        """Refresh/keepalive port forwarding"""
+        pass
+
+    @property
+    @abstractmethod
+    def name(self) -> str:
+        """Provider name"""
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PIA Provider Implementation
+# ═══════════════════════════════════════════════════════════════════════════
+
+class PIAProvider(VPNProvider):
+    """Private Internet Access VPN provider"""
+
+    @property
+    def name(self) -> str:
+        return "PIA"
+
+    @property
+    def _user(self) -> str:
+        return self.config.get('PIA_USER', '')
+
+    @property
+    def _pass(self) -> str:
+        return self.config.get('PIA_PASS', '')
+
+    @property
+    def _region(self) -> str:
+        return self.config.get('PIA_REGION', 'ca_toronto')
+
+    @property
+    def _ca_cert(self) -> str:
+        return f"{self.config.config_dir}/providers/pia-ca.crt"
+
+    async def authenticate(self) -> bool:
+        """Get PIA authentication token"""
+        log.info("Authenticating with PIA...")
+
+        try:
+            result = run_cmd([
+                "curl", "-s", "--location", "--request", "POST",
+                "https://www.privateinternetaccess.com/api/client/v2/token",
+                "--form", f"username={self._user}",
+                "--form", f"password={self._pass}"
+            ], check=False)
+
+            if result.returncode == 0 and result.stdout:
+                data = json.loads(result.stdout)
+                if "token" in data:
+                    self.state.token = data["token"]
+                    self.state.token_expires = datetime.now() + timedelta(hours=24)
+                    log.info("Authentication successful")
+                    return True
+
+            log.error(f"Authentication failed: {result.stderr or result.stdout}")
+        except Exception as e:
+            log.error(f"Authentication error: {e}")
+
+        return False
+
+    async def get_server(self) -> bool:
+        """Get PIA server for region"""
+        log.info(f"Getting server for region: {self._region}")
+
+        try:
+            with urllib.request.urlopen(
+                "https://serverlist.piaservers.net/vpninfo/servers/v6",
+                timeout=30
+            ) as resp:
+                data = resp.readline().decode()
+                servers = json.loads(data)
+
+            for region in servers.get("regions", []):
+                if region["id"] == self._region:
+                    wg_servers = region.get("servers", {}).get("wg", [])
+                    if wg_servers:
+                        server = wg_servers[0]
+                        self.state.server_ip = server["ip"]
+                        self.state.server_hostname = server["cn"]
+                        log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
+                        return True
+
+            log.error(f"Region not found: {self._region}")
+        except Exception as e:
+            log.error(f"Failed to get server: {e}")
+
+        return False
+
+    async def register_wireguard(self) -> bool:
+        """Register WireGuard with PIA"""
+        log.info("Registering WireGuard...")
+
+        try:
+            # Generate keys
+            result = run_cmd(["wg", "genkey"])
+            priv_key = result.stdout.strip()
+
+            proc = subprocess.run(["wg", "pubkey"], input=priv_key, capture_output=True, text=True)
+            pub_key = proc.stdout.strip()
+
+            # Register with PIA API
+            ctx = ssl.create_default_context()
+            ctx.load_verify_locations(self._ca_cert)
+
+            params = urllib.parse.urlencode({"pt": self.state.token, "pubkey": pub_key})
+            url = f"https://{self.state.server_hostname}:1337/addKey?{params}"
+
+            req = urllib.request.Request(url)
+            req.add_header("Host", self.state.server_hostname)
+
+            # Patch socket to connect to correct IP
+            import socket
+            orig_create_connection = socket.create_connection
+            def patched_create_connection(address, *args, **kwargs):
+                host, port = address
+                if host == self.state.server_hostname:
+                    return orig_create_connection((self.state.server_ip, port), *args, **kwargs)
+                return orig_create_connection(address, *args, **kwargs)
+
+            socket.create_connection = patched_create_connection
+            try:
+                with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+                    result = json.loads(resp.read().decode())
+            finally:
+                socket.create_connection = orig_create_connection
+
+            if result.get("status") == "OK":
+                self.state.peer_ip = result["peer_ip"]
+                self.state.server_vip = result["server_vip"]
+
+                # Write WireGuard config
+                wg_config = f"""[Interface]
+PrivateKey = {priv_key}
+Address = {result['peer_ip']}/32
+DNS = {result['dns_servers'][0]}
+
+[Peer]
+PublicKey = {result['server_key']}
+Endpoint = {self.state.server_ip}:{result['server_port']}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 25
+"""
+                Path(self.config.wg_conf).write_text(wg_config)
+
+                # Save state
+                state_dir = Path(self.config.state_dir)
+                state_dir.mkdir(parents=True, exist_ok=True)
+                (state_dir / "server_ip").write_text(self.state.server_ip)
+                (state_dir / "hostname").write_text(self.state.server_hostname)
+                (state_dir / "server_vip").write_text(self.state.server_vip)
+
+                log.info(f"WireGuard registered, peer IP: {self.state.peer_ip}")
+                return True
+            else:
+                log.error(f"WireGuard registration failed: {result}")
+        except Exception as e:
+            log.error(f"WireGuard registration error: {e}")
+
+        return False
+
+    async def setup_port_forward(self) -> bool:
+        """Setup PIA port forwarding"""
+        log.info("Setting up port forwarding...")
+
+        try:
+            result = run_in_netns([
+                "curl", "-s", "-m", "15",
+                "--resolve", f"{self.state.server_hostname}:19999:{self.state.server_vip}",
+                "--cacert", self._ca_cert,
+                f"https://{self.state.server_hostname}:19999/getSignature?token={self.state.token}"
+            ], self.config.netns)
+
+            pf_response = json.loads(result.stdout)
+
+            if pf_response.get("status") != "OK":
+                log.error(f"Port forward request failed: {pf_response}")
+                return False
+
+            self.state.port_payload = pf_response["payload"]
+            self.state.port_signature = pf_response["signature"]
+
+            # Decode port info
+            port_data = json.loads(base64.b64decode(self.state.port_payload))
+            self.state.port = port_data["port"]
+            self.state.port_expires = datetime.fromisoformat(
+                port_data["expires_at"].replace("Z", "+00:00")
+            )
+
+            # Save state
+            state_dir = Path(self.config.state_dir)
+            (state_dir / "pf-response.json").write_text(json.dumps(pf_response))
+            (state_dir / "port").write_text(str(self.state.port))
+
+            log.info(f"Port {self.state.port} assigned (expires: {self.state.port_expires})")
+
+            return await self.refresh_port_forward()
+
+        except Exception as e:
+            log.error(f"Port forward setup error: {e}")
+            return False
+
+    async def refresh_port_forward(self) -> bool:
+        """Refresh PIA port forwarding"""
+        try:
+            result = run_in_netns([
+                "curl", "-Gs", "-m", "15",
+                "--connect-to", f"{self.state.server_hostname}::{self.state.server_vip}:",
+                "--cacert", self._ca_cert,
+                "--data-urlencode", f"payload={self.state.port_payload}",
+                "--data-urlencode", f"signature={self.state.port_signature}",
+                f"https://{self.state.server_hostname}:19999/bindPort"
+            ], self.config.netns)
+
+            response = json.loads(result.stdout)
+
+            if response.get("status") == "OK":
+                return True
+            else:
+                log.warning(f"Port refresh failed: {response}")
+                return False
+        except Exception as e:
+            log.error(f"Port refresh error: {e}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Torrent Client Interface
+# ═══════════════════════════════════════════════════════════════════════════
+
+class TorrentClient(ABC):
+    """Abstract base class for torrent clients"""
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    @abstractmethod
+    async def get_listen_port(self) -> Optional[int]:
+        """Get current listening port"""
+        pass
+
+    @abstractmethod
+    async def set_listen_port(self, port: int) -> bool:
+        """Set listening port"""
+        pass
+
+    @abstractmethod
+    async def set_interface(self, interface_name: str, interface_address: str) -> bool:
+        """Set network interface binding"""
+        pass
+
+
+class QBittorrentClient(TorrentClient):
+    """qBittorrent client integration"""
+
+    async def get_listen_port(self) -> Optional[int]:
+        try:
+            with urllib.request.urlopen(
+                f"{self.config.qb_api_url}/preferences", timeout=5
+            ) as resp:
+                prefs = json.loads(resp.read().decode())
+                return prefs.get("listen_port")
+        except Exception as e:
+            log.error(f"Failed to get qBittorrent port: {e}")
+            return None
+
+    async def set_listen_port(self, port: int) -> bool:
+        try:
+            current = await self.get_listen_port()
+            if current == port:
+                log.debug(f"qBittorrent port unchanged ({port})")
+                return True
+
+            log.info(f"Updating qBittorrent port: {current} -> {port}")
+
+            data = urllib.parse.urlencode({
+                "json": json.dumps({"listen_port": port})
+            }).encode()
+
+            req = urllib.request.Request(
+                f"{self.config.qb_api_url}/setPreferences",
+                data=data, method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+
+            await asyncio.sleep(2)
+
+            new_port = await self.get_listen_port()
+            if new_port == port:
+                log.info("qBittorrent port updated successfully")
+                return True
+            else:
+                log.warning("qBittorrent port update may have failed")
+                return False
+
+        except Exception as e:
+            log.error(f"Failed to set qBittorrent port: {e}")
+            return False
+
+    async def set_interface(self, interface_name: str, interface_address: str) -> bool:
+        """Set qBittorrent network interface binding"""
+        try:
+            # Get current settings
+            with urllib.request.urlopen(
+                f"{self.config.qb_api_url}/preferences", timeout=5
+            ) as resp:
+                prefs = json.loads(resp.read().decode())
+
+            current_iface = prefs.get("current_network_interface", "")
+            current_addr = prefs.get("current_interface_address", "")
+
+            if current_iface == interface_name and current_addr == interface_address:
+                log.debug(f"qBittorrent interface unchanged ({interface_name})")
+                return True
+
+            log.info(f"Updating qBittorrent interface: {current_iface} -> {interface_name}")
+
+            data = urllib.parse.urlencode({
+                "json": json.dumps({
+                    "current_network_interface": interface_name,
+                    "current_interface_name": interface_name,
+                    "current_interface_address": interface_address
+                })
+            }).encode()
+
+            req = urllib.request.Request(
+                f"{self.config.qb_api_url}/setPreferences",
+                data=data, method="POST"
+            )
+
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+
+            log.info(f"qBittorrent interface updated to {interface_name} ({interface_address})")
+            return True
+
+        except Exception as e:
+            log.error(f"Failed to set qBittorrent interface: {e}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Provider Factory
+# ═══════════════════════════════════════════════════════════════════════════
+
+def get_vpn_provider(config: Config, state: VPNState) -> VPNProvider:
+    """Factory function to get VPN provider"""
+    providers = {
+        "pia": PIAProvider,
+        # Future: "mullvad": MullvadProvider,
+        # Future: "protonvpn": ProtonVPNProvider,
+    }
+
+    provider_name = config.vpn_provider.lower()
+    if provider_name not in providers:
+        raise ValueError(f"Unknown VPN provider: {provider_name}")
+
+    return providers[provider_name](config, state)
+
+
+def get_torrent_client(config: Config) -> TorrentClient:
+    """Factory function to get torrent client"""
+    clients = {
+        "qbittorrent": QBittorrentClient,
+        # Future: "transmission": TransmissionClient,
+        # Future: "deluge": DelugeClient,
+    }
+
+    client_name = config.torrent_client.lower()
+    if client_name not in clients:
+        raise ValueError(f"Unknown torrent client: {client_name}")
+
+    return clients[client_name](config)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Main Application
+# ═══════════════════════════════════════════════════════════════════════════
+
+class Mole:
+    """MOLE - Managed Obfuscated Link Environment"""
+
+    def __init__(self, config_path: str = DEFAULT_CONFIG_FILE):
+        self.config = Config(config_path)
+        self.state = VPNState()
+        self.provider = get_vpn_provider(self.config, self.state)
+        self.torrent = get_torrent_client(self.config)
+        self.shutdown_event = asyncio.Event()
+        self._keepalive_task = None
+        self._watchdog_task = None
+
+    async def run(self):
+        """Main entry point"""
+        log.info("=" * 60)
+        log.info(f"MOLE v{VERSION} - Managed Obfuscated Link Environment")
+        log.info(f"Provider: {self.provider.name}")
+        log.info("=" * 60)
+
+        # Setup signal handlers
+        loop = asyncio.get_event_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, self._signal_handler)
+
+        # Setup network namespace
+        self._setup_namespace()
+
+        # Initial VPN setup
+        if not await self._full_renewal():
+            log.error("Initial setup failed, will retry...")
+
+        # Start background tasks
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+        self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+        # Main renewal loop
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self.shutdown_event.wait(),
+                    timeout=self.config.renewal_interval
+                )
+            except asyncio.TimeoutError:
+                log.info("Scheduled renewal starting...")
+                await self._full_renewal()
+
+        log.info("Shutting down...")
+        await self._cleanup()
+
+    def _signal_handler(self):
+        log.info("Received shutdown signal")
+        self.shutdown_event.set()
+
+    async def _cleanup(self):
+        if self._keepalive_task:
+            self._keepalive_task.cancel()
+        if self._watchdog_task:
+            self._watchdog_task.cancel()
+
+        # Bring down VPN
+        run_in_netns(["wg-quick", "down", self.config.wg_conf], self.config.netns, check=False)
+        log.info("Cleanup complete")
+
+    def _setup_namespace(self):
+        """Setup network namespace and veth pair"""
+        netns = self.config.netns
+
+        # Create namespace if needed
+        result = run_cmd(["ip", "netns", "list"], check=False)
+        if netns not in result.stdout:
+            log.info(f"Creating network namespace '{netns}'...")
+            run_cmd(["ip", "netns", "add", netns])
+
+        # Create veth pair if needed
+        result = run_cmd(["ip", "link", "show", "veth-host"], check=False)
+        if result.returncode != 0:
+            log.info("Creating veth pair...")
+            run_cmd(["ip", "link", "add", "veth-host", "type", "veth", "peer", "name", "veth-vpn"])
+            run_cmd(["ip", "link", "set", "veth-vpn", "netns", netns])
+            run_cmd(["ip", "addr", "add", f"{self.config.veth_host_ip}/24", "dev", "veth-host"])
+            run_cmd(["ip", "link", "set", "veth-host", "up"])
+            run_in_netns(["ip", "addr", "add", f"{self.config.veth_vpn_ip}/24", "dev", "veth-vpn"], netns)
+            run_in_netns(["ip", "link", "set", "veth-vpn", "up"], netns)
+            run_in_netns(["ip", "link", "set", "lo", "up"], netns)
+
+        # Enable IP forwarding
+        Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
+
+        # Setup NAT masquerade
+        masq_check = run_cmd([
+            "iptables", "-t", "nat", "-C", "POSTROUTING",
+            "-s", "10.200.200.0/24", "-o", self.config.host_interface,
+            "-j", "MASQUERADE"
+        ], check=False)
+
+        if masq_check.returncode != 0:
+            run_cmd([
+                "iptables", "-t", "nat", "-A", "POSTROUTING",
+                "-s", "10.200.200.0/24", "-o", self.config.host_interface,
+                "-j", "MASQUERADE"
+            ])
+
+    async def _full_renewal(self) -> bool:
+        """Full VPN renewal process"""
+        log.info("Starting full renewal...")
+
+        old_server_ip = self.state.server_ip
+
+        # Step 1: Authenticate
+        if not await self.provider.authenticate():
+            return False
+
+        # Step 2: Get server
+        if not await self.provider.get_server():
+            return False
+
+        # Step 3: Register WireGuard
+        if not await self.provider.register_wireguard():
+            return False
+
+        # Step 4: Connect VPN
+        if not await self._connect_vpn(old_server_ip):
+            return False
+
+        # Step 5: Setup port forwarding
+        if not await self.provider.setup_port_forward():
+            return False
+
+        # Step 6: Update torrent client interface and port
+        if self.state.peer_ip:
+            await self.torrent.set_interface("mole", self.state.peer_ip)
+        if self.state.port:
+            await self.torrent.set_listen_port(self.state.port)
+
+        log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
+        return True
+
+    async def _connect_vpn(self, old_server_ip: Optional[str]) -> bool:
+        """Establish VPN connection"""
+        log.info("Connecting VPN...")
+
+        netns = self.config.netns
+
+        # Bring down existing connection
+        run_in_netns(["wg-quick", "down", "mole"], netns, check=False)
+
+        # Update routes
+        if old_server_ip:
+            run_in_netns(["ip", "route", "del", old_server_ip, "via", self.config.veth_host_ip], netns, check=False)
+
+        run_in_netns([
+            "ip", "route", "add", self.state.server_ip,
+            "via", self.config.veth_host_ip, "dev", "veth-vpn"
+        ], netns, check=False)
+
+        # Bring up WireGuard
+        result = run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, check=False)
+        if result.returncode != 0:
+            log.error(f"Failed to bring up WireGuard: {result.stderr}")
+            return False
+
+        await asyncio.sleep(5)
+
+        # Verify connection
+        result = run_in_netns(["ping", "-c", "1", "-W", "5", self.state.server_vip], netns, check=False)
+        if result.returncode != 0:
+            log.warning("VPN connectivity check failed, but continuing...")
+
+        self.state.connected = True
+        log.info("VPN connected")
+        return True
+
+    async def _keepalive_loop(self):
+        """Port forwarding keepalive loop"""
+        log.info("Keepalive loop started")
+
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.config.keepalive_interval)
+
+                if self.state.port_payload and self.state.connected:
+                    if await self.provider.refresh_port_forward():
+                        log.info(f"Port {self.state.port} keepalive OK")
+                    else:
+                        log.warning("Port keepalive failed")
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Keepalive error: {e}")
+
+    async def _watchdog_loop(self):
+        """VPN health monitoring loop"""
+        log.info("Watchdog loop started")
+        failures = 0
+
+        while not self.shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.config.watchdog_interval)
+
+                if await self._check_health():
+                    if failures > 0:
+                        log.info(f"VPN recovered after {failures} failures")
+                    failures = 0
+                else:
+                    failures += 1
+                    log.warning(f"Health check failed ({failures}/{self.config.watchdog_max_failures})")
+
+                    if failures >= self.config.watchdog_max_failures:
+                        log.warning("Max failures reached, attempting recovery...")
+                        await self._full_renewal()
+                        failures = 0
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Watchdog error: {e}")
+
+    async def _check_health(self) -> bool:
+        """Check VPN connection health"""
+        try:
+            netns = self.config.netns
+
+            # Check interface
+            result = run_in_netns(["ip", "link", "show", "mole"], netns, check=False)
+            if result.returncode != 0:
+                return False
+
+            # Check handshake age
+            result = run_in_netns(["wg", "show", "mole", "latest-handshakes"], netns, check=False)
+            if result.returncode == 0 and result.stdout.strip():
+                parts = result.stdout.strip().split()
+                if len(parts) >= 2:
+                    handshake_ts = int(parts[1])
+                    if handshake_ts == 0:
+                        return False
+                    age = int(datetime.now().timestamp()) - handshake_ts
+                    if age > 180:
+                        return False
+
+            # Check gateway ping
+            if self.state.peer_ip:
+                parts = self.state.peer_ip.split(".")
+                gateway = f"10.{parts[1]}.128.1"
+                result = run_in_netns(["ping", "-c", "1", "-W", "5", gateway], netns, check=False)
+                if result.returncode != 0:
+                    return False
+
+            return True
+
+        except Exception as e:
+            log.error(f"Health check error: {e}")
+            return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CLI Commands
+# ═══════════════════════════════════════════════════════════════════════════
+
+def cmd_init(args):
+    """Initialize MOLE directory structure and config"""
+    print(f"MOLE v{VERSION} - Initialization")
+    print("=" * 40)
+
+    config_dir = Path(DEFAULT_CONFIG_DIR)
+    state_dir = Path(DEFAULT_STATE_DIR)
+    providers_dir = config_dir / "providers"
+    config_file = Path(DEFAULT_CONFIG_FILE)
+
+    # Check for root
+    if os.geteuid() != 0:
+        print("Error: init must be run as root (sudo mole init)")
+        return 1
+
+    # Create directories
+    print(f"\nCreating directories...")
+    for d in [config_dir, state_dir, providers_dir]:
+        if not d.exists():
+            d.mkdir(parents=True, mode=0o755)
+            print(f"  Created: {d}")
+        else:
+            print(f"  Exists:  {d}")
+
+    # Write PIA CA cert
+    pia_cert_path = providers_dir / "pia-ca.crt"
+    if not pia_cert_path.exists() or args.force:
+        pia_cert_path.write_text(PIA_CA_CERT)
+        print(f"  Created: {pia_cert_path}")
+    else:
+        print(f"  Exists:  {pia_cert_path}")
+
+    # Write config template
+    if not config_file.exists() or args.force:
+        config_file.write_text(CONFIG_TEMPLATE)
+        config_file.chmod(0o600)  # Restrict access (contains credentials)
+        print(f"  Created: {config_file}")
+        print(f"\n*** IMPORTANT: Edit {config_file} with your credentials ***")
+    else:
+        print(f"  Exists:  {config_file} (use --force to overwrite)")
+
+    print(f"\nDirectory structure:")
+    print(f"  {DEFAULT_CONFIG_DIR}/")
+    print(f"    config           <- Your configuration (edit this!)")
+    print(f"    providers/")
+    print(f"      pia-ca.crt     <- PIA CA certificate")
+    print(f"  {DEFAULT_STATE_DIR}/")
+    print(f"    (runtime state files)")
+    print(f"  {DEFAULT_WG_CONF}")
+    print(f"    (generated WireGuard config)")
+
+    print(f"\nNext steps:")
+    print(f"  1. Edit {config_file} with your VPN credentials")
+    print(f"  2. Run: sudo systemctl start mole")
+    print(f"  3. Check status: mole status")
+
+    return 0
+
+
+def cmd_status(args):
+    """Show current MOLE status"""
+    state_dir = Path(DEFAULT_STATE_DIR)
+    netns = "vpn"
+
+    print(f"MOLE v{VERSION} - Status")
+    print("=" * 40)
+
+    # Check for root (needed to query namespace)
+    if os.geteuid() != 0:
+        print("\nNote: Run with sudo for full status (sudo mole status)")
+        print("      Some information may be unavailable.\n")
+
+    # Check if service is running
+    result = subprocess.run(
+        ["systemctl", "is-active", "mole"],
+        capture_output=True, text=True
+    )
+    service_status = result.stdout.strip()
+    print(f"\nService: {service_status}")
+
+    # Check namespace exists
+    result = run_cmd(["ip", "netns", "list"], check=False)
+    ns_exists = netns in result.stdout
+    print(f"Namespace '{netns}': {'exists' if ns_exists else 'missing'}")
+
+    if not ns_exists:
+        return 0
+
+    # Check WireGuard interface
+    result = run_in_netns(["ip", "link", "show", "mole"], netns, check=False)
+    if "Operation not permitted" in result.stderr:
+        print(f"WireGuard interface: (requires sudo)")
+        wg_up = False
+    else:
+        wg_up = result.returncode == 0
+        print(f"WireGuard interface: {'up' if wg_up else 'down'}")
+
+    if wg_up:
+        # Get WireGuard details
+        result = run_in_netns(["wg", "show", "mole"], netns, check=False)
+        if result.returncode == 0:
+            for line in result.stdout.split('\n'):
+                if 'endpoint:' in line:
+                    print(f"  Endpoint: {line.split('endpoint:')[1].strip()}")
+                if 'latest handshake:' in line:
+                    print(f"  Last handshake: {line.split('latest handshake:')[1].strip()}")
+                if 'transfer:' in line:
+                    print(f"  Transfer: {line.split('transfer:')[1].strip()}")
+
+    # Read state files
+    print(f"\nState:")
+    for name in ["hostname", "server_ip", "port"]:
+        state_file = state_dir / name
+        if state_file.exists():
+            print(f"  {name}: {state_file.read_text().strip()}")
+
+    # Get public IP through VPN
+    if wg_up:
+        result = run_in_netns(["curl", "-s", "-m", "5", "https://ipinfo.io/ip"], netns, check=False)
+        if result.returncode == 0:
+            print(f"  public_ip: {result.stdout.strip()}")
+
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Entry Point
+# ═══════════════════════════════════════════════════════════════════════════
+
+def main():
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description=f"MOLE v{VERSION} - Managed Obfuscated Link Environment",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Commands:
+  init      Initialize directory structure and config
+  status    Show current VPN status
+  run       Run the VPN manager (default, used by systemd)
+
+Examples:
+  sudo mole init          # First-time setup
+  mole status             # Check VPN status
+  sudo mole run           # Start VPN manager (or use systemd)
+"""
+    )
+
+    parser.add_argument(
+        "-v", "--version",
+        action="version",
+        version=f"MOLE v{VERSION}"
+    )
+
+    subparsers = parser.add_subparsers(dest="command", help="Command to run")
+
+    # init command
+    init_parser = subparsers.add_parser("init", help="Initialize MOLE")
+    init_parser.add_argument(
+        "-f", "--force",
+        action="store_true",
+        help="Overwrite existing files"
+    )
+
+    # status command
+    status_parser = subparsers.add_parser("status", help="Show VPN status")
+
+    # run command
+    run_parser = subparsers.add_parser("run", help="Run VPN manager")
+    run_parser.add_argument(
+        "-c", "--config",
+        default=DEFAULT_CONFIG_FILE,
+        help="Path to configuration file"
+    )
+
+    args = parser.parse_args()
+
+    # Setup logging
+    global log
+    log = setup_logging(quiet=(args.command == "status"))
+
+    # Route to command
+    if args.command == "init":
+        return cmd_init(args)
+    elif args.command == "status":
+        return cmd_status(args)
+    elif args.command == "run" or args.command is None:
+        # Default to run
+        config_path = getattr(args, 'config', DEFAULT_CONFIG_FILE)
+        mole = Mole(config_path)
+        asyncio.run(mole.run())
+        return 0
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
