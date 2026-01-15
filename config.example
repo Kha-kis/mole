@@ -16,9 +16,18 @@ VPN_PROVIDER=pia
 PIA_USER=your_pia_username
 PIA_PASS=your_pia_password
 
-# Region ID (see: https://serverlist.piaservers.net/vpninfo/servers/v6)
-# Examples: us_east, us_west, ca_toronto, uk_london, nl_amsterdam, de_berlin
+# Region ID (supports comma-separated fallback list)
+# Use 'mole regions pia' to see available regions
+# Use 'mole autoselect' to find fastest region
+# Examples: ca_toronto, us_east, uk_london
+# Fallback: PIA_REGION=ca_toronto,ca_montreal,us_chicago
 PIA_REGION=ca_toronto
+
+# Specific server hostname (optional, overrides auto-selection)
+# Use 'mole regions pia --servers' to see available servers per region
+# Use 'mole autoselect --servers' to find fastest specific server
+# Use 'mole autoselect -s -r ca_toronto' to test servers in one region
+# PIA_SERVER=toronto420
 
 # ═══════════════════════════════════════════════════════════════════
 # Network Namespace Settings

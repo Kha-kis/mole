@@ -287,8 +287,22 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
             errors.append("PIA_USER is not set or still has default value")
         if not config.get('PIA_PASS') or config.get('PIA_PASS') == 'your_password':
             errors.append("PIA_PASS is not set or still has default value")
-        if not config.get('PIA_REGION'):
+
+        # Validate PIA_REGION (supports comma-separated fallback list)
+        region_str = config.get('PIA_REGION', '')
+        if not region_str:
             errors.append("PIA_REGION is not set")
+        else:
+            regions = [r.strip() for r in region_str.split(',') if r.strip()]
+            if not regions:
+                errors.append("PIA_REGION is empty after parsing")
+            elif len(regions) > 1:
+                warnings.append(f"Using fallback regions: {', '.join(regions)}")
+
+        # Validate PIA_SERVER if set (optional)
+        server_hostname = config.get('PIA_SERVER', '').strip()
+        if server_hostname:
+            warnings.append(f"Using specific server: {server_hostname}")
 
         # Check CA cert exists
         ca_cert = Path(config.config_dir) / "providers" / "pia-ca.crt"
@@ -460,8 +474,16 @@ class PIAProvider(VPNProvider):
         return self.config.get('PIA_PASS', '')
 
     @property
-    def _region(self) -> str:
-        return self.config.get('PIA_REGION', 'ca_toronto')
+    def _regions(self) -> List[str]:
+        """Get list of regions (supports comma-separated fallback)"""
+        region_str = self.config.get('PIA_REGION', 'ca_toronto')
+        return [r.strip() for r in region_str.split(',') if r.strip()]
+
+    @property
+    def _server_hostname(self) -> Optional[str]:
+        """Get specific server hostname if configured"""
+        hostname = self.config.get('PIA_SERVER', '').strip()
+        return hostname if hostname else None
 
     @property
     def _ca_cert(self) -> str:
@@ -494,8 +516,14 @@ class PIAProvider(VPNProvider):
         return False
 
     async def get_server(self) -> bool:
-        """Get PIA server for region"""
-        log.info(f"Getting server for region: {self._region}")
+        """Get PIA server with fallback regions and optional specific server"""
+        regions_to_try = self._regions
+        target_hostname = self._server_hostname
+
+        if target_hostname:
+            log.info(f"Looking for server: {target_hostname} in regions: {', '.join(regions_to_try)}")
+        else:
+            log.info(f"Getting server for regions: {', '.join(regions_to_try)}")
 
         try:
             with urllib.request.urlopen(
@@ -505,17 +533,36 @@ class PIAProvider(VPNProvider):
                 data = resp.readline().decode()
                 servers = json.loads(data)
 
-            for region in servers.get("regions", []):
-                if region["id"] == self._region:
-                    wg_servers = region.get("servers", {}).get("wg", [])
-                    if wg_servers:
-                        server = wg_servers[0]
-                        self.state.server_ip = server["ip"]
-                        self.state.server_hostname = server["cn"]
-                        log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
-                        return True
+            # Try each region in order (fallback support)
+            for region_id in regions_to_try:
+                for region in servers.get("regions", []):
+                    if region["id"] == region_id:
+                        wg_servers = region.get("servers", {}).get("wg", [])
 
-            log.error(f"Region not found: {self._region}")
+                        if target_hostname:
+                            # Find specific server by hostname
+                            for server in wg_servers:
+                                if server["cn"] == target_hostname:
+                                    self.state.server_ip = server["ip"]
+                                    self.state.server_hostname = server["cn"]
+                                    log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
+                                    return True
+                            log.warning(f"Server '{target_hostname}' not found in region '{region_id}'")
+                        elif wg_servers:
+                            # Use first available server in region
+                            server = wg_servers[0]
+                            self.state.server_ip = server["ip"]
+                            self.state.server_hostname = server["cn"]
+                            log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
+                            return True
+                        else:
+                            log.warning(f"No WireGuard servers in region '{region_id}'")
+                        break
+                else:
+                    log.warning(f"Region '{region_id}' not found, trying next...")
+                    continue
+
+            log.error("All regions exhausted, no suitable server found")
         except Exception as e:
             log.error(f"Failed to get server: {e}")
 
@@ -1319,6 +1366,7 @@ def cmd_regions(args):
 
     # Filter options
     pf_only = getattr(args, 'port_forward', False)
+    show_servers = getattr(args, 'servers', False)
 
     try:
         regions = _fetch_pia_regions()
@@ -1330,18 +1378,39 @@ def cmd_regions(args):
         # Sort by name
         regions.sort(key=lambda x: x["name"])
 
-        # Print header
-        print(f"\n{'Region ID':<25} {'Name':<30} {'Port Forward'}")
-        print("-" * 60)
+        if show_servers:
+            # Detailed view with individual servers
+            total_servers = 0
+            for r in regions:
+                pf = "Yes" if r.get("port_forward") else "No"
+                servers = r.get("servers", [])
+                total_servers += len(servers)
+                print(f"\n{r['id']} ({r['name']}) - Port Forward: {pf}")
+                print(f"  Servers ({len(servers)}):")
+                for s in servers:
+                    print(f"    - {s['cn']} ({s['ip']})")
 
-        for r in regions:
-            pf = "Yes" if r.get("port_forward") else "No"
-            print(f"{r['id']:<25} {r['name']:<30} {pf}")
+            print(f"\n{'=' * 60}")
+            print(f"Total: {len(regions)} regions, {total_servers} servers")
+            if pf_only:
+                print("(showing only regions with port forwarding)")
+            print(f"\nUsage:")
+            print(f"  PIA_REGION=<region_id>     Set region in /etc/mole/config")
+            print(f"  PIA_SERVER=<hostname>      Set specific server (optional)")
+        else:
+            # Table view (default)
+            print(f"\n{'Region ID':<25} {'Name':<30} {'Port Forward'}")
+            print("-" * 60)
 
-        print(f"\nTotal: {len(regions)} regions")
-        if pf_only:
-            print("(showing only regions with port forwarding)")
-        print(f"\nUsage: Set PIA_REGION in /etc/mole/config")
+            for r in regions:
+                pf = "Yes" if r.get("port_forward") else "No"
+                print(f"{r['id']:<25} {r['name']:<30} {pf}")
+
+            print(f"\nTotal: {len(regions)} regions")
+            if pf_only:
+                print("(showing only regions with port forwarding)")
+            print(f"\nUsage: Set PIA_REGION in /etc/mole/config")
+            print(f"Tip: Use --servers to see individual servers per region")
 
     except Exception as e:
         print(f"Error fetching regions: {e}")
@@ -1592,9 +1661,15 @@ def _ping_server(server_ip: str, netns: str = None) -> Optional[float]:
 
 
 def cmd_autoselect(args):
-    """Auto-select the best region based on latency (port forwarding regions only)"""
-    print(f"MOLE v{VERSION} - Auto-Select Region")
-    print("=" * 40)
+    """Auto-select the best region/server based on latency"""
+    test_servers = getattr(args, 'servers', False)
+    region_filter = getattr(args, 'region', None)
+
+    if test_servers:
+        print(f"MOLE v{VERSION} - Auto-Select Server")
+    else:
+        print(f"MOLE v{VERSION} - Auto-Select Region")
+    print("=" * 50)
 
     print("\nFetching regions with port forwarding support...")
 
@@ -1606,54 +1681,114 @@ def cmd_autoselect(args):
 
     # Filter to port forwarding regions only
     pf_regions = [r for r in regions if r.get("port_forward")]
-    print(f"Found {len(pf_regions)} regions with port forwarding")
+
+    # Optionally filter to specific region
+    if region_filter:
+        pf_regions = [r for r in pf_regions if r["id"] == region_filter]
+        if not pf_regions:
+            print(f"Error: Region '{region_filter}' not found or has no port forwarding")
+            return 1
+        print(f"Testing servers in region: {region_filter}")
+    else:
+        print(f"Found {len(pf_regions)} regions with port forwarding")
 
     if not pf_regions:
         print("Error: No regions with port forwarding found")
         return 1
 
-    print("\nTesting latency to each region (this may take a minute)...")
+    if test_servers:
+        # Test individual servers
+        all_servers = []
+        for region in pf_regions:
+            for server in region.get("servers", []):
+                all_servers.append({
+                    "region_id": region["id"],
+                    "region_name": region["name"],
+                    "hostname": server["cn"],
+                    "ip": server["ip"]
+                })
 
-    # Test latency to first server in each region
-    results = []
+        print(f"\nTesting {len(all_servers)} servers (this may take a few minutes)...")
 
-    def test_region(region):
-        servers = region.get("servers", [])
-        if servers:
-            server_ip = servers[0].get("ip")
-            if server_ip:
-                latency = _ping_server(server_ip)
-                return (region, latency)
-        return (region, None)
+        results = []
 
-    # Use thread pool for parallel ping
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(test_region, r): r for r in pf_regions}
-        for future in concurrent.futures.as_completed(futures):
-            region, latency = future.result()
-            if latency is not None:
-                results.append((region, latency))
-                print(f"  {region['name']:<30} {latency:.1f} ms")
-            else:
-                print(f"  {region['name']:<30} timeout")
+        def test_server(srv):
+            latency = _ping_server(srv["ip"])
+            return (srv, latency)
 
-    if not results:
-        print("\nError: Could not reach any servers")
-        return 1
+        # Use more workers for server testing
+        with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+            futures = {executor.submit(test_server, s): s for s in all_servers}
+            for future in concurrent.futures.as_completed(futures):
+                srv, latency = future.result()
+                if latency is not None:
+                    results.append((srv, latency))
+                    print(f"  {srv['hostname']:<25} {latency:.1f} ms  ({srv['region_name']})")
+                else:
+                    print(f"  {srv['hostname']:<25} timeout")
 
-    # Sort by latency
-    results.sort(key=lambda x: x[1])
+        if not results:
+            print("\nError: Could not reach any servers")
+            return 1
 
-    print(f"\n{'=' * 40}")
-    print("Top 5 fastest regions:")
-    print(f"{'=' * 40}")
-    for i, (region, latency) in enumerate(results[:5], 1):
-        print(f"  {i}. {region['name']:<30} {latency:.1f} ms  (ID: {region['id']})")
+        # Sort by latency
+        results.sort(key=lambda x: x[1])
 
-    best = results[0]
-    print(f"\nRecommended region: {best[0]['id']}")
-    print(f"\nTo use this region, set in /etc/mole/config:")
-    print(f"  PIA_REGION={best[0]['id']}")
+        print(f"\n{'=' * 50}")
+        print("Top 10 fastest servers:")
+        print(f"{'=' * 50}")
+        for i, (srv, latency) in enumerate(results[:10], 1):
+            print(f"  {i}. {srv['hostname']:<25} {latency:.1f} ms  ({srv['region_id']})")
+
+        best = results[0][0]
+        print(f"\nRecommended server: {best['hostname']}")
+        print(f"\nTo use this server, set in /etc/mole/config:")
+        print(f"  PIA_REGION={best['region_id']}")
+        print(f"  PIA_SERVER={best['hostname']}")
+
+    else:
+        # Test regions (first server per region)
+        print("\nTesting latency to each region (this may take a minute)...")
+
+        results = []
+
+        def test_region(region):
+            servers = region.get("servers", [])
+            if servers:
+                server_ip = servers[0].get("ip")
+                if server_ip:
+                    latency = _ping_server(server_ip)
+                    return (region, latency)
+            return (region, None)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(test_region, r): r for r in pf_regions}
+            for future in concurrent.futures.as_completed(futures):
+                region, latency = future.result()
+                if latency is not None:
+                    results.append((region, latency))
+                    print(f"  {region['name']:<30} {latency:.1f} ms")
+                else:
+                    print(f"  {region['name']:<30} timeout")
+
+        if not results:
+            print("\nError: Could not reach any servers")
+            return 1
+
+        # Sort by latency
+        results.sort(key=lambda x: x[1])
+
+        print(f"\n{'=' * 50}")
+        print("Top 5 fastest regions:")
+        print(f"{'=' * 50}")
+        for i, (region, latency) in enumerate(results[:5], 1):
+            print(f"  {i}. {region['name']:<30} {latency:.1f} ms  (ID: {region['id']})")
+
+        best = results[0][0]
+        print(f"\nRecommended region: {best['id']}")
+        print(f"\nTo use this region, set in /etc/mole/config:")
+        print(f"  PIA_REGION={best['id']}")
+        print(f"\nTip: Use --servers to find the fastest specific server")
 
     return 0
 
@@ -2021,7 +2156,10 @@ Examples:
   mole ip                      # Show VPN public IP
   mole regions pia             # List PIA regions
   mole regions pia --pf        # Only regions with port forwarding
+  mole regions pia --servers   # Show individual servers per region
   mole autoselect              # Find fastest region
+  mole autoselect --servers    # Find fastest specific server
+  mole autoselect -s -r ca_toronto  # Test servers in one region
   mole speedtest               # Test VPN speed
   mole stats                   # Show bandwidth usage
   sudo mole qbittorrent setup  # Setup qBittorrent in VPN namespace
@@ -2069,9 +2207,25 @@ Examples:
         action="store_true",
         help="Only show regions with port forwarding"
     )
+    regions_parser.add_argument(
+        "-s", "--servers",
+        action="store_true",
+        help="Show individual servers within each region"
+    )
 
     # autoselect command
     autoselect_parser = subparsers.add_parser("autoselect", help="Find fastest region")
+    autoselect_parser.add_argument(
+        "-s", "--servers",
+        action="store_true",
+        help="Test individual servers (slower but more accurate)"
+    )
+    autoselect_parser.add_argument(
+        "-r", "--region",
+        type=str,
+        default=None,
+        help="Limit server testing to a specific region (use with --servers)"
+    )
 
     # speedtest command
     speedtest_parser = subparsers.add_parser("speedtest", help="Test VPN speed")
