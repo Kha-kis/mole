@@ -8,15 +8,17 @@ MOLE runs your VPN connection in an isolated network namespace, automatically ha
 
 - **Network Namespace Isolation** - VPN traffic is isolated from host network
 - **Kill Switch** - Blocks all traffic if VPN connection drops
-- **DNS Leak Protection** - DNS queries route through VPN only
+- **DNS over TLS** - Encrypted DNS with caching, filtering, and auto-updating blocklists
+- **HTTP Proxy** - Authenticated proxy to route traffic through VPN
+- **HTTP Control API** - REST API to query/control VPN state
 - **Automatic Token Renewal** - Refreshes VPN credentials before expiration
 - **Port Forwarding** - Automatically requests and maintains forwarded ports
 - **Torrent Client Integration** - Updates qBittorrent's listening port via API
 - **Health Monitoring** - Watchdog detects and recovers from connection failures
 - **Systemd Integration** - Runs as a proper system service
-- **Config Validation** - Check configuration for errors before running
+- **Server Selection** - Choose specific servers or use fallback regions
+- **Region Auto-Select** - Find the fastest region or specific server
 - **Speed Testing** - Test VPN connection speed
-- **Region Auto-Select** - Find the fastest region with port forwarding support
 - **Bandwidth Statistics** - Track upload/download usage over time
 
 ## Supported Providers
@@ -78,7 +80,12 @@ VPN_PROVIDER=pia
 # PIA Credentials
 PIA_USER=your_username
 PIA_PASS=your_password
-PIA_REGION=ca_toronto
+
+# Region (supports comma-separated fallback list)
+PIA_REGION=ca_toronto,ca_montreal,us_chicago
+
+# Specific server (optional, overrides auto-selection)
+# PIA_SERVER=toronto420
 
 # Network Namespace
 NETNS_NAME=vpn
@@ -128,8 +135,12 @@ sudo mole logs -f
 mole --version       Show version
 mole validate        Validate configuration file
 mole ip              Show current public IP through VPN
-mole regions [provider] [--pf]  List VPN regions (--pf for port forwarding only)
-mole autoselect      Find fastest region with port forwarding
+mole dns             Test DNS over TLS functionality
+sudo mole dns -n     Test DNS from inside VPN namespace
+mole api-key generate  Generate a new API key
+sudo mole api-key show Show current API key status
+mole regions [provider] [--pf] [--servers]  List VPN regions
+mole autoselect [-s] [-r REGION]  Find fastest region or server
 mole speedtest       Test VPN connection speed
 mole stats [--save]  Show bandwidth statistics
 sudo mole init       Initialize directory structure
@@ -236,7 +247,7 @@ This means if the VPN drops:
 
 ### DNS Leak Protection
 
-DNS queries from applications in the namespace are forced through the VPN tunnel. The `mole status` command includes a DNS leak check that verifies your DNS requests are resolving through the VPN server IP, not your ISP.
+DNS queries from applications in the namespace are forced through the VPN tunnel. When DNS over TLS is enabled, queries are encrypted end-to-end to prevent eavesdropping. The `mole status` command includes a DNS leak check that verifies your DNS requests are not leaking to your ISP.
 
 ### Network Isolation
 
@@ -254,22 +265,35 @@ mole validate
 
 This checks for missing credentials, invalid settings, and common configuration errors.
 
-### Region Selection
+### Region and Server Selection
 
 List all available regions:
 
 ```bash
 mole regions pia           # All PIA regions
 mole regions pia --pf      # Only regions with port forwarding
+mole regions pia --servers # Show individual servers per region
 ```
 
-Find the fastest region automatically:
+Find the fastest region or server:
 
 ```bash
-mole autoselect
+mole autoselect            # Find fastest region
+mole autoselect -s         # Find fastest specific server
+mole autoselect -s -r ca_toronto  # Find fastest server in a region
 ```
 
-This tests latency to all port-forwarding regions and recommends the fastest one.
+Configure fallback regions (tries each until one works):
+
+```ini
+PIA_REGION=ca_toronto,ca_montreal,us_chicago
+```
+
+Or specify a specific server:
+
+```ini
+PIA_SERVER=toronto420
+```
 
 ### Speed Testing
 
@@ -286,6 +310,138 @@ View current and historical bandwidth usage:
 ```bash
 mole stats           # View stats
 mole stats --save    # Save current session to history
+```
+
+## DNS over TLS
+
+MOLE can run a DNS over TLS server that encrypts your DNS queries and optionally blocks ads, malware, and tracking domains. Features include DNS response caching and automatic blocklist updates.
+
+### Configuration
+
+```ini
+# Enable DNS over TLS
+DOT_ENABLED=true
+
+# Upstream provider: cloudflare, cloudflare-family, quad9, quad9-unsecured, google, custom
+DOT_UPSTREAM=cloudflare
+
+# For custom upstream
+# DOT_UPSTREAM=custom
+# DOT_CUSTOM_SERVER=9.9.9.9:853
+
+# Filtering (blocklists are auto-downloaded and cached)
+DOT_BLOCK_ADS=true       # Block ads, fake news, gambling
+DOT_BLOCK_MALWARE=true   # Block known malware domains
+DOT_BLOCK_TRACKING=false # Block Windows telemetry
+
+# DNS Caching (reduces latency and upstream queries)
+DOT_CACHING=true         # Enable DNS response caching (default: enabled)
+DOT_CACHE_TTL=0          # Max cache TTL in seconds (0 = use response TTL)
+
+# Blocklist Auto-Update
+DOT_UPDATE_PERIOD=24h    # How often to update blocklists (0 = disabled)
+                         # Supports: 1h, 6h, 24h, 7d, or seconds
+```
+
+### Testing
+
+```bash
+mole dns             # Test DNS configuration and resolution
+mole dns -n          # Test from inside VPN namespace
+```
+
+### Usage
+
+When enabled, all DNS queries from the VPN namespace are automatically routed through the DOT server. You can also query it directly:
+
+```bash
+dig @10.200.200.2 example.com
+```
+
+### API Endpoint
+
+When the HTTP API is enabled, DNS statistics are available at `/v1/dns`:
+
+```bash
+curl http://127.0.0.1:8080/v1/dns
+```
+
+Returns cache entries, blocked domain count, and last blocklist update time.
+
+## HTTP Proxy
+
+MOLE can run an authenticated HTTP proxy that routes traffic through the VPN.
+
+### Configuration
+
+```ini
+# Enable HTTP Proxy
+PROXY_ENABLED=true
+PROXY_PORT=8888
+PROXY_BIND=10.200.200.1
+
+# Authentication (required)
+PROXY_USER=mole
+PROXY_PASS=your_secure_password
+```
+
+### Usage
+
+```bash
+# Command line
+curl -x http://mole:password@10.200.200.1:8888 https://ifconfig.me
+
+# Environment variable
+export http_proxy=http://mole:password@10.200.200.1:8888
+export https_proxy=http://mole:password@10.200.200.1:8888
+
+# Browser: Configure proxy to 10.200.200.1:8888 with authentication
+```
+
+## HTTP Control API
+
+MOLE can expose a REST API for querying and controlling VPN state.
+
+### Configuration
+
+```ini
+HTTP_API_ENABLED=true
+HTTP_API_PORT=8080
+HTTP_API_BIND=127.0.0.1  # localhost only by default
+
+# API key (required for non-localhost access)
+HTTP_API_KEY=your_api_key_here
+```
+
+### Generate API Key
+
+```bash
+mole api-key generate    # Generate a new API key
+mole api-key show        # Show current key status
+```
+
+### Endpoints
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/v1/status` | VPN connection status |
+| GET | `/v1/port` | Current forwarded port |
+| GET | `/v1/ip` | Public IP address |
+| GET | `/v1/server` | Current server info |
+| GET | `/v1/health` | Health check status |
+| GET | `/v1/dns` | DNS cache and blocklist stats |
+| PUT | `/v1/vpn/restart` | Trigger reconnection |
+
+### Usage
+
+```bash
+# Without API key (localhost only)
+curl http://127.0.0.1:8080/v1/status
+
+# With API key (required for remote access)
+curl -H 'X-API-Key: YOUR_KEY' http://127.0.0.1:8080/v1/status
+curl -H 'Authorization: Bearer YOUR_KEY' http://127.0.0.1:8080/v1/status
+curl 'http://127.0.0.1:8080/v1/status?api_key=YOUR_KEY'
 ```
 
 ## License

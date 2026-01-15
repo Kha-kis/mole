@@ -22,14 +22,17 @@ from typing import Optional, Dict, Any, List, Tuple
 import urllib.request
 import urllib.parse
 import ssl
+import hmac
+import secrets
 import time
 import concurrent.futures
+import struct
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Version
 # ═══════════════════════════════════════════════════════════════════════════
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Default Paths (FHS compliant)
@@ -257,6 +260,108 @@ class Config:
     def watchdog_max_failures(self) -> int:
         return self.get_int('WATCHDOG_MAX_FAILURES', 3)
 
+    # HTTP Control API
+    @property
+    def http_api_enabled(self) -> bool:
+        val = self.get('HTTP_API_ENABLED', 'false').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def http_api_port(self) -> int:
+        return self.get_int('HTTP_API_PORT', 8080)
+
+    @property
+    def http_api_bind(self) -> str:
+        return self.get('HTTP_API_BIND', '127.0.0.1')
+
+    @property
+    def http_api_key(self) -> str:
+        return self.get('HTTP_API_KEY', '')
+
+    # HTTP Proxy
+    @property
+    def proxy_enabled(self) -> bool:
+        val = self.get('PROXY_ENABLED', 'false').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def proxy_port(self) -> int:
+        return self.get_int('PROXY_PORT', 8888)
+
+    @property
+    def proxy_bind(self) -> str:
+        return self.get('PROXY_BIND', '10.200.200.1')
+
+    @property
+    def proxy_user(self) -> str:
+        return self.get('PROXY_USER', 'mole')
+
+    @property
+    def proxy_pass(self) -> str:
+        return self.get('PROXY_PASS', '')
+
+    # DNS over TLS
+    @property
+    def dot_enabled(self) -> bool:
+        val = self.get('DOT_ENABLED', 'false').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def dot_port(self) -> int:
+        return self.get_int('DOT_PORT', 53)
+
+    @property
+    def dot_bind(self) -> str:
+        return self.get('DOT_BIND', '10.200.200.2')
+
+    @property
+    def dot_upstream(self) -> str:
+        return self.get('DOT_UPSTREAM', 'cloudflare')
+
+    @property
+    def dot_custom_server(self) -> str:
+        return self.get('DOT_CUSTOM_SERVER', '')
+
+    @property
+    def dot_block_ads(self) -> bool:
+        val = self.get('DOT_BLOCK_ADS', 'true').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def dot_block_malware(self) -> bool:
+        val = self.get('DOT_BLOCK_MALWARE', 'true').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def dot_block_tracking(self) -> bool:
+        val = self.get('DOT_BLOCK_TRACKING', 'false').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def dot_caching(self) -> bool:
+        """Enable DNS response caching for improved performance"""
+        val = self.get('DOT_CACHING', 'true').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
+    def dot_cache_ttl(self) -> int:
+        """Maximum cache TTL in seconds (0 = use response TTL)"""
+        return self.get_int('DOT_CACHE_TTL', 0)
+
+    @property
+    def dot_update_period(self) -> int:
+        """Blocklist update period in seconds (0 = disabled, default 24h)"""
+        val = self.get('DOT_UPDATE_PERIOD', '86400')  # 24 hours
+        # Parse time strings like "24h", "1d", "30m"
+        val = val.strip().lower()
+        if val.endswith('h'):
+            return int(val[:-1]) * 3600
+        elif val.endswith('d'):
+            return int(val[:-1]) * 86400
+        elif val.endswith('m'):
+            return int(val[:-1]) * 60
+        return int(val)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Config Validation
@@ -287,6 +392,17 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
             errors.append("PIA_USER is not set or still has default value")
         if not config.get('PIA_PASS') or config.get('PIA_PASS') == 'your_password':
             errors.append("PIA_PASS is not set or still has default value")
+
+        # Validate credentials don't contain dangerous characters
+        for key in ['PIA_USER', 'PIA_PASS']:
+            value = config.get(key, '')
+            if value:
+                # Check for control characters, null bytes, or newlines
+                if any(ord(c) < 32 or ord(c) == 127 for c in value):
+                    errors.append(f"{key} contains invalid control characters")
+                # Check for overly long credentials (prevent DoS/buffer issues)
+                if len(value) > 256:
+                    errors.append(f"{key} is too long (max 256 characters)")
 
         # Validate PIA_REGION (supports comma-separated fallback list)
         region_str = config.get('PIA_REGION', '')
@@ -357,6 +473,16 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         if config.torrent_client.lower() in ('none', 'disabled', ''):
             warnings.append(f"PORT_FORWARD is enabled but TORRENT_CLIENT is disabled - port will be forwarded but not used")
 
+    # Check HTTP API security configuration
+    if config.http_api_enabled:
+        bind_addr = config.http_api_bind
+        if not config.http_api_key and bind_addr not in ('127.0.0.1', 'localhost', '::1'):
+            warnings.append(f"SECURITY: HTTP API bound to '{bind_addr}' without authentication - set HTTP_API_KEY")
+
+    # Check HTTP Proxy authentication
+    if config.proxy_enabled and not config.proxy_pass:
+        errors.append("PROXY_ENABLED is true but PROXY_PASS is not set - proxy requires authentication")
+
     all_issues = errors + [f"Warning: {w}" for w in warnings]
     return len(errors) == 0, all_issues
 
@@ -404,6 +530,36 @@ class VPNState:
 def run_cmd(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
     """Run a shell command"""
     return subprocess.run(cmd, capture_output=True, text=True, check=check)
+
+
+def secure_write_file(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write a file with restricted permissions (secure for sensitive data)"""
+    # Convert Path to string if needed
+    path_str = str(path)
+    # Open with O_CREAT|O_WRONLY|O_TRUNC and explicit mode
+    fd = os.open(path_str, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, mode)
+    try:
+        os.write(fd, content.encode('utf-8'))
+    finally:
+        os.close(fd)
+
+
+import re as _re
+def sanitize_for_log(text: str, max_length: int = 200) -> str:
+    """Sanitize text for logging by removing sensitive patterns and truncating"""
+    if not text:
+        return text
+    # Mask patterns that look like tokens, API keys, or base64 secrets
+    # Token pattern: alphanumeric strings of 20+ chars
+    text = _re.sub(r'\b[A-Za-z0-9_-]{32,}\b', '[REDACTED]', text)
+    # Base64 patterns (long sequences ending in = or ==)
+    text = _re.sub(r'\b[A-Za-z0-9+/]{20,}={0,2}\b', '[REDACTED]', text)
+    # Password/token in JSON
+    text = _re.sub(r'"(password|token|secret|key|auth)"\s*:\s*"[^"]*"', r'"\1": "[REDACTED]"', text, flags=_re.IGNORECASE)
+    # Truncate if too long
+    if len(text) > max_length:
+        text = text[:max_length] + "...[truncated]"
+    return text
 
 
 def run_in_netns(cmd: list, netns: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -509,9 +665,9 @@ class PIAProvider(VPNProvider):
                     log.info("Authentication successful")
                     return True
 
-            log.error(f"Authentication failed: {result.stderr or result.stdout}")
+            log.error(f"Authentication failed: {sanitize_for_log(result.stderr or result.stdout)}")
         except Exception as e:
-            log.error(f"Authentication error: {e}")
+            log.error(f"Authentication error: {sanitize_for_log(str(e))}")
 
         return False
 
@@ -610,11 +766,17 @@ class PIAProvider(VPNProvider):
                 self.state.peer_ip = result["peer_ip"]
                 self.state.server_vip = result["server_vip"]
 
+                # Use DOT server if enabled, otherwise use PIA's DNS
+                if self.config.dot_enabled:
+                    dns_server = self.config.dot_bind
+                else:
+                    dns_server = result['dns_servers'][0]
+
                 # Write WireGuard config
                 wg_config = f"""[Interface]
 PrivateKey = {priv_key}
 Address = {result['peer_ip']}/32
-DNS = {result['dns_servers'][0]}
+DNS = {dns_server}
 
 [Peer]
 PublicKey = {result['server_key']}
@@ -624,12 +786,12 @@ PersistentKeepalive = 25
 """
                 Path(self.config.wg_conf).write_text(wg_config)
 
-                # Save state
+                # Save state (with restricted permissions)
                 state_dir = Path(self.config.state_dir)
-                state_dir.mkdir(parents=True, exist_ok=True)
-                (state_dir / "server_ip").write_text(self.state.server_ip)
-                (state_dir / "hostname").write_text(self.state.server_hostname)
-                (state_dir / "server_vip").write_text(self.state.server_vip)
+                state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                secure_write_file(state_dir / "server_ip", self.state.server_ip)
+                secure_write_file(state_dir / "hostname", self.state.server_hostname)
+                secure_write_file(state_dir / "server_vip", self.state.server_vip)
 
                 log.info(f"WireGuard registered, peer IP: {self.state.peer_ip}")
                 return True
@@ -655,7 +817,7 @@ PersistentKeepalive = 25
             pf_response = json.loads(result.stdout)
 
             if pf_response.get("status") != "OK":
-                log.error(f"Port forward request failed: {pf_response}")
+                log.error(f"Port forward request failed: {sanitize_for_log(str(pf_response))}")
                 return False
 
             self.state.port_payload = pf_response["payload"]
@@ -668,10 +830,10 @@ PersistentKeepalive = 25
                 port_data["expires_at"].replace("Z", "+00:00")
             )
 
-            # Save state
+            # Save state (with restricted permissions for sensitive data)
             state_dir = Path(self.config.state_dir)
-            (state_dir / "pf-response.json").write_text(json.dumps(pf_response))
-            (state_dir / "port").write_text(str(self.state.port))
+            secure_write_file(state_dir / "pf-response.json", json.dumps(pf_response))
+            secure_write_file(state_dir / "port", str(self.state.port))
 
             log.info(f"Port {self.state.port} assigned (expires: {self.state.port_expires})")
 
@@ -698,10 +860,10 @@ PersistentKeepalive = 25
             if response.get("status") == "OK":
                 return True
             else:
-                log.warning(f"Port refresh failed: {response}")
+                log.warning(f"Port refresh failed: {sanitize_for_log(str(response))}")
                 return False
         except Exception as e:
-            log.error(f"Port refresh error: {e}")
+            log.error(f"Port refresh error: {sanitize_for_log(str(e))}")
             return False
 
 
@@ -823,6 +985,992 @@ class QBittorrentClient(TorrentClient):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# HTTP Control API Server
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HTTPAPIServer:
+    """Simple HTTP API server for querying/controlling mole"""
+
+    def __init__(self, mole: 'Mole', bind: str, port: int, api_key: str = ''):
+        self.mole = mole
+        self.bind = bind
+        self.port = port
+        self.api_key = api_key
+        self._server = None
+
+    async def start(self):
+        """Start the HTTP API server"""
+        self._server = await asyncio.start_server(
+            self._handle_request, self.bind, self.port
+        )
+        auth_status = "enabled" if self.api_key else "DISABLED (no API key set)"
+        log.info(f"HTTP API server listening on {self.bind}:{self.port}")
+        log.info(f"HTTP API authentication: {auth_status}")
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def stop(self):
+        """Stop the HTTP API server"""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+    def _check_auth(self, headers: dict, query_params: dict) -> bool:
+        """Check API key authentication using constant-time comparison"""
+        if not self.api_key:
+            # No API key configured - allow all (localhost only recommended)
+            return True
+
+        # Use constant-time comparison to prevent timing attacks
+        api_key_bytes = self.api_key.encode('utf-8')
+
+        # Check X-API-Key header
+        header_key = headers.get('x-api-key', '')
+        if header_key and hmac.compare_digest(header_key.encode('utf-8'), api_key_bytes):
+            return True
+
+        # Check Authorization: Bearer <key>
+        auth_header = headers.get('authorization', '')
+        if auth_header.startswith('Bearer '):
+            bearer_key = auth_header[7:]
+            if bearer_key and hmac.compare_digest(bearer_key.encode('utf-8'), api_key_bytes):
+                return True
+
+        # Check ?api_key= query parameter
+        query_key = query_params.get('api_key', '')
+        if query_key and hmac.compare_digest(query_key.encode('utf-8'), api_key_bytes):
+            return True
+
+        return False
+
+    def _parse_query_params(self, path: str) -> tuple:
+        """Parse path and query parameters"""
+        if '?' in path:
+            path_part, query_string = path.split('?', 1)
+            params = {}
+            for param in query_string.split('&'):
+                if '=' in param:
+                    key, value = param.split('=', 1)
+                    params[key] = value
+            return path_part, params
+        return path, {}
+
+    async def _handle_request(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle incoming HTTP request"""
+        try:
+            # Read request line
+            request_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+            if not request_line:
+                return
+
+            request_line = request_line.decode('utf-8').strip()
+            parts = request_line.split(' ')
+            if len(parts) < 2:
+                await self._send_response(writer, 400, {"error": "Bad request"})
+                return
+
+            method, full_path = parts[0], parts[1]
+            path, query_params = self._parse_query_params(full_path)
+
+            # Read headers
+            headers = {}
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                if line == b'\r\n' or line == b'\n' or not line:
+                    break
+                if b':' in line:
+                    key, value = line.decode('utf-8').split(':', 1)
+                    headers[key.strip().lower()] = value.strip()
+
+            # Check authentication
+            if not self._check_auth(headers, query_params):
+                await self._send_response(writer, 401, {"error": "Unauthorized", "message": "Invalid or missing API key"})
+                return
+
+            # Route request
+            response = await self._route_request(method, path)
+            await self._send_response(writer, response['status'], response['body'])
+
+        except asyncio.TimeoutError:
+            await self._send_response(writer, 408, {"error": "Request timeout"})
+        except Exception as e:
+            log.error(f"API request error: {e}")
+            await self._send_response(writer, 500, {"error": "Internal server error"})
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def _route_request(self, method: str, path: str) -> dict:
+        """Route request to appropriate handler"""
+        routes = {
+            ('GET', '/v1/status'): self._get_status,
+            ('GET', '/v1/port'): self._get_port,
+            ('GET', '/v1/ip'): self._get_ip,
+            ('GET', '/v1/server'): self._get_server,
+            ('GET', '/v1/health'): self._get_health,
+            ('GET', '/v1/dns'): self._get_dns,
+            ('PUT', '/v1/vpn/restart'): self._put_restart,
+        }
+
+        handler = routes.get((method, path))
+        if handler:
+            return await handler()
+
+        return {'status': 404, 'body': {"error": "Not found", "path": path}}
+
+    async def _send_response(self, writer: asyncio.StreamWriter, status: int, body: dict):
+        """Send HTTP response"""
+        status_messages = {
+            200: 'OK', 400: 'Bad Request', 404: 'Not Found',
+            408: 'Request Timeout', 500: 'Internal Server Error'
+        }
+        body_bytes = json.dumps(body, indent=2).encode('utf-8')
+
+        response = f"HTTP/1.1 {status} {status_messages.get(status, 'Unknown')}\r\n"
+        response += "Content-Type: application/json\r\n"
+        response += f"Content-Length: {len(body_bytes)}\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+
+        writer.write(response.encode('utf-8'))
+        writer.write(body_bytes)
+        await writer.drain()
+
+    async def _get_status(self) -> dict:
+        """GET /v1/status - VPN connection status"""
+        state = self.mole.state
+        return {
+            'status': 200,
+            'body': {
+                'connected': state.connected,
+                'server': state.server_hostname,
+                'server_ip': state.server_ip,
+                'peer_ip': state.peer_ip,
+                'port': state.port,
+                'port_forward_enabled': self.mole.config.port_forward,
+            }
+        }
+
+    async def _get_port(self) -> dict:
+        """GET /v1/port - Current forwarded port"""
+        port = self.mole.state.port
+        return {
+            'status': 200,
+            'body': {
+                'port': port,
+                'enabled': self.mole.config.port_forward,
+            }
+        }
+
+    async def _get_ip(self) -> dict:
+        """GET /v1/ip - Public IP address"""
+        try:
+            result = run_in_netns(
+                ["curl", "-s", "--max-time", "5", "https://ifconfig.me"],
+                self.mole.config.netns, check=False
+            )
+            ip = result.stdout.strip() if result.returncode == 0 else None
+        except Exception:
+            ip = None
+
+        return {
+            'status': 200,
+            'body': {
+                'public_ip': ip,
+                'server_ip': self.mole.state.server_ip,
+            }
+        }
+
+    async def _get_server(self) -> dict:
+        """GET /v1/server - Current server info"""
+        state = self.mole.state
+        return {
+            'status': 200,
+            'body': {
+                'hostname': state.server_hostname,
+                'ip': state.server_ip,
+                'vip': state.server_vip,
+            }
+        }
+
+    async def _get_health(self) -> dict:
+        """GET /v1/health - Health check status"""
+        # Check WireGuard interface
+        result = run_in_netns(["wg", "show", "mole"], self.mole.config.netns, check=False)
+        wg_up = result.returncode == 0
+
+        # Check connectivity
+        ping_result = run_in_netns(
+            ["ping", "-c", "1", "-W", "2", "1.1.1.1"],
+            self.mole.config.netns, check=False
+        )
+        connected = ping_result.returncode == 0
+
+        return {
+            'status': 200,
+            'body': {
+                'healthy': wg_up and connected,
+                'wireguard_up': wg_up,
+                'internet_connected': connected,
+            }
+        }
+
+    async def _get_dns(self) -> dict:
+        """GET /v1/dns - DNS over TLS status and cache stats"""
+        config = self.mole.config
+        dns_server = getattr(self.mole, '_dns_server', None)
+
+        cache_size = 0
+        cache_entries = 0
+        blocked_domains = 0
+        last_blocklist_update = None
+
+        if dns_server:
+            cache_entries = len(dns_server._cache)
+            # Calculate approximate cache size
+            cache_size = sum(len(v[0]) for v in dns_server._cache.values())
+            blocked_domains = len(dns_server.blocked_domains)
+            if dns_server._last_blocklist_update > 0:
+                last_blocklist_update = int(dns_server._last_blocklist_update)
+
+        return {
+            'status': 200,
+            'body': {
+                'enabled': config.dot_enabled,
+                'upstream': config.dot_upstream,
+                'caching': config.dot_caching,
+                'cache_entries': cache_entries,
+                'cache_size_bytes': cache_size,
+                'blocked_domains': blocked_domains,
+                'last_blocklist_update': last_blocklist_update,
+                'block_ads': config.dot_block_ads,
+                'block_malware': config.dot_block_malware,
+                'block_tracking': config.dot_block_tracking,
+            }
+        }
+
+    async def _put_restart(self) -> dict:
+        """PUT /v1/vpn/restart - Trigger VPN reconnection"""
+        log.info("API: Restart requested")
+        # Schedule renewal in background
+        asyncio.create_task(self.mole._full_renewal())
+        return {
+            'status': 200,
+            'body': {
+                'message': 'Restart initiated',
+            }
+        }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HTTP Proxy Server (Authenticated)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class HTTPProxyServer:
+    """Authenticated HTTP proxy that routes traffic through VPN namespace"""
+
+    # Private/internal IP ranges to block (SSRF protection)
+    BLOCKED_NETWORKS = [
+        ('127.', ),              # Loopback
+        ('10.', ),               # Private Class A
+        ('192.168.', ),          # Private Class C
+        ('172.16.', '172.17.', '172.18.', '172.19.',  # Private Class B
+         '172.20.', '172.21.', '172.22.', '172.23.',
+         '172.24.', '172.25.', '172.26.', '172.27.',
+         '172.28.', '172.29.', '172.30.', '172.31.'),
+        ('169.254.', ),          # Link-local / Cloud metadata
+        ('0.', ),                # Invalid
+        ('255.', ),              # Broadcast
+    ]
+
+    def __init__(self, config: Config, netns: str):
+        self.config = config
+        self.netns = netns
+        self.bind = config.proxy_bind
+        self.port = config.proxy_port
+        self.user = config.proxy_user
+        self.password = config.proxy_pass
+        self._server = None
+
+    def _is_blocked_target(self, host: str) -> bool:
+        """Check if target host is internal/private (SSRF protection)"""
+        # Block localhost by name
+        if host.lower() in ('localhost', 'localhost.localdomain'):
+            return True
+
+        # Block cloud metadata hostnames
+        if host.lower() in ('metadata.google.internal', 'metadata', '169.254.169.254'):
+            return True
+
+        # Block internal veth addresses
+        if host == self.config.veth_host_ip or host == self.config.veth_vpn_ip:
+            return True
+
+        # Check if it looks like an IP address
+        parts = host.split('.')
+        if len(parts) == 4 and all(p.isdigit() for p in parts):
+            # It's an IPv4 address - check against blocked networks
+            for network_group in self.BLOCKED_NETWORKS:
+                for prefix in network_group:
+                    if host.startswith(prefix):
+                        return True
+
+        return False
+
+    async def start(self):
+        """Start the HTTP proxy server"""
+        self._server = await asyncio.start_server(
+            self._handle_connection, self.bind, self.port
+        )
+        log.info(f"HTTP Proxy server listening on {self.bind}:{self.port}")
+        async with self._server:
+            await self._server.serve_forever()
+
+    async def stop(self):
+        """Stop the HTTP proxy server"""
+        if self._server:
+            self._server.close()
+            await self._server.wait_closed()
+
+    async def _handle_connection(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle incoming proxy connection"""
+        try:
+            # Read request line
+            request_line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+            if not request_line:
+                return
+
+            request_line = request_line.decode('utf-8', errors='ignore').strip()
+            parts = request_line.split(' ')
+            if len(parts) < 3:
+                await self._send_error(writer, 400, "Bad Request")
+                return
+
+            method, target, _ = parts[0], parts[1], parts[2]
+
+            # Read headers
+            headers = {}
+            while True:
+                line = await asyncio.wait_for(reader.readline(), timeout=30.0)
+                if line == b'\r\n' or line == b'\n' or not line:
+                    break
+                if b':' in line:
+                    key, value = line.decode('utf-8', errors='ignore').split(':', 1)
+                    headers[key.strip().lower()] = value.strip()
+
+            # Check authentication
+            if not self._check_auth(headers):
+                await self._send_auth_required(writer)
+                return
+
+            # Handle CONNECT method (HTTPS tunneling)
+            if method == 'CONNECT':
+                await self._handle_connect(target, reader, writer)
+            else:
+                # Handle regular HTTP request
+                await self._handle_http(method, target, headers, reader, writer)
+
+        except asyncio.TimeoutError:
+            log.debug("Proxy connection timeout")
+        except Exception as e:
+            log.error(f"Proxy error: {e}")
+        finally:
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except:
+                pass
+
+    def _check_auth(self, headers: dict) -> bool:
+        """Verify proxy authentication using constant-time comparison"""
+        auth = headers.get('proxy-authorization', '')
+        if not auth.startswith('Basic '):
+            return False
+        try:
+            credentials = base64.b64decode(auth[6:]).decode('utf-8')
+            user, passwd = credentials.split(':', 1)
+            # Use constant-time comparison to prevent timing attacks
+            user_match = hmac.compare_digest(user.encode('utf-8'), self.user.encode('utf-8'))
+            pass_match = hmac.compare_digest(passwd.encode('utf-8'), self.password.encode('utf-8'))
+            return user_match and pass_match
+        except (ValueError, UnicodeDecodeError, base64.binascii.Error):
+            return False
+
+    async def _send_auth_required(self, writer: asyncio.StreamWriter):
+        """Send 407 Proxy Authentication Required"""
+        response = "HTTP/1.1 407 Proxy Authentication Required\r\n"
+        response += 'Proxy-Authenticate: Basic realm="mole"\r\n'
+        response += "Content-Length: 0\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        writer.write(response.encode('utf-8'))
+        await writer.drain()
+
+    async def _send_error(self, writer: asyncio.StreamWriter, code: int, message: str):
+        """Send HTTP error response"""
+        response = f"HTTP/1.1 {code} {message}\r\n"
+        response += "Content-Length: 0\r\n"
+        response += "Connection: close\r\n"
+        response += "\r\n"
+        writer.write(response.encode('utf-8'))
+        await writer.drain()
+
+    async def _handle_connect(self, target: str, reader: asyncio.StreamReader,
+                              writer: asyncio.StreamWriter):
+        """Handle CONNECT method for HTTPS tunneling"""
+        # Parse target (host:port)
+        if ':' in target:
+            host, port_str = target.rsplit(':', 1)
+            try:
+                port = int(port_str)
+            except ValueError:
+                await self._send_error(writer, 400, "Invalid port")
+                return
+        else:
+            host, port = target, 443
+
+        # SSRF protection: block internal/private addresses
+        if self._is_blocked_target(host):
+            log.warning(f"Proxy SSRF blocked: {host}:{port}")
+            await self._send_error(writer, 403, "Forbidden")
+            return
+
+        try:
+            # Connect to target through namespace using socat
+            # Using create_subprocess_exec (safe, no shell injection)
+            proc = await asyncio.create_subprocess_exec(
+                'ip', 'netns', 'exec', self.netns,
+                'socat', '-', f'TCP:{host}:{port}',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            # Send connection established
+            writer.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            await writer.drain()
+
+            # Bidirectional tunnel
+            await asyncio.gather(
+                self._pipe(reader, proc.stdin),
+                self._pipe_proc(proc.stdout, writer),
+                return_exceptions=True
+            )
+
+        except Exception as e:
+            log.error(f"CONNECT tunnel error: {e}")
+            await self._send_error(writer, 502, "Bad Gateway")
+
+    async def _handle_http(self, method: str, target: str, headers: dict,
+                           reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
+        """Handle regular HTTP request through proxy"""
+        try:
+            # Parse URL
+            if target.startswith('http://'):
+                url = target[7:]
+            else:
+                url = target
+
+            if '/' in url:
+                host_port, path = url.split('/', 1)
+                path = '/' + path
+            else:
+                host_port = url
+                path = '/'
+
+            if ':' in host_port:
+                host, port_str = host_port.rsplit(':', 1)
+                try:
+                    port = int(port_str)
+                except ValueError:
+                    await self._send_error(writer, 400, "Invalid port")
+                    return
+            else:
+                host, port = host_port, 80
+
+            # SSRF protection: block internal/private addresses
+            if self._is_blocked_target(host):
+                log.warning(f"Proxy SSRF blocked: {host}:{port}")
+                await self._send_error(writer, 403, "Forbidden")
+                return
+
+            # Build request to forward
+            request = f"{method} {path} HTTP/1.1\r\n"
+            request += f"Host: {host}\r\n"
+            for key, value in headers.items():
+                if key not in ('proxy-authorization', 'proxy-connection'):
+                    request += f"{key}: {value}\r\n"
+            request += "Connection: close\r\n"
+            request += "\r\n"
+
+            # Read body if present
+            content_length = int(headers.get('content-length', 0))
+            body = b''
+            if content_length > 0:
+                body = await reader.read(content_length)
+
+            # Forward request through namespace (safe, no shell)
+            proc = await asyncio.create_subprocess_exec(
+                'ip', 'netns', 'exec', self.netns,
+                'socat', '-', f'TCP:{host}:{port}',
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL
+            )
+
+            # Send request
+            proc.stdin.write(request.encode('utf-8'))
+            proc.stdin.write(body)
+            await proc.stdin.drain()
+            proc.stdin.close()
+
+            # Read and forward response
+            response = await proc.stdout.read()
+            writer.write(response)
+            await writer.drain()
+
+        except Exception as e:
+            log.error(f"HTTP proxy error: {e}")
+            await self._send_error(writer, 502, "Bad Gateway")
+
+    async def _pipe(self, reader: asyncio.StreamReader, writer):
+        """Pipe data from reader to subprocess stdin"""
+        try:
+            while True:
+                data = await reader.read(8192)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except:
+            pass
+        finally:
+            try:
+                writer.close()
+            except:
+                pass
+
+    async def _pipe_proc(self, proc_stdout, writer: asyncio.StreamWriter):
+        """Pipe data from subprocess stdout to writer"""
+        try:
+            while True:
+                data = await proc_stdout.read(8192)
+                if not data:
+                    break
+                writer.write(data)
+                await writer.drain()
+        except:
+            pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DNS over TLS Server
+# ═══════════════════════════════════════════════════════════════════════════
+
+# DNS over TLS upstream providers: (ip, port, sni_hostname)
+DOT_PROVIDERS = {
+    'cloudflare': ('1.1.1.1', 853, 'cloudflare-dns.com'),
+    'cloudflare-family': ('1.1.1.3', 853, 'family.cloudflare-dns.com'),  # Blocks malware + adult content
+    'quad9': ('9.9.9.9', 853, 'dns.quad9.net'),              # Blocks malware
+    'quad9-unsecured': ('9.9.9.10', 853, 'dns.quad9.net'),   # No blocking
+    'google': ('8.8.8.8', 853, 'dns.google'),
+}
+
+# Blocklist URLs (hosts file format)
+BLOCKLIST_URLS = {
+    'ads': 'https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews-gambling/hosts',
+    'malware': 'https://urlhaus.abuse.ch/downloads/hostfile/',
+    'tracking': 'https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/master/data/hosts/spy.txt',
+}
+
+
+class DNSProtocol(asyncio.DatagramProtocol):
+    """UDP protocol handler for DNS queries"""
+
+    def __init__(self, server: 'DNSOverTLSServer'):
+        self.server = server
+        self.transport = None
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data: bytes, addr: tuple):
+        """Handle incoming DNS query"""
+        asyncio.create_task(self._handle_query(data, addr))
+
+    async def _handle_query(self, data: bytes, addr: tuple):
+        """Process DNS query and send response"""
+        try:
+            response = await self.server.resolve(data)
+            if response and self.transport:
+                self.transport.sendto(response, addr)
+        except Exception as e:
+            log.debug(f"DNS query error: {e}")
+
+
+class DNSOverTLSServer:
+    """DNS over TLS server with filtering and caching support"""
+
+    def __init__(self, config: Config, netns: str):
+        self.config = config
+        self.netns = netns
+        self.bind = config.dot_bind
+        self.port = config.dot_port
+        self.upstream_ip, self.upstream_port, self.upstream_sni = self._get_upstream()
+        self.blocked_domains: set = set()
+        self._transport = None
+        self._protocol = None
+        # DNS cache: {(domain, qtype): (response_bytes, expiry_time)}
+        self._cache: Dict[Tuple[str, int], Tuple[bytes, float]] = {}
+        self._cache_enabled = config.dot_caching
+        self._cache_max_ttl = config.dot_cache_ttl  # 0 = use response TTL
+        self._blocklist_update_task = None
+        self._last_blocklist_update = 0.0
+
+    def _get_upstream(self) -> Tuple[str, int, str]:
+        """Get upstream DNS server (IP, port, SNI hostname)"""
+        upstream = self.config.dot_upstream.lower()
+        if upstream == 'custom':
+            custom = self.config.dot_custom_server
+            if ':' in custom:
+                ip, port = custom.rsplit(':', 1)
+                return (ip, int(port), ip)  # Use IP as hostname for custom
+            return (custom, 853, custom)
+        provider = DOT_PROVIDERS.get(upstream, DOT_PROVIDERS['cloudflare'])
+        return provider  # Returns (ip, port, sni_hostname)
+
+    async def start(self):
+        """Start the DNS server"""
+        # Load blocklists
+        await self._load_blocklists()
+        self._last_blocklist_update = time.time()
+
+        # Create UDP server
+        loop = asyncio.get_event_loop()
+        self._transport, self._protocol = await loop.create_datagram_endpoint(
+            lambda: DNSProtocol(self),
+            local_addr=(self.bind, self.port)
+        )
+        log.info(f"DNS over TLS server listening on {self.bind}:{self.port}")
+        log.info(f"DNS upstream: {self.config.dot_upstream} ({self.upstream_ip}:{self.upstream_port})")
+        log.info(f"DNS caching: {'enabled' if self._cache_enabled else 'disabled'}")
+        log.info(f"DNS blocking {len(self.blocked_domains)} domains")
+
+        # Start blocklist update task if enabled
+        update_period = self.config.dot_update_period
+        if update_period > 0:
+            log.info(f"DNS blocklist auto-update: every {update_period // 3600}h")
+            self._blocklist_update_task = asyncio.create_task(self._blocklist_update_loop())
+
+        # Keep running
+        while True:
+            await asyncio.sleep(3600)
+
+    async def stop(self):
+        """Stop the DNS server"""
+        if self._blocklist_update_task:
+            self._blocklist_update_task.cancel()
+            try:
+                await self._blocklist_update_task
+            except asyncio.CancelledError:
+                pass
+        if self._transport:
+            self._transport.close()
+
+    async def _blocklist_update_loop(self):
+        """Periodically update blocklists"""
+        update_period = self.config.dot_update_period
+        while True:
+            try:
+                await asyncio.sleep(update_period)
+                log.info("Updating DNS blocklists...")
+                old_count = len(self.blocked_domains)
+                await self._load_blocklists()
+                new_count = len(self.blocked_domains)
+                self._last_blocklist_update = time.time()
+                log.info(f"DNS blocklists updated: {old_count} -> {new_count} domains")
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                log.error(f"Blocklist update error: {e}")
+
+    async def _load_blocklists(self):
+        """Load and parse blocklists"""
+        blocklists_to_load = []
+        if self.config.dot_block_ads:
+            blocklists_to_load.append('ads')
+        if self.config.dot_block_malware:
+            blocklists_to_load.append('malware')
+        if self.config.dot_block_tracking:
+            blocklists_to_load.append('tracking')
+
+        if not blocklists_to_load:
+            return
+
+        # Cache directory
+        cache_dir = Path(self.config.state_dir) / 'blocklists'
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        for name in blocklists_to_load:
+            url = BLOCKLIST_URLS.get(name)
+            if not url:
+                continue
+
+            cache_file = cache_dir / f"{name}.txt"
+            content = None
+
+            # Try to download fresh blocklist
+            try:
+                async with asyncio.timeout(30):
+                    proc = await asyncio.create_subprocess_exec(
+                        'curl', '-sL', '--max-time', '25', url,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.DEVNULL
+                    )
+                    stdout, _ = await proc.communicate()
+                    if proc.returncode == 0 and stdout:
+                        content = stdout.decode('utf-8', errors='ignore')
+                        # Cache the blocklist
+                        cache_file.write_text(content)
+                        log.debug(f"Downloaded {name} blocklist")
+            except Exception as e:
+                log.debug(f"Failed to download {name} blocklist: {e}")
+
+            # Fall back to cached version
+            if not content and cache_file.exists():
+                content = cache_file.read_text()
+                log.debug(f"Using cached {name} blocklist")
+
+            if content:
+                self._parse_hosts_file(content)
+
+    def _parse_hosts_file(self, content: str):
+        """Parse hosts file format and add domains to blocklist"""
+        for line in content.split('\n'):
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            # Hosts file format: "0.0.0.0 domain.com" or "127.0.0.1 domain.com"
+            parts = line.split()
+            if len(parts) >= 2:
+                domain = parts[1].lower()
+                # Skip local entries
+                if domain not in ('localhost', 'localhost.localdomain', 'local', 'broadcasthost'):
+                    self.blocked_domains.add(domain)
+
+    async def resolve(self, query: bytes) -> Optional[bytes]:
+        """Resolve DNS query, blocking or forwarding as needed"""
+        try:
+            # Parse domain and query type from query
+            domain = self._extract_domain(query)
+            qtype = self._extract_qtype(query) if self._cache_enabled else 0
+
+            if domain:
+                # Check blocklist first (no point caching blocked domains)
+                if self._is_blocked(domain):
+                    log.debug(f"DNS blocked: {domain}")
+                    return self._make_nxdomain_response(query)
+
+                # Check cache
+                if self._cache_enabled:
+                    cache_key = (domain, qtype)
+                    cached = self._cache.get(cache_key)
+                    if cached:
+                        response, expiry = cached
+                        if time.time() < expiry:
+                            log.debug(f"DNS cache hit: {domain}")
+                            # Update transaction ID to match query
+                            return query[:2] + response[2:]
+                        else:
+                            # Expired, remove from cache
+                            del self._cache[cache_key]
+
+            # Forward to upstream via TLS
+            response = await self._query_upstream(query)
+
+            # Cache successful response
+            if response and self._cache_enabled and domain:
+                ttl = self._extract_response_ttl(response)
+                # Apply max TTL cap if configured
+                if self._cache_max_ttl > 0:
+                    ttl = min(ttl, self._cache_max_ttl)
+                cache_key = (domain, qtype)
+                self._cache[cache_key] = (response, time.time() + ttl)
+                log.debug(f"DNS cached: {domain} (TTL={ttl}s)")
+
+                # Simple cache cleanup: remove expired entries periodically
+                if len(self._cache) > 1000:
+                    now = time.time()
+                    self._cache = {k: v for k, v in self._cache.items() if v[1] > now}
+
+            return response
+
+        except Exception as e:
+            log.debug(f"DNS resolve error: {e}")
+            return None
+
+    def _extract_domain(self, query: bytes) -> Optional[str]:
+        """Extract domain name from DNS query"""
+        try:
+            # Skip header (12 bytes)
+            pos = 12
+            labels = []
+
+            while pos < len(query):
+                length = query[pos]
+                if length == 0:
+                    break
+                if length >= 64:  # Compression pointer, stop here
+                    break
+                pos += 1
+                labels.append(query[pos:pos + length].decode('utf-8', errors='ignore'))
+                pos += length
+
+            return '.'.join(labels).lower() if labels else None
+        except:
+            return None
+
+    def _extract_qtype(self, query: bytes) -> int:
+        """Extract query type from DNS query (A=1, AAAA=28, etc.)"""
+        try:
+            # Skip header (12 bytes) and find end of domain name
+            pos = 12
+            while pos < len(query) and query[pos] != 0:
+                length = query[pos]
+                if length >= 64:  # Compression pointer
+                    pos += 2
+                    break
+                pos += 1 + length
+            else:
+                pos += 1  # Skip null terminator
+
+            # QTYPE is 2 bytes after domain name
+            if pos + 2 <= len(query):
+                return struct.unpack('!H', query[pos:pos + 2])[0]
+            return 0
+        except:
+            return 0
+
+    def _extract_response_ttl(self, response: bytes) -> int:
+        """Extract minimum TTL from DNS response for cache expiry"""
+        try:
+            # Parse header
+            if len(response) < 12:
+                return 300  # Default 5 minutes
+
+            ancount = struct.unpack('!H', response[6:8])[0]
+            if ancount == 0:
+                return 300  # No answers, use default
+
+            # Skip header and question section
+            pos = 12
+            # Skip question name
+            while pos < len(response) and response[pos] != 0:
+                length = response[pos]
+                if length >= 64:  # Compression pointer
+                    pos += 2
+                    break
+                pos += 1 + length
+            else:
+                pos += 1  # Skip null terminator
+            pos += 4  # Skip QTYPE and QCLASS
+
+            # Parse answer records to find minimum TTL
+            min_ttl = 86400  # Default max 24 hours
+            for _ in range(ancount):
+                if pos >= len(response):
+                    break
+                # Skip name (may be compressed)
+                if response[pos] >= 192:  # Compression pointer
+                    pos += 2
+                else:
+                    while pos < len(response) and response[pos] != 0:
+                        pos += 1 + response[pos]
+                    pos += 1
+
+                if pos + 10 > len(response):
+                    break
+
+                # TYPE (2), CLASS (2), TTL (4), RDLENGTH (2)
+                ttl = struct.unpack('!I', response[pos + 4:pos + 8])[0]
+                rdlength = struct.unpack('!H', response[pos + 8:pos + 10])[0]
+                min_ttl = min(min_ttl, ttl)
+                pos += 10 + rdlength
+
+            return max(60, min_ttl)  # At least 60 seconds
+        except:
+            return 300  # Default 5 minutes on error
+
+    def _is_blocked(self, domain: str) -> bool:
+        """Check if domain or parent domain is blocked"""
+        # Check exact match
+        if domain in self.blocked_domains:
+            return True
+
+        # Check parent domains (e.g., ads.example.com -> example.com)
+        parts = domain.split('.')
+        for i in range(1, len(parts)):
+            parent = '.'.join(parts[i:])
+            if parent in self.blocked_domains:
+                return True
+
+        return False
+
+    def _make_nxdomain_response(self, query: bytes) -> bytes:
+        """Create NXDOMAIN response for blocked domains"""
+        # Copy transaction ID
+        response = bytearray(query[:2])
+        # Flags: QR=1, OPCODE=0, AA=0, TC=0, RD=1, RA=1, Z=0, RCODE=3 (NXDOMAIN)
+        response.extend([0x81, 0x83])
+        # QDCOUNT=1, ANCOUNT=0, NSCOUNT=0, ARCOUNT=0
+        response.extend([0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        # Copy question section
+        response.extend(query[12:])
+        return bytes(response)
+
+    async def _query_upstream(self, query: bytes) -> Optional[bytes]:
+        """Forward query to upstream DNS over TLS"""
+        try:
+            # Create TLS context
+            ctx = ssl.create_default_context()
+
+            # Connect to upstream with SNI hostname for certificate validation
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.upstream_ip, self.upstream_port,
+                    ssl=ctx, server_hostname=self.upstream_sni
+                ),
+                timeout=10.0
+            )
+
+            try:
+                # DNS over TLS uses length-prefixed messages
+                writer.write(struct.pack('!H', len(query)) + query)
+                await writer.drain()
+
+                # Read response
+                length_data = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
+                length = struct.unpack('!H', length_data)[0]
+                response = await asyncio.wait_for(reader.readexactly(length), timeout=10.0)
+
+                return response
+
+            finally:
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except:
+                    pass
+
+        except asyncio.TimeoutError:
+            log.debug("DNS upstream timeout")
+            return None
+        except Exception as e:
+            log.debug(f"DNS upstream error: {e}")
+            return None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Provider Factory
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -876,6 +2024,12 @@ class Mole:
         self.shutdown_event = asyncio.Event()
         self._keepalive_task = None
         self._watchdog_task = None
+        self._api_task = None
+        self._api_server = None
+        self._proxy_task = None
+        self._proxy_server = None
+        self._dns_task = None
+        self._dns_server = None
 
     async def run(self):
         """Main entry point"""
@@ -894,6 +2048,14 @@ class Mole:
         # Setup network namespace
         self._setup_namespace()
 
+        # Start DNS over TLS server if enabled (must start BEFORE VPN connects)
+        # because WireGuard config points DNS to this server
+        if self.config.dot_enabled:
+            self._dns_server = DNSOverTLSServer(self.config, self.config.netns)
+            self._dns_task = asyncio.create_task(self._dns_server.start())
+            # Give DNS server a moment to bind
+            await asyncio.sleep(0.5)
+
         # Initial VPN setup
         if not await self._full_renewal():
             log.error("Initial setup failed, will retry...")
@@ -901,6 +2063,28 @@ class Mole:
         # Start background tasks
         self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
+
+        # Start HTTP API server if enabled
+        if self.config.http_api_enabled:
+            # Security warning: unauthenticated API on non-localhost
+            bind_addr = self.config.http_api_bind
+            if not self.config.http_api_key and bind_addr not in ('127.0.0.1', 'localhost', '::1'):
+                log.warning("SECURITY WARNING: HTTP API is exposed without authentication!")
+                log.warning(f"  Bind address '{bind_addr}' is accessible from network")
+                log.warning("  Set HTTP_API_KEY in config or bind to 127.0.0.1")
+
+            self._api_server = HTTPAPIServer(self, bind_addr, self.config.http_api_port, self.config.http_api_key)
+            self._api_task = asyncio.create_task(self._api_server.start())
+            log.info(f"HTTP API: enabled on {bind_addr}:{self.config.http_api_port}")
+
+        # Start HTTP Proxy server if enabled
+        if self.config.proxy_enabled:
+            if not self.config.proxy_pass:
+                log.error("HTTP Proxy: PROXY_PASS is required but not set")
+            else:
+                self._proxy_server = HTTPProxyServer(self.config, self.config.netns)
+                self._proxy_task = asyncio.create_task(self._proxy_server.start())
+                log.info(f"HTTP Proxy: enabled on {self.config.proxy_bind}:{self.config.proxy_port}")
 
         # Main renewal loop
         while not self.shutdown_event.is_set():
@@ -925,6 +2109,24 @@ class Mole:
             self._keepalive_task.cancel()
         if self._watchdog_task:
             self._watchdog_task.cancel()
+
+        # Stop HTTP API server
+        if self._api_task:
+            self._api_task.cancel()
+        if self._api_server:
+            await self._api_server.stop()
+
+        # Stop HTTP Proxy server
+        if self._proxy_task:
+            self._proxy_task.cancel()
+        if self._proxy_server:
+            await self._proxy_server.stop()
+
+        # Stop DNS server
+        if self._dns_task:
+            self._dns_task.cancel()
+        if self._dns_server:
+            await self._dns_server.stop()
 
         # Bring down VPN
         run_in_netns(["wg-quick", "down", self.config.wg_conf], self.config.netns, check=False)
@@ -1098,7 +2300,7 @@ class Mole:
         # Bring up WireGuard
         result = run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, check=False)
         if result.returncode != 0:
-            log.error(f"Failed to bring up WireGuard: {result.stderr}")
+            log.error(f"Failed to bring up WireGuard: {sanitize_for_log(result.stderr)}")
             return False
 
         await asyncio.sleep(5)
@@ -1218,14 +2420,20 @@ def cmd_init(args):
         print("Error: init must be run as root (sudo mole init)")
         return 1
 
-    # Create directories
+    # Create directories with appropriate permissions
     print(f"\nCreating directories...")
-    for d in [config_dir, state_dir, providers_dir]:
+    for d, mode in [(config_dir, 0o755), (state_dir, 0o700), (providers_dir, 0o755)]:
         if not d.exists():
-            d.mkdir(parents=True, mode=0o755)
-            print(f"  Created: {d}")
+            d.mkdir(parents=True, mode=mode)
+            print(f"  Created: {d} (mode {oct(mode)})")
         else:
-            print(f"  Exists:  {d}")
+            # Ensure existing directory has correct permissions
+            current_mode = d.stat().st_mode & 0o777
+            if current_mode != mode:
+                d.chmod(mode)
+                print(f"  Fixed:   {d} (mode {oct(mode)})")
+            else:
+                print(f"  Exists:  {d}")
 
     # Write PIA CA cert
     pia_cert_path = providers_dir / "pia-ca.crt"
@@ -1484,6 +2692,167 @@ def cmd_ip(args):
     else:
         print("Failed to get public IP (VPN may be down)")
         return 1
+
+
+def cmd_dns(args):
+    """Test DNS over TLS functionality"""
+    config = Config(args.config if hasattr(args, 'config') and args.config else DEFAULT_CONFIG_FILE)
+
+    print(f"MOLE v{VERSION} - DNS over TLS Test")
+    print("=" * 50)
+
+    # Check if DOT is enabled in config
+    if not config.dot_enabled:
+        print("\n⚠ DNS over TLS is not enabled in config")
+        print("  Add DOT_ENABLED=true to your config file")
+        return 1
+
+    dot_bind = config.dot_bind
+    dot_port = config.dot_port
+
+    print(f"\nDOT Server: {dot_bind}:{dot_port}")
+    print(f"Upstream: {config.dot_upstream}")
+    print(f"Block ads: {config.dot_block_ads}")
+    print(f"Block malware: {config.dot_block_malware}")
+    print(f"Block tracking: {config.dot_block_tracking}")
+
+    # Test domains
+    test_domains = [
+        ("google.com", "Normal resolution"),
+        ("cloudflare.com", "Normal resolution"),
+    ]
+
+    # Add blocked domain tests if filtering is enabled
+    if config.dot_block_ads:
+        test_domains.append(("doubleclick.net", "Should be BLOCKED (ads)"))
+        test_domains.append(("pagead2.googlesyndication.com", "Should be BLOCKED (ads)"))
+    if config.dot_block_malware:
+        test_domains.append(("malware.testcategory.com", "Malware test domain"))
+
+    print("\n" + "-" * 50)
+    print("DNS Resolution Tests")
+    print("-" * 50)
+
+    # Determine if we should test from namespace or host
+    use_namespace = args.namespace if hasattr(args, 'namespace') and args.namespace else False
+
+    for domain, description in test_domains:
+        print(f"\n{domain}")
+        print(f"  Expected: {description}")
+
+        # Build dig command
+        dig_cmd = ["dig", "+short", "+time=5", "+tries=2", f"@{dot_bind}", domain]
+
+        try:
+            if use_namespace:
+                result = run_in_netns(dig_cmd, config.netns, check=False)
+            else:
+                result = subprocess.run(dig_cmd, capture_output=True, text=True, timeout=10)
+
+            if result.returncode == 0:
+                output = result.stdout.strip()
+                if output:
+                    # Got IP addresses - domain resolved
+                    ips = output.split('\n')[:2]  # Show max 2 IPs
+                    print(f"  Result: ✓ Resolved → {', '.join(ips)}")
+                else:
+                    # Empty response - likely NXDOMAIN (blocked)
+                    print(f"  Result: ✗ BLOCKED (NXDOMAIN)")
+            else:
+                print(f"  Result: ✗ Query failed (server may not be running)")
+
+        except subprocess.TimeoutExpired:
+            print(f"  Result: ✗ Timeout (server may not be running)")
+        except Exception as e:
+            print(f"  Result: ✗ Error: {e}")
+
+    # Additional connectivity test
+    print("\n" + "-" * 50)
+    print("Upstream Connectivity Test")
+    print("-" * 50)
+
+    upstream_ip, upstream_port = DOT_PROVIDERS.get(
+        config.dot_upstream.lower(),
+        DOT_PROVIDERS['cloudflare']
+    )
+    if config.dot_upstream.lower() == 'custom' and config.dot_custom_server:
+        custom = config.dot_custom_server
+        if ':' in custom:
+            upstream_ip, upstream_port = custom.rsplit(':', 1)
+            upstream_port = int(upstream_port)
+        else:
+            upstream_ip = custom
+
+    print(f"\nTesting TLS connection to {upstream_ip}:{upstream_port}...")
+
+    try:
+        import ssl
+        import socket
+        ctx = ssl.create_default_context()
+        with socket.create_connection((upstream_ip, upstream_port), timeout=5) as sock:
+            with ctx.wrap_socket(sock, server_hostname=upstream_ip) as ssock:
+                print(f"  Result: ✓ TLS connection successful")
+                print(f"  TLS version: {ssock.version()}")
+    except Exception as e:
+        print(f"  Result: ✗ TLS connection failed: {e}")
+
+    print("\n" + "=" * 50)
+    print("Usage examples:")
+    print(f"  dig @{dot_bind} example.com")
+    print(f"  nslookup example.com {dot_bind}")
+    print("=" * 50)
+
+    return 0
+
+
+def cmd_apikey(args):
+    """Generate or show API key"""
+    import secrets
+
+    action = args.action if hasattr(args, 'action') and args.action else 'generate'
+
+    if action == 'generate':
+        # Generate a secure random API key
+        api_key = secrets.token_urlsafe(32)
+
+        print(f"MOLE v{VERSION} - API Key Generator")
+        print("=" * 50)
+        print(f"\nGenerated API Key:\n")
+        print(f"  {api_key}")
+        print(f"\nAdd this to your config file ({DEFAULT_CONFIG_FILE}):\n")
+        print(f"  HTTP_API_KEY={api_key}")
+        print(f"\nUsage examples:\n")
+        print(f"  # Using X-API-Key header")
+        print(f"  curl -H 'X-API-Key: {api_key}' http://127.0.0.1:8080/v1/status")
+        print(f"\n  # Using Authorization header")
+        print(f"  curl -H 'Authorization: Bearer {api_key}' http://127.0.0.1:8080/v1/status")
+        print(f"\n  # Using query parameter")
+        print(f"  curl 'http://127.0.0.1:8080/v1/status?api_key={api_key}'")
+        print("=" * 50)
+
+    elif action == 'show':
+        # Show current API key from config
+        config = Config(args.config if hasattr(args, 'config') and args.config else DEFAULT_CONFIG_FILE)
+        api_key = config.http_api_key
+
+        print(f"MOLE v{VERSION} - API Key Status")
+        print("=" * 50)
+
+        if api_key:
+            # Mask the key for security (show first 8 and last 4 chars)
+            if len(api_key) > 12:
+                masked = api_key[:8] + '...' + api_key[-4:]
+            else:
+                masked = '***'
+            print(f"\nAPI Key configured: Yes")
+            print(f"Key (masked): {masked}")
+        else:
+            print(f"\nAPI Key configured: No")
+            print(f"\nRun 'mole api-key generate' to create one")
+
+        print("=" * 50)
+
+    return 0
 
 
 def cmd_stop(args):
@@ -1869,7 +3238,7 @@ def cmd_stats(args):
         # Keep only last 100 sessions
         stats["sessions"] = stats["sessions"][-100:]
 
-        stats_file.write_text(json.dumps(stats, indent=2))
+        secure_write_file(stats_file, json.dumps(stats, indent=2))
         print(f"\nStats saved to {stats_file}")
 
     return 0
@@ -2193,6 +3562,34 @@ Examples:
     # ip command
     ip_parser = subparsers.add_parser("ip", help="Show current public IP")
 
+    # dns command
+    dns_parser = subparsers.add_parser("dns", help="Test DNS over TLS functionality")
+    dns_parser.add_argument(
+        "-c", "--config",
+        default=DEFAULT_CONFIG_FILE,
+        help="Path to configuration file"
+    )
+    dns_parser.add_argument(
+        "-n", "--namespace",
+        action="store_true",
+        help="Run tests from inside VPN namespace"
+    )
+
+    # api-key command
+    apikey_parser = subparsers.add_parser("api-key", help="Generate or show API key")
+    apikey_parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["generate", "show"],
+        default="generate",
+        help="Action: generate (default) or show current key"
+    )
+    apikey_parser.add_argument(
+        "-c", "--config",
+        default=DEFAULT_CONFIG_FILE,
+        help="Path to configuration file"
+    )
+
     # regions command
     regions_parser = subparsers.add_parser("regions", help="List VPN regions")
     regions_parser.add_argument(
@@ -2298,7 +3695,7 @@ Examples:
 
     # Setup logging
     global log
-    log = setup_logging(quiet=(args.command in ["status", "ip", "regions", "stats"]))
+    log = setup_logging(quiet=(args.command in ["status", "ip", "dns", "api-key", "regions", "stats"]))
 
     # Route to command
     if args.command == "init":
@@ -2307,6 +3704,10 @@ Examples:
         return cmd_status(args)
     elif args.command == "ip":
         return cmd_ip(args)
+    elif args.command == "dns":
+        return cmd_dns(args)
+    elif args.command == "api-key":
+        return cmd_apikey(args)
     elif args.command == "regions":
         return cmd_regions(args)
     elif args.command == "autoselect":

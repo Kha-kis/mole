@@ -83,6 +83,96 @@ WATCHDOG_INTERVAL=60
 WATCHDOG_MAX_FAILURES=3
 
 # ═══════════════════════════════════════════════════════════════════
+# HTTP Control API
+# ═══════════════════════════════════════════════════════════════════
+
+# Enable REST API for querying VPN status and control
+# HTTP_API_ENABLED=true
+
+# Port for HTTP API (default: 8080)
+# HTTP_API_PORT=8080
+
+# Bind address (default: 127.0.0.1 - localhost only)
+# Set to 0.0.0.0 to allow remote access (requires API key)
+# HTTP_API_BIND=127.0.0.1
+
+# API Key for authentication (generate with: mole api-key generate)
+# Required if binding to non-localhost address
+# HTTP_API_KEY=your_api_key_here
+
+# API Endpoints:
+#   GET  /v1/status   - VPN connection status
+#   GET  /v1/port     - Current forwarded port
+#   GET  /v1/ip       - Public IP address
+#   GET  /v1/server   - Current server info
+#   GET  /v1/health   - Health check status
+#   GET  /v1/dns      - DNS cache and blocklist stats
+#   PUT  /v1/vpn/restart - Trigger reconnection
+#
+# Authentication methods (when API key is set):
+#   Header: X-API-Key: <key>
+#   Header: Authorization: Bearer <key>
+#   Query:  ?api_key=<key>
+
+# ═══════════════════════════════════════════════════════════════════
+# HTTP Proxy
+# ═══════════════════════════════════════════════════════════════════
+
+# Enable authenticated HTTP proxy that routes traffic through VPN
+# PROXY_ENABLED=true
+
+# Proxy port (default: 8888)
+# PROXY_PORT=8888
+
+# Bind address (default: 10.200.200.1 - host side of veth)
+# PROXY_BIND=10.200.200.1
+
+# Proxy authentication (REQUIRED if proxy is enabled)
+# PROXY_USER=mole
+# PROXY_PASS=your_secure_password
+
+# Usage:
+#   curl -x http://mole:password@10.200.200.1:8888 https://ifconfig.me
+#   Or configure browser proxy to 10.200.200.1:8888 with authentication
+
+# ═══════════════════════════════════════════════════════════════════
+# DNS over TLS
+# ═══════════════════════════════════════════════════════════════════
+
+# Enable DNS over TLS server with filtering
+# DOT_ENABLED=true
+
+# DNS port (default: 53)
+# DOT_PORT=53
+
+# Bind address (default: 10.200.200.2 - inside namespace)
+# DOT_BIND=10.200.200.2
+
+# Upstream DNS provider: cloudflare, cloudflare-family, quad9,
+#                        quad9-unsecured, google, or 'custom'
+# DOT_UPSTREAM=cloudflare
+
+# Custom upstream DNS server (only used when DOT_UPSTREAM=custom)
+# DOT_CUSTOM_SERVER=1.1.1.1:853
+
+# DNS Filtering (blocklists are downloaded and cached automatically)
+# DOT_BLOCK_ADS=true        # Block ads, trackers, fake news, gambling
+# DOT_BLOCK_MALWARE=true    # Block known malware domains
+# DOT_BLOCK_TRACKING=false  # Block Windows telemetry/spyware
+
+# DNS Caching (reduces latency and upstream queries)
+# DOT_CACHING=true          # Enable DNS response caching (default: enabled)
+# DOT_CACHE_TTL=0           # Max cache TTL in seconds (0 = use response TTL)
+
+# Blocklist Auto-Update
+# DOT_UPDATE_PERIOD=24h     # How often to update blocklists (0 = disabled)
+#                           # Supports: 1h, 6h, 24h, 7d, or seconds
+
+# Usage:
+#   dig @10.200.200.2 google.com
+#   Or set nameserver 10.200.200.2 in /etc/resolv.conf
+
+# ═══════════════════════════════════════════════════════════════════
 # Advanced Settings (usually don't need to change)
 # ═══════════════════════════════════════════════════════════════════
 
