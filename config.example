@@ -36,10 +36,20 @@ VETH_VPN_IP=10.200.200.2
 HOST_INTERFACE=eth0
 
 # ═══════════════════════════════════════════════════════════════════
+# Port Forwarding Settings
+# ═══════════════════════════════════════════════════════════════════
+
+# Enable port forwarding (requires a region that supports it)
+# Set to false if you don't need incoming connections
+# Use 'mole regions pia --pf' to see regions with port forwarding
+PORT_FORWARD=true
+
+# ═══════════════════════════════════════════════════════════════════
 # Torrent Client Settings
 # ═══════════════════════════════════════════════════════════════════
 
-# Currently supported: qbittorrent
+# Supported: qbittorrent, none
+# Set to 'none' to disable torrent client integration
 TORRENT_CLIENT=qbittorrent
 
 # qBittorrent Web API URL
