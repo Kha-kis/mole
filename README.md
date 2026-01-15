@@ -32,9 +32,36 @@ MOLE runs your VPN connection in an isolated network namespace, automatically ha
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/mole.git
+git clone https://gitea.okami.icu/khak1s/mole.git
 cd mole
 sudo ./install.sh
+```
+
+The install script performs the following:
+- Installs the `mole` binary to `/usr/local/bin/mole`
+- Installs the systemd service to `/etc/systemd/system/mole.service`
+- Runs `mole init` to create the directory structure (`/etc/mole/`, `/var/lib/mole/`)
+- Enables the service (but does not start it)
+
+## Uninstallation
+
+To remove MOLE from your system:
+
+```bash
+sudo ./uninstall.sh
+```
+
+The uninstall script will:
+- Stop and disable the mole service
+- Remove `/usr/local/bin/mole`
+- Remove the systemd service file
+- Optionally remove configuration and state files (`/etc/mole/`, `/var/lib/mole/`, `/etc/wireguard/mole.conf`)
+
+**Note:** The network namespace and veth interfaces are not automatically removed. To clean them up manually:
+
+```bash
+sudo ip link del veth-host
+sudo ip netns del vpn
 ```
 
 ## Configuration
