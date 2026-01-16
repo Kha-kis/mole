@@ -1,0 +1,5 @@
+# Development dependencies for MOLE
+pytest>=7.0.0
+
+# Optional: for ProtonVPN support
+# proton-client>=0.7.0

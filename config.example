@@ -6,7 +6,7 @@
 # VPN Provider
 # ═══════════════════════════════════════════════════════════════════
 
-# Currently supported: pia
+# Supported providers: pia, proton
 VPN_PROVIDER=pia
 
 # ═══════════════════════════════════════════════════════════════════
@@ -16,11 +16,13 @@ VPN_PROVIDER=pia
 PIA_USER=your_pia_username
 PIA_PASS=your_pia_password
 
-# Region ID (supports comma-separated fallback list)
+# Region ID (or comma-separated fallback list, tried in order)
+# If first region has no suitable servers, tries next region, etc.
 # Use 'mole regions pia' to see available regions
 # Use 'mole autoselect' to find fastest region
-# Examples: ca_toronto, us_east, uk_london
-# Fallback: PIA_REGION=ca_toronto,ca_montreal,us_chicago
+# Examples:
+#   PIA_REGION=ca_toronto                       # Only Toronto
+#   PIA_REGION=ca_toronto,ca_montreal,us_east   # Try Toronto first, then Montreal, then US East
 PIA_REGION=ca_toronto
 
 # Specific server hostname (optional, overrides auto-selection)
@@ -28,6 +30,58 @@ PIA_REGION=ca_toronto
 # Use 'mole autoselect --servers' to find fastest specific server
 # Use 'mole autoselect -s -r ca_toronto' to test servers in one region
 # PIA_SERVER=toronto420
+
+# Dedicated IP token (optional, for PIA Dedicated IP users)
+# If set, MOLE will use your dedicated IP instead of shared servers
+# Get your DIP token from the PIA client or web portal
+# PIA_DIP_TOKEN=dip_xxxxxxxxxxxxxxxx
+
+# Maximum latency threshold for auto-selection (optional, in milliseconds)
+# Servers with latency above this value will be excluded
+# Set to 0 to disable (default) - use best server regardless of latency
+# PIA_MAX_LATENCY=100
+
+# ═══════════════════════════════════════════════════════════════════
+# ProtonVPN Settings
+# ═══════════════════════════════════════════════════════════════════
+# To use ProtonVPN, set VPN_PROVIDER=proton above
+
+# PROTON_USER=your_proton_email
+# PROTON_PASS=your_proton_password
+
+# Country code (or comma-separated fallback list, tried in order)
+# If first country has no suitable servers, tries next country, etc.
+# Use 2-letter country codes: US, CH, NL, DE, etc.
+# Examples:
+#   PROTON_COUNTRY=NL           # Only Netherlands
+#   PROTON_COUNTRY=NL,DE,CH     # Try NL first, then DE, then CH
+# PROTON_COUNTRY=NL
+
+# Specific server name (optional, overrides auto-selection)
+# Example: NL#458, CH#1, US-CA#1
+# PROTON_SERVER=
+
+# Account tier: 0=free, 1=basic, 2=plus/visionary (default: 2)
+# Port forwarding requires tier 2 (Plus plan)
+# PROTON_TIER=2
+
+# Maximum latency threshold for server selection (optional, in milliseconds)
+# Pings servers and excludes those above this threshold
+# Set to 0 to disable (default) - select by load only
+# PROTON_MAX_LATENCY=100
+
+# NetShield DNS filtering (requires Plus plan)
+#   0 = Off (default)
+#   1 = Block malware
+#   2 = Block malware, ads, and trackers
+# PROTON_NETSHIELD=0
+
+# Prefer reconnecting to last used server (default: true)
+# Set to false to always select fresh server by load/latency
+# PROTON_PREFER_LAST_SERVER=true
+
+# NAT-PMP gateway for port forwarding (usually don't need to change)
+# PROTON_NATPMP_GATEWAY=10.2.0.1
 
 # ═══════════════════════════════════════════════════════════════════
 # Network Namespace Settings
@@ -61,9 +115,14 @@ PORT_FORWARD=true
 # Set to 'none' to disable torrent client integration
 TORRENT_CLIENT=qbittorrent
 
-# qBittorrent Web API URL
-# Default port is 8080, adjust if you changed it
-QB_API_URL=http://localhost:8080/api/v2/app
+# qBittorrent Web UI port (default: 8080)
+QB_PORT=8080
+
+# User to run qBittorrent as (for 'mole qbittorrent setup')
+# QB_USER=youruser
+
+# Legacy option: qBittorrent Web API URL (QB_PORT is preferred)
+# QB_API_URL=http://localhost:8080/api/v2/app
 
 # ═══════════════════════════════════════════════════════════════════
 # Timing Settings (in seconds)

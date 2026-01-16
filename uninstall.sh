@@ -28,7 +28,14 @@ fi
 echo ""
 echo "Stopping and disabling services..."
 
-# Stop qbittorrent-mole first if it exists (depends on mole)
+# Stop qbittorrent passthrough first if it exists
+if [ -f /etc/systemd/system/qbittorrent-passthrough.service ]; then
+    echo "  Stopping qbittorrent-passthrough..."
+    systemctl stop qbittorrent-passthrough 2>/dev/null || true
+    systemctl disable qbittorrent-passthrough 2>/dev/null || true
+fi
+
+# Stop qbittorrent-mole if it exists (depends on mole)
 if [ -f /etc/systemd/system/qbittorrent-mole.service ]; then
     echo "  Stopping qbittorrent-mole..."
     systemctl stop qbittorrent-mole 2>/dev/null || true
@@ -42,8 +49,10 @@ systemctl disable mole 2>/dev/null || true
 
 echo "Removing files..."
 rm -f /usr/local/bin/mole
+rm -rf /usr/local/lib/mole
 rm -f /etc/systemd/system/mole.service
 rm -f /etc/systemd/system/qbittorrent-mole.service
+rm -f /etc/systemd/system/qbittorrent-passthrough.service
 systemctl daemon-reload
 
 read -p "Remove configuration and state? [y/N] " -n 1 -r

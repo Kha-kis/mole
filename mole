@@ -14,6 +14,7 @@ import logging
 import signal
 import sys
 import os
+import re
 from abc import ABC, abstractmethod
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -90,31 +91,6 @@ iyd1Fzx0yujuiXDROLhISLQDRjVVAvawrAtLZWYK31bY7KlezPlQnl/D9Asxe85l
 8jO5+0LdJ6VyOs/Hd4w52alDW/MFySDZSfQHMTIc30hLBJ8OnCEIvluVQQ2UQvoW
 +no177N9L2Y+M9TcTA62ZyMXShHQGeh20rb4kK8f+iFX8NxtdHVSkxMEFSfDDyQ=
 -----END CERTIFICATE-----
-"""
-
-# ═══════════════════════════════════════════════════════════════════════════
-# qBittorrent Service Template
-# ═══════════════════════════════════════════════════════════════════════════
-
-QBITTORRENT_SERVICE_TEMPLATE = """[Unit]
-Description=qBittorrent-nox in MOLE VPN namespace
-Documentation=man:qbittorrent-nox(1)
-After=network.target mole.service
-Wants=mole.service
-BindsTo=mole.service
-
-[Service]
-Type=simple
-User={user}
-ExecStart=/usr/bin/ip netns exec {netns} /usr/bin/qbittorrent-nox --webui-port={port}
-Restart=on-failure
-RestartSec=5
-
-# Wait for VPN to be ready
-ExecStartPre=/bin/bash -c 'for i in {{1..30}}; do ip netns exec {netns} ip link show mole >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
-
-[Install]
-WantedBy=multi-user.target
 """
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -242,7 +218,28 @@ class Config:
 
     @property
     def qb_api_url(self) -> str:
+        # Build URL from components if QB_PORT is set, otherwise use legacy QB_API_URL
+        port = self.get('QB_PORT', '')
+        if port:
+            return f"http://{self.veth_vpn_ip}:{port}/api/v2/app"
         return self.get('QB_API_URL', 'http://localhost:8080/api/v2/app')
+
+    @property
+    def qb_port(self) -> int:
+        # Get from QB_PORT, or extract from QB_API_URL for backwards compatibility
+        port = self.get('QB_PORT', '')
+        if port:
+            return int(port)
+        # Try to extract from QB_API_URL
+        url = self.get('QB_API_URL', '')
+        match = re.search(r':(\d+)(?:/|$)', url)
+        if match:
+            return int(match.group(1))
+        return 8080
+
+    @property
+    def qb_user(self) -> str:
+        return self.get('QB_USER', '')
 
     @property
     def renewal_interval(self) -> int:
@@ -312,7 +309,9 @@ class Config:
 
     @property
     def dot_bind(self) -> str:
-        return self.get('DOT_BIND', '10.200.200.2')
+        # DNS server runs IN namespace, serves apps in namespace
+        # 127.0.0.1 for namespace-local, 0.0.0.0 to also serve host via veth
+        return self.get('DOT_BIND', '127.0.0.1')
 
     @property
     def dot_upstream(self) -> str:
@@ -407,11 +406,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         # Validate PIA_REGION (supports comma-separated fallback list)
         region_str = config.get('PIA_REGION', '')
         if not region_str:
-            errors.append("PIA_REGION is not set")
+            warnings.append("PIA_REGION not set - will auto-detect on first run")
         else:
             regions = [r.strip() for r in region_str.split(',') if r.strip()]
             if not regions:
-                errors.append("PIA_REGION is empty after parsing")
+                warnings.append("PIA_REGION is empty - will auto-detect on first run")
             elif len(regions) > 1:
                 warnings.append(f"Using fallback regions: {', '.join(regions)}")
 
@@ -433,7 +432,6 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         warnings.append(f"HOST_INTERFACE '{host_iface}' not found (may be OK if using different name)")
 
     # Validate IP addresses
-    import re
     ip_pattern = re.compile(r'^(\d{1,3}\.){3}\d{1,3}$')
 
     for key in ['VETH_HOST_IP', 'VETH_VPN_IP']:
@@ -544,18 +542,17 @@ def secure_write_file(path: Path, content: str, mode: int = 0o600) -> None:
         os.close(fd)
 
 
-import re as _re
 def sanitize_for_log(text: str, max_length: int = 200) -> str:
     """Sanitize text for logging by removing sensitive patterns and truncating"""
     if not text:
         return text
     # Mask patterns that look like tokens, API keys, or base64 secrets
     # Token pattern: alphanumeric strings of 20+ chars
-    text = _re.sub(r'\b[A-Za-z0-9_-]{32,}\b', '[REDACTED]', text)
+    text = re.sub(r'\b[A-Za-z0-9_-]{32,}\b', '[REDACTED]', text)
     # Base64 patterns (long sequences ending in = or ==)
-    text = _re.sub(r'\b[A-Za-z0-9+/]{20,}={0,2}\b', '[REDACTED]', text)
+    text = re.sub(r'\b[A-Za-z0-9+/]{20,}={0,2}\b', '[REDACTED]', text)
     # Password/token in JSON
-    text = _re.sub(r'"(password|token|secret|key|auth)"\s*:\s*"[^"]*"', r'"\1": "[REDACTED]"', text, flags=_re.IGNORECASE)
+    text = re.sub(r'"(password|token|secret|key|auth)"\s*:\s*"[^"]*"', r'"\1": "[REDACTED]"', text, flags=re.IGNORECASE)
     # Truncate if too long
     if len(text) > max_length:
         text = text[:max_length] + "...[truncated]"
@@ -632,7 +629,9 @@ class PIAProvider(VPNProvider):
     @property
     def _regions(self) -> List[str]:
         """Get list of regions (supports comma-separated fallback)"""
-        region_str = self.config.get('PIA_REGION', 'ca_toronto')
+        region_str = self.config.get('PIA_REGION', '')
+        if not region_str:
+            return []
         return [r.strip() for r in region_str.split(',') if r.strip()]
 
     @property
@@ -644,6 +643,79 @@ class PIAProvider(VPNProvider):
     @property
     def _ca_cert(self) -> str:
         return f"{self.config.config_dir}/providers/pia-ca.crt"
+
+    async def _autodetect_region(self) -> Optional[str]:
+        """Auto-detect the best region based on latency and save to config"""
+        import concurrent.futures
+
+        try:
+            # Fetch regions
+            with urllib.request.urlopen(
+                "https://serverlist.piaservers.net/vpninfo/servers/v6",
+                timeout=30
+            ) as resp:
+                data = resp.readline().decode()
+                servers = json.loads(data)
+
+            # Filter to port forwarding regions if needed
+            pf_only = self.config.port_forward
+            regions = []
+            for region in servers.get("regions", []):
+                if pf_only and not region.get("port_forward"):
+                    continue
+                wg_servers = region.get("servers", {}).get("wg", [])
+                if wg_servers:
+                    regions.append({
+                        "id": region["id"],
+                        "name": region["name"],
+                        "ip": wg_servers[0]["ip"]
+                    })
+
+            if not regions:
+                log.error("No suitable regions found")
+                return None
+
+            log.info(f"Testing {len(regions)} regions...")
+
+            # Ping test regions in parallel
+            def ping_region(r):
+                try:
+                    result = run_cmd(["ping", "-c", "1", "-W", "2", r["ip"]], check=False)
+                    if result.returncode == 0:
+                        for part in result.stdout.split():
+                            if part.startswith("time="):
+                                return (r, float(part[5:]))
+                except:
+                    pass
+                return (r, None)
+
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = [executor.submit(ping_region, r) for r in regions]
+                for future in concurrent.futures.as_completed(futures):
+                    region, latency = future.result()
+                    if latency is not None:
+                        results.append((region, latency))
+
+            if not results:
+                log.error("Could not reach any regions")
+                return None
+
+            # Sort by latency and pick best
+            results.sort(key=lambda x: x[1])
+            best = results[0][0]
+            best_latency = results[0][1]
+
+            log.info(f"Best region: {best['name']} ({best['id']}) - {best_latency:.1f} ms")
+
+            # Save to config
+            _apply_region_to_config(best['id'])
+
+            return best['id']
+
+        except Exception as e:
+            log.error(f"Auto-detect failed: {e}")
+            return None
 
     async def authenticate(self) -> bool:
         """Get PIA authentication token"""
@@ -675,6 +747,14 @@ class PIAProvider(VPNProvider):
         """Get PIA server with fallback regions and optional specific server"""
         regions_to_try = self._regions
         target_hostname = self._server_hostname
+
+        if not regions_to_try:
+            log.info("PIA_REGION not set - auto-detecting best region...")
+            best_region = await self._autodetect_region()
+            if not best_region:
+                log.error("Could not auto-detect region")
+                return False
+            regions_to_try = [best_region]
 
         if target_hostname:
             log.info(f"Looking for server: {target_hostname} in regions: {', '.join(regions_to_try)}")
@@ -2407,8 +2487,11 @@ class Mole:
 
 def cmd_init(args):
     """Initialize MOLE directory structure and config"""
-    print(f"MOLE v{VERSION} - Initialization")
-    print("=" * 40)
+    import getpass
+    import concurrent.futures
+
+    print(f"MOLE v{VERSION} - Setup Wizard")
+    print("=" * 50)
 
     config_dir = Path(DEFAULT_CONFIG_DIR)
     state_dir = Path(DEFAULT_STATE_DIR)
@@ -2425,47 +2508,463 @@ def cmd_init(args):
     for d, mode in [(config_dir, 0o755), (state_dir, 0o700), (providers_dir, 0o755)]:
         if not d.exists():
             d.mkdir(parents=True, mode=mode)
-            print(f"  Created: {d} (mode {oct(mode)})")
+            print(f"  Created: {d}")
         else:
-            # Ensure existing directory has correct permissions
-            current_mode = d.stat().st_mode & 0o777
-            if current_mode != mode:
-                d.chmod(mode)
-                print(f"  Fixed:   {d} (mode {oct(mode)})")
-            else:
-                print(f"  Exists:  {d}")
+            d.chmod(mode)
+            print(f"  Exists:  {d}")
 
     # Write PIA CA cert
     pia_cert_path = providers_dir / "pia-ca.crt"
-    if not pia_cert_path.exists() or args.force:
-        pia_cert_path.write_text(PIA_CA_CERT)
-        print(f"  Created: {pia_cert_path}")
+    pia_cert_path.write_text(PIA_CA_CERT)
+    print(f"  Created: {pia_cert_path}")
+
+    # Check if config exists and not forcing
+    if config_file.exists() and not args.force:
+        print(f"\nConfig file already exists: {config_file}")
+        response = input("Run interactive setup anyway? [y/N]: ").strip().lower()
+        if response not in ('y', 'yes'):
+            print("\nSetup skipped. Use --force to overwrite config.")
+            print(f"Or edit manually: {config_file}")
+            return 0
+
+    # Interactive setup
+    print(f"\n{'=' * 50}")
+    print("PIA (Private Internet Access) Setup")
+    print(f"{'=' * 50}")
+
+    # Get credentials
+    print("\nEnter your PIA credentials:")
+    pia_user = input("  Username: ").strip()
+    if not pia_user:
+        print("Error: Username is required")
+        return 1
+
+    pia_pass = getpass.getpass("  Password: ")
+    if not pia_pass:
+        print("Error: Password is required")
+        return 1
+
+    # Port forwarding preference
+    print("\nPort forwarding allows incoming connections (needed for torrents).")
+    pf_response = input("Enable port forwarding? [Y/n]: ").strip().lower()
+    port_forward = pf_response not in ('n', 'no')
+
+    # Torrent client
+    torrent_client = "none"
+    qb_port = 8080
+    qb_user = os.environ.get('SUDO_USER', 'root')
+    if port_forward:
+        print("\nTorrent client integration (auto-updates listening port):")
+        print("  1. qBittorrent")
+        print("  2. None")
+        tc_response = input("Select [1]: ").strip()
+        if tc_response != '2':
+            torrent_client = "qbittorrent"
+            qb_port_str = input("  qBittorrent Web UI port [8080]: ").strip()
+            qb_port = int(qb_port_str) if qb_port_str.isdigit() else 8080
+            qb_user_input = input(f"  Run qBittorrent as user [{qb_user}]: ").strip()
+            if qb_user_input:
+                qb_user = qb_user_input
+
+    # Detect network interface
+    print("\nDetecting network interface...")
+    host_interface = "eth0"
+    try:
+        result = run_cmd(["ip", "route", "show", "default"], check=False)
+        if result.returncode == 0 and "dev" in result.stdout:
+            parts = result.stdout.split()
+            if "dev" in parts:
+                idx = parts.index("dev") + 1
+                if idx < len(parts):
+                    host_interface = parts[idx]
+    except:
+        pass
+    print(f"  Detected: {host_interface}")
+
+    # Auto-detect best region
+    print(f"\n{'=' * 50}")
+    print("Finding best region...")
+    print(f"{'=' * 50}")
+
+    best_region = None
+    try:
+        with urllib.request.urlopen(
+            "https://serverlist.piaservers.net/vpninfo/servers/v6",
+            timeout=30
+        ) as resp:
+            data = resp.readline().decode()
+            servers = json.loads(data)
+
+        # Filter regions
+        regions = []
+        for region in servers.get("regions", []):
+            if port_forward and not region.get("port_forward"):
+                continue
+            wg_servers = region.get("servers", {}).get("wg", [])
+            if wg_servers:
+                regions.append({
+                    "id": region["id"],
+                    "name": region["name"],
+                    "ip": wg_servers[0]["ip"]
+                })
+
+        if regions:
+            print(f"Testing {len(regions)} regions...")
+
+            def ping_region(r):
+                try:
+                    result = run_cmd(["ping", "-c", "1", "-W", "2", r["ip"]], check=False)
+                    if result.returncode == 0:
+                        for part in result.stdout.split():
+                            if part.startswith("time="):
+                                return (r, float(part[5:]))
+                except:
+                    pass
+                return (r, None)
+
+            results = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
+                futures = [executor.submit(ping_region, r) for r in regions]
+                for future in concurrent.futures.as_completed(futures):
+                    region, latency = future.result()
+                    if latency is not None:
+                        results.append((region, latency))
+
+            if results:
+                results.sort(key=lambda x: x[1])
+                best_region = results[0][0]['id']
+                best_name = results[0][0]['name']
+                best_latency = results[0][1]
+                print(f"\nBest region: {best_name} ({best_region}) - {best_latency:.1f} ms")
+
+                # Show top 5
+                if len(results) > 1:
+                    print("\nTop 5 regions:")
+                    for i, (r, lat) in enumerate(results[:5], 1):
+                        marker = " <-- selected" if i == 1 else ""
+                        print(f"  {i}. {r['name']:<30} {lat:.1f} ms{marker}")
+    except Exception as e:
+        print(f"Warning: Could not auto-detect region: {e}")
+
+    if not best_region:
+        print("\nCould not auto-detect region. Using default: ca_toronto")
+        best_region = "ca_toronto"
+
+    # DNS over TLS
+    print(f"\n{'=' * 50}")
+    print("DNS over TLS (encrypted DNS with optional ad-blocking)")
+    print(f"{'=' * 50}")
+    dot_enabled = False
+    dot_upstream = "cloudflare"
+    dot_block_ads = False
+    dot_block_malware = False
+
+    dot_response = input("\nEnable DNS over TLS? [y/N]: ").strip().lower()
+    dot_custom_server = ""
+    if dot_response in ('y', 'yes'):
+        dot_enabled = True
+        print("\nSelect DNS provider:")
+        print("  1. Cloudflare (1.1.1.1) - Fast, privacy-focused")
+        print("  2. Cloudflare Family - Blocks malware & adult content")
+        print("  3. Quad9 (9.9.9.9) - Blocks malware")
+        print("  4. Google (8.8.8.8)")
+        print("  5. Custom (enter your own DoT server)")
+        dns_choice = input("Select [1]: ").strip()
+        if dns_choice == '2':
+            dot_upstream = "cloudflare-family"
+        elif dns_choice == '3':
+            dot_upstream = "quad9"
+        elif dns_choice == '4':
+            dot_upstream = "google"
+        elif dns_choice == '5':
+            dot_upstream = "custom"
+            dot_custom_server = input("  Enter DoT server (ip:port, e.g. 9.9.9.9:853): ").strip()
+            if not dot_custom_server:
+                print("  No server entered, using Cloudflare")
+                dot_upstream = "cloudflare"
+
+        print("\nAd & tracker blocking (uses auto-updating blocklists):")
+        block_response = input("Block ads and trackers? [Y/n]: ").strip().lower()
+        if block_response not in ('n', 'no'):
+            dot_block_ads = True
+
+        malware_response = input("Block malware domains? [Y/n]: ").strip().lower()
+        if malware_response not in ('n', 'no'):
+            dot_block_malware = True
+
+    # HTTP Proxy
+    print(f"\n{'=' * 50}")
+    print("HTTP Proxy (route other apps through VPN)")
+    print(f"{'=' * 50}")
+    proxy_enabled = False
+    proxy_user = ""
+    proxy_pass = ""
+
+    proxy_response = input("\nEnable HTTP proxy? [y/N]: ").strip().lower()
+    if proxy_response in ('y', 'yes'):
+        proxy_enabled = True
+        print("\nProxy authentication (required):")
+        proxy_user = input("  Proxy username [mole]: ").strip() or "mole"
+        proxy_pass = getpass.getpass("  Proxy password: ")
+        if not proxy_pass:
+            # Generate random password
+            import secrets
+            proxy_pass = secrets.token_urlsafe(16)
+            print(f"  Generated password: {proxy_pass}")
+
+    # HTTP API
+    print(f"\n{'=' * 50}")
+    print("HTTP Control API (query/control VPN via REST API)")
+    print(f"{'=' * 50}")
+    api_enabled = False
+    api_key = ""
+
+    api_response = input("\nEnable HTTP API? [y/N]: ").strip().lower()
+    if api_response in ('y', 'yes'):
+        api_enabled = True
+        import secrets
+        api_key = secrets.token_urlsafe(32)
+        print(f"\nGenerated API key: {api_key}")
+        print("(Save this - you'll need it to access the API)")
+
+    # Write config
+    print(f"\n{'=' * 50}")
+    print("Writing configuration...")
+    print(f"{'=' * 50}")
+
+    config_content = f"""# MOLE Configuration
+# Generated by setup wizard
+
+# VPN Provider
+VPN_PROVIDER=pia
+
+# PIA Credentials
+PIA_USER={pia_user}
+PIA_PASS={pia_pass}
+
+# Region (auto-detected)
+PIA_REGION={best_region}
+
+# Network Namespace
+NETNS_NAME=vpn
+VETH_HOST_IP=10.200.200.1
+VETH_VPN_IP=10.200.200.2
+
+# Host network interface
+HOST_INTERFACE={host_interface}
+
+# Port Forwarding
+PORT_FORWARD={'true' if port_forward else 'false'}
+
+# Torrent Client
+TORRENT_CLIENT={torrent_client}
+"""
+
+    if torrent_client == "qbittorrent":
+        config_content += f"""QB_PORT={qb_port}
+QB_USER={qb_user}
+"""
+
+    # DNS over TLS config
+    if dot_enabled:
+        config_content += f"""
+# DNS over TLS
+DOT_ENABLED=true
+DOT_UPSTREAM={dot_upstream}
+"""
+        if dot_upstream == "custom" and dot_custom_server:
+            config_content += f"DOT_CUSTOM_SERVER={dot_custom_server}\n"
+        config_content += f"""DOT_BLOCK_ADS={'true' if dot_block_ads else 'false'}
+DOT_BLOCK_MALWARE={'true' if dot_block_malware else 'false'}
+DOT_CACHING=true
+DOT_UPDATE_PERIOD=24h
+"""
     else:
-        print(f"  Exists:  {pia_cert_path}")
+        config_content += """
+# DNS over TLS (disabled)
+DOT_ENABLED=false
+"""
 
-    # Write config template
-    if not config_file.exists() or args.force:
-        config_file.write_text(CONFIG_TEMPLATE)
-        config_file.chmod(0o600)  # Restrict access (contains credentials)
-        print(f"  Created: {config_file}")
-        print(f"\n*** IMPORTANT: Edit {config_file} with your credentials ***")
+    # HTTP Proxy config
+    if proxy_enabled:
+        config_content += f"""
+# HTTP Proxy
+PROXY_ENABLED=true
+PROXY_PORT=8888
+PROXY_BIND=10.200.200.1
+PROXY_USER={proxy_user}
+PROXY_PASS={proxy_pass}
+"""
     else:
-        print(f"  Exists:  {config_file} (use --force to overwrite)")
+        config_content += """
+# HTTP Proxy (disabled)
+PROXY_ENABLED=false
+"""
 
-    print(f"\nDirectory structure:")
-    print(f"  {DEFAULT_CONFIG_DIR}/")
-    print(f"    config           <- Your configuration (edit this!)")
-    print(f"    providers/")
-    print(f"      pia-ca.crt     <- PIA CA certificate")
-    print(f"  {DEFAULT_STATE_DIR}/")
-    print(f"    (runtime state files)")
-    print(f"  {DEFAULT_WG_CONF}")
-    print(f"    (generated WireGuard config)")
+    # HTTP API config
+    if api_enabled:
+        config_content += f"""
+# HTTP Control API
+HTTP_API_ENABLED=true
+HTTP_API_PORT=8080
+HTTP_API_BIND=127.0.0.1
+HTTP_API_KEY={api_key}
+"""
+    else:
+        config_content += """
+# HTTP Control API (disabled)
+HTTP_API_ENABLED=false
+"""
 
-    print(f"\nNext steps:")
-    print(f"  1. Edit {config_file} with your VPN credentials")
-    print(f"  2. Run: sudo systemctl start mole")
-    print(f"  3. Check status: mole status")
+    config_file.write_text(config_content)
+    config_file.chmod(0o600)
+    print(f"  Created: {config_file}")
+
+    # Summary
+    print(f"\n{'=' * 50}")
+    print("Setup Complete!")
+    print(f"{'=' * 50}")
+    print(f"\nConfiguration:")
+    print(f"  Provider:        PIA")
+    print(f"  Region:          {best_region}")
+    print(f"  Port Forwarding: {'Yes' if port_forward else 'No'}")
+    if torrent_client == "qbittorrent":
+        print(f"  Torrent Client:  qBittorrent (port {qb_port})")
+    else:
+        print(f"  Torrent Client:  {torrent_client}")
+    print(f"  Interface:       {host_interface}")
+    if dot_enabled:
+        if dot_upstream == "custom" and dot_custom_server:
+            print(f"  DNS over TLS:    Yes (custom: {dot_custom_server})")
+        else:
+            print(f"  DNS over TLS:    Yes ({dot_upstream})")
+        features = []
+        if dot_block_ads:
+            features.append("ad-blocking")
+        if dot_block_malware:
+            features.append("malware-blocking")
+        if features:
+            print(f"    Features:      {', '.join(features)}")
+    else:
+        print(f"  DNS over TLS:    No")
+    print(f"  HTTP Proxy:      {'Yes (port 8888)' if proxy_enabled else 'No'}")
+    print(f"  HTTP API:        {'Yes (port 8080)' if api_enabled else 'No'}")
+
+    # Start service
+    print(f"\n{'=' * 50}")
+    print("Starting MOLE Service")
+    print(f"{'=' * 50}")
+
+    print("\nStarting MOLE...")
+    subprocess.run(["systemctl", "start", "mole"], check=False)
+
+    # Wait for VPN to connect
+    print("Waiting for VPN connection", end="", flush=True)
+    vpn_connected = False
+    for i in range(30):  # Wait up to 30 seconds
+        time.sleep(1)
+        print(".", end="", flush=True)
+
+        # Check if WireGuard interface is up
+        result = run_in_netns(["ip", "link", "show", "mole"], "vpn", check=False)
+        if result.returncode == 0 and "state UP" in result.stdout:
+            vpn_connected = True
+            break
+
+    print()
+
+    if vpn_connected:
+        print("VPN connected!")
+
+        # Get public IP
+        result = run_in_netns(["curl", "-s", "-m", "5", "https://ipinfo.io/ip"], "vpn", check=False)
+        if result.returncode == 0 and result.stdout.strip():
+            print(f"Public IP: {result.stdout.strip()}")
+
+        # Get port if port forwarding enabled
+        if port_forward:
+            state_file = Path(DEFAULT_STATE_DIR) / "state.json"
+            if state_file.exists():
+                try:
+                    state = json.loads(state_file.read_text())
+                    if state.get("port"):
+                        print(f"Forwarded Port: {state['port']}")
+                except:
+                    pass
+    else:
+        print("VPN is still connecting...")
+        print("Check status with: sudo mole status")
+        print("View logs with:   sudo mole logs -f")
+
+    # qBittorrent setup
+    if torrent_client == "qbittorrent" and vpn_connected:
+        print(f"\n{'=' * 50}")
+        print("qBittorrent Setup")
+        print(f"{'=' * 50}")
+
+        print("\nqBittorrent can run inside the VPN namespace so all")
+        print("torrent traffic goes through the VPN with kill-switch protection.")
+
+        qb_response = input("\nSetup qBittorrent in VPN namespace? [Y/n]: ").strip().lower()
+        if qb_response in ('', 'y', 'yes'):
+            # Check if qbittorrent-nox is installed
+            result = subprocess.run(["which", "qbittorrent-nox"], capture_output=True)
+            if result.returncode != 0:
+                print("\nqbittorrent-nox is not installed.")
+                print("Install it with: sudo apt install qbittorrent-nox")
+            else:
+                print("\nSetting up qBittorrent service...")
+
+                # Use centralized apply_config to generate service files
+                _qbittorrent_apply_config(enable_passthrough=False, verbose=False)
+
+                subprocess.run(["systemctl", "enable", "qbittorrent-mole"], check=False)
+                subprocess.run(["systemctl", "start", "qbittorrent-mole"], check=False)
+
+                print(f"  User: {qb_user}")
+                print(f"  Port: {qb_port}")
+                print("  Service enabled and started!")
+
+                # Ask about localhost passthrough
+                config = Config()
+                print(f"\nqBittorrent is accessible at http://{config.veth_vpn_ip}:{qb_port}")
+                passthrough_response = input(f"Also make it accessible at http://localhost:{qb_port}? [Y/n]: ").strip().lower()
+
+                if passthrough_response in ('', 'y', 'yes'):
+                    # Check if socat is installed
+                    socat_result = subprocess.run(["which", "socat"], capture_output=True)
+                    if socat_result.returncode != 0:
+                        print("\n  socat is not installed (needed for localhost passthrough)")
+                        print("  Install with: sudo apt install socat")
+                        print(f"  Then run: sudo mole qbittorrent passthrough")
+                    else:
+                        # Use centralized apply_config to generate passthrough service
+                        _qbittorrent_apply_config(enable_passthrough=True, verbose=False)
+
+                        subprocess.run(["systemctl", "enable", "qbittorrent-passthrough"], check=False)
+                        subprocess.run(["systemctl", "start", "qbittorrent-passthrough"], check=False)
+
+                        print(f"  Localhost passthrough enabled!")
+                        print(f"\nqBittorrent Web UI: http://localhost:{qb_port}")
+                else:
+                    print(f"\nqBittorrent Web UI: http://{config.veth_vpn_ip}:{qb_port}")
+
+                print("Default login: admin / adminadmin")
+                print("(Change password on first login!)")
+
+    # Final instructions
+    print(f"\n{'=' * 50}")
+    print("Setup Complete!")
+    print(f"{'=' * 50}")
+
+    print("\nUseful commands:")
+    print("  sudo mole status      - Check VPN status")
+    print("  sudo mole logs -f     - Follow logs")
+    print("  mole autoselect       - Find faster region")
+    if torrent_client == "qbittorrent":
+        print("  sudo systemctl status qbittorrent-mole  - qBittorrent status")
+
+    print("\nMOLE will start automatically on boot.")
 
     return 0
 
@@ -2810,8 +3309,30 @@ def cmd_apikey(args):
     import secrets
 
     action = args.action if hasattr(args, 'action') and args.action else 'generate'
+    config_path = args.config if hasattr(args, 'config') and args.config else DEFAULT_CONFIG_FILE
 
     if action == 'generate':
+        # Check if there's already a key in config
+        existing_key = None
+        try:
+            config = Config(config_path)
+            existing_key = config.http_api_key
+        except:
+            pass
+
+        if existing_key:
+            print(f"An API key already exists in config.")
+            if len(existing_key) > 12:
+                masked = existing_key[:8] + '...' + existing_key[-4:]
+            else:
+                masked = '***'
+            print(f"Current key (masked): {masked}")
+            response = input("\nGenerate a new key and replace it? [y/N]: ").strip().lower()
+            if response not in ('y', 'yes'):
+                print("Aborted.")
+                return 0
+            print()
+
         # Generate a secure random API key
         api_key = secrets.token_urlsafe(32)
 
@@ -2819,8 +3340,49 @@ def cmd_apikey(args):
         print("=" * 50)
         print(f"\nGenerated API Key:\n")
         print(f"  {api_key}")
-        print(f"\nAdd this to your config file ({DEFAULT_CONFIG_FILE}):\n")
-        print(f"  HTTP_API_KEY={api_key}")
+
+        # Offer to auto-apply to config
+        print()
+        response = input(f"Add this key to {config_path}? [Y/n]: ").strip().lower()
+        if response in ('', 'y', 'yes'):
+            try:
+                # Read current config
+                with open(config_path, 'r') as f:
+                    config_content = f.read()
+
+                # Check if HTTP_API_KEY line exists
+                if re.search(r'^HTTP_API_KEY=', config_content, re.MULTILINE):
+                    # Replace existing key
+                    config_content = re.sub(
+                        r'^HTTP_API_KEY=.*$',
+                        f'HTTP_API_KEY={api_key}',
+                        config_content,
+                        flags=re.MULTILINE
+                    )
+                else:
+                    # Add new key (append to end)
+                    if not config_content.endswith('\n'):
+                        config_content += '\n'
+                    config_content += f'\n# HTTP API Authentication\nHTTP_API_KEY={api_key}\n'
+
+                # Write back
+                with open(config_path, 'w') as f:
+                    f.write(config_content)
+
+                print(f"\nAPI key added to {config_path}")
+                print("Restart MOLE for the new key to take effect: sudo systemctl restart mole")
+            except PermissionError:
+                print(f"\nError: Permission denied writing to {config_path}")
+                print("Run with sudo to update config, or add manually:")
+                print(f"\n  HTTP_API_KEY={api_key}")
+            except Exception as e:
+                print(f"\nError updating config: {e}")
+                print("Add manually to your config file:")
+                print(f"\n  HTTP_API_KEY={api_key}")
+        else:
+            print(f"\nAdd this to your config file ({config_path}):\n")
+            print(f"  HTTP_API_KEY={api_key}")
+
         print(f"\nUsage examples:\n")
         print(f"  # Using X-API-Key header")
         print(f"  curl -H 'X-API-Key: {api_key}' http://127.0.0.1:8080/v1/status")
@@ -2832,20 +3394,24 @@ def cmd_apikey(args):
 
     elif action == 'show':
         # Show current API key from config
-        config = Config(args.config if hasattr(args, 'config') and args.config else DEFAULT_CONFIG_FILE)
+        try:
+            config = Config(config_path)
+        except PermissionError:
+            print(f"Error: Permission denied reading {config_path}")
+            print("Run with sudo: sudo mole api-key show")
+            return 1
+
         api_key = config.http_api_key
 
         print(f"MOLE v{VERSION} - API Key Status")
         print("=" * 50)
 
         if api_key:
-            # Mask the key for security (show first 8 and last 4 chars)
-            if len(api_key) > 12:
-                masked = api_key[:8] + '...' + api_key[-4:]
-            else:
-                masked = '***'
             print(f"\nAPI Key configured: Yes")
-            print(f"Key (masked): {masked}")
+            print(f"\nCurrent key:\n")
+            print(f"  {api_key}")
+            print(f"\nUsage examples:\n")
+            print(f"  curl -H 'X-API-Key: {api_key}' http://127.0.0.1:8080/v1/status")
         else:
             print(f"\nAPI Key configured: No")
             print(f"\nRun 'mole api-key generate' to create one")
@@ -2912,6 +3478,48 @@ def cmd_validate(args):
     else:
         print("\nConfiguration has errors - please fix before running")
         return 1
+
+
+def cmd_apply(args):
+    """Apply config changes to all generated service files"""
+    print(f"MOLE v{VERSION} - Apply Config")
+    print("=" * 40)
+
+    if os.geteuid() != 0:
+        print("Error: apply requires root (sudo mole apply)")
+        return 1
+
+    config = Config()
+    services_to_restart = []
+
+    # qBittorrent services
+    if config.torrent_client.lower() == 'qbittorrent':
+        print("\nqBittorrent:")
+        print(f"  Port: {config.qb_port}")
+        print(f"  User: {config.qb_user or '(auto-detect)'}")
+
+        if _qbittorrent_apply_config(verbose=True):
+            services_to_restart.extend(["qbittorrent-mole", "qbittorrent-passthrough"])
+
+    # Future modules can be added here:
+    # if config.some_other_service:
+    #     if _other_service_apply_config(verbose=True):
+    #         services_to_restart.append("other-service")
+
+    # Restart affected services if running
+    if services_to_restart:
+        print("\nRestarting affected services...")
+        for service in services_to_restart:
+            result = subprocess.run(
+                ["systemctl", "is-active", service],
+                capture_output=True, text=True
+            )
+            if result.stdout.strip() == "active":
+                subprocess.run(["systemctl", "restart", service], check=False)
+                print(f"  Restarted: {service}")
+
+    print("\nConfig applied.")
+    return 0
 
 
 def cmd_speedtest(args):
@@ -3029,6 +3637,86 @@ def _ping_server(server_ip: str, netns: str = None) -> Optional[float]:
     return None
 
 
+def _apply_region_to_config(region: str, server: str = None) -> bool:
+    """Apply region (and optionally server) selection to config file"""
+
+    try:
+        with open(DEFAULT_CONFIG_FILE, 'r') as f:
+            config_content = f.read()
+
+        # Update or add PIA_REGION
+        if re.search(r'^PIA_REGION=', config_content, re.MULTILINE):
+            config_content = re.sub(
+                r'^PIA_REGION=.*$',
+                f'PIA_REGION={region}',
+                config_content,
+                flags=re.MULTILINE
+            )
+        else:
+            if not config_content.endswith('\n'):
+                config_content += '\n'
+            config_content += f'\nPIA_REGION={region}\n'
+
+        # Update or add/remove PIA_SERVER
+        if server:
+            if re.search(r'^PIA_SERVER=', config_content, re.MULTILINE):
+                config_content = re.sub(
+                    r'^PIA_SERVER=.*$',
+                    f'PIA_SERVER={server}',
+                    config_content,
+                    flags=re.MULTILINE
+                )
+            elif re.search(r'^#\s*PIA_SERVER=', config_content, re.MULTILINE):
+                # Uncomment and set
+                config_content = re.sub(
+                    r'^#\s*PIA_SERVER=.*$',
+                    f'PIA_SERVER={server}',
+                    config_content,
+                    flags=re.MULTILINE
+                )
+            else:
+                # Add after PIA_REGION
+                config_content = re.sub(
+                    r'^(PIA_REGION=.*)$',
+                    f'\\1\nPIA_SERVER={server}',
+                    config_content,
+                    flags=re.MULTILINE
+                )
+        else:
+            # Comment out PIA_SERVER if it exists (region-only selection)
+            if re.search(r'^PIA_SERVER=', config_content, re.MULTILINE):
+                config_content = re.sub(
+                    r'^PIA_SERVER=(.*)$',
+                    r'# PIA_SERVER=\1',
+                    config_content,
+                    flags=re.MULTILINE
+                )
+
+        with open(DEFAULT_CONFIG_FILE, 'w') as f:
+            f.write(config_content)
+
+        if server:
+            print(f"\nConfig updated:")
+            print(f"  PIA_REGION={region}")
+            print(f"  PIA_SERVER={server}")
+        else:
+            print(f"\nConfig updated: PIA_REGION={region}")
+
+        print("Restart MOLE for changes to take effect: sudo systemctl restart mole")
+        return True
+
+    except PermissionError:
+        print(f"\nError: Permission denied writing to {DEFAULT_CONFIG_FILE}")
+        print("Run with sudo to update config, or add manually:")
+        print(f"  PIA_REGION={region}")
+        if server:
+            print(f"  PIA_SERVER={server}")
+        return False
+    except Exception as e:
+        print(f"\nError updating config: {e}")
+        return False
+
+
 def cmd_autoselect(args):
     """Auto-select the best region/server based on latency"""
     test_servers = getattr(args, 'servers', False)
@@ -3110,10 +3798,18 @@ def cmd_autoselect(args):
             print(f"  {i}. {srv['hostname']:<25} {latency:.1f} ms  ({srv['region_id']})")
 
         best = results[0][0]
-        print(f"\nRecommended server: {best['hostname']}")
-        print(f"\nTo use this server, set in /etc/mole/config:")
-        print(f"  PIA_REGION={best['region_id']}")
-        print(f"  PIA_SERVER={best['hostname']}")
+        best_latency = results[0][1]
+        print(f"\nRecommended server: {best['hostname']} ({best_latency:.1f} ms)")
+
+        # Offer to apply selection
+        print()
+        response = input(f"Apply this server to {DEFAULT_CONFIG_FILE}? [Y/n]: ").strip().lower()
+        if response in ('', 'y', 'yes'):
+            _apply_region_to_config(best['region_id'], best['hostname'])
+        else:
+            print(f"\nTo use this server, set in {DEFAULT_CONFIG_FILE}:")
+            print(f"  PIA_REGION={best['region_id']}")
+            print(f"  PIA_SERVER={best['hostname']}")
 
     else:
         # Test regions (first server per region)
@@ -3154,9 +3850,18 @@ def cmd_autoselect(args):
             print(f"  {i}. {region['name']:<30} {latency:.1f} ms  (ID: {region['id']})")
 
         best = results[0][0]
-        print(f"\nRecommended region: {best['id']}")
-        print(f"\nTo use this region, set in /etc/mole/config:")
-        print(f"  PIA_REGION={best['id']}")
+        best_latency = results[0][1]
+        print(f"\nRecommended region: {best['id']} ({best_latency:.1f} ms)")
+
+        # Offer to apply selection
+        print()
+        response = input(f"Apply this region to {DEFAULT_CONFIG_FILE}? [Y/n]: ").strip().lower()
+        if response in ('', 'y', 'yes'):
+            _apply_region_to_config(best['id'])
+        else:
+            print(f"\nTo use this region, set in {DEFAULT_CONFIG_FILE}:")
+            print(f"  PIA_REGION={best['id']}")
+
         print(f"\nTip: Use --servers to find the fastest specific server")
 
     return 0
@@ -3244,6 +3949,90 @@ def cmd_stats(args):
     return 0
 
 
+def _qbittorrent_apply_config(enable_passthrough: bool = None, verbose: bool = True) -> bool:
+    """Generate/update qBittorrent service files from config.
+
+    Returns True if services were updated and need restart.
+    """
+    config = Config()
+
+    if config.torrent_client.lower() != 'qbittorrent':
+        if verbose:
+            print("qBittorrent not configured in config file")
+        return False
+
+    qb_port = config.qb_port
+    qb_user = config.qb_user or os.environ.get('SUDO_USER', 'root')
+    netns = config.netns
+    veth_vpn_ip = config.veth_vpn_ip
+
+    updated = False
+
+    # Generate qbittorrent-mole.service
+    service_content = f"""[Unit]
+Description=qBittorrent-nox in MOLE VPN namespace
+After=network.target mole.service
+Wants=mole.service
+BindsTo=mole.service
+
+[Service]
+Type=simple
+User={qb_user}
+ExecStart=/usr/bin/ip netns exec {netns} /usr/bin/qbittorrent-nox --webui-port={qb_port}
+Restart=on-failure
+ExecStartPre=/bin/bash -c 'for i in {{1..30}}; do ip netns exec {netns} ip link show mole >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+    qb_service = Path("/etc/systemd/system/qbittorrent-mole.service")
+    if not qb_service.exists() or qb_service.read_text() != service_content:
+        qb_service.write_text(service_content)
+        updated = True
+        if verbose:
+            print(f"  Updated: {qb_service}")
+    elif verbose:
+        print(f"  No change: {qb_service}")
+
+    # Generate passthrough service if requested or if it already exists
+    pt_service = Path("/etc/systemd/system/qbittorrent-passthrough.service")
+    should_have_passthrough = enable_passthrough if enable_passthrough is not None else pt_service.exists()
+
+    if should_have_passthrough:
+        # Check if socat is available
+        result = subprocess.run(["which", "socat"], capture_output=True)
+        if result.returncode != 0:
+            if verbose:
+                print("  Warning: socat not installed, skipping passthrough service")
+        else:
+            passthrough_content = f"""[Unit]
+Description=qBittorrent localhost passthrough
+After=qbittorrent-mole.service
+BindsTo=qbittorrent-mole.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/socat TCP-LISTEN:{qb_port},bind=127.0.0.1,fork,reuseaddr TCP:{veth_vpn_ip}:{qb_port}
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+            if not pt_service.exists() or pt_service.read_text() != passthrough_content:
+                pt_service.write_text(passthrough_content)
+                updated = True
+                if verbose:
+                    print(f"  Updated: {pt_service}")
+            elif verbose:
+                print(f"  No change: {pt_service}")
+
+    if updated:
+        subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+    return updated
+
+
 def cmd_qbittorrent(args):
     """Manage qBittorrent in the VPN namespace"""
     action = getattr(args, 'action', 'status')
@@ -3260,6 +4049,10 @@ def cmd_qbittorrent(args):
         return _qbittorrent_control('enable')
     elif action == 'disable':
         return _qbittorrent_control('disable')
+    elif action == 'passthrough':
+        return _qbittorrent_passthrough(args)
+    elif action == 'port':
+        return _qbittorrent_port(args)
     else:
         print(f"Unknown action: {action}")
         return 1
@@ -3327,10 +4120,11 @@ def _qbittorrent_setup(args):
 
     # Get configuration
     config = Config()
-    netns = config.netns
 
-    # Get user to run as
+    # Get user to run as - priority: args > config > auto-detect
     user = getattr(args, 'user', None)
+    if not user:
+        user = config.qb_user
     if not user:
         # Try to find a non-root user
         import pwd
@@ -3344,28 +4138,50 @@ def _qbittorrent_setup(args):
                 print("Error: Username required")
                 return 1
 
-    # Get port
-    port = getattr(args, 'port', 8080)
+    # Get port - priority: args > config > default
+    port = getattr(args, 'port', None)
+    if not port:
+        port = config.qb_port or 8080
 
     print(f"\nConfiguration:")
     print(f"  User: {user}")
-    print(f"  Namespace: {netns}")
+    print(f"  Namespace: {config.netns}")
     print(f"  Web UI Port: {port}")
 
-    # Generate service file
-    service_content = QBITTORRENT_SERVICE_TEMPLATE.format(
-        user=user,
-        netns=netns,
-        port=port
-    )
+    # Update config file with QB_PORT and QB_USER
+    config_file = Path(DEFAULT_CONFIG_FILE)
+    if config_file.exists():
+        content = config_file.read_text()
+        updated = False
 
-    service_path = Path("/etc/systemd/system/qbittorrent-mole.service")
+        # Update or add QB_PORT
+        if 'QB_PORT=' in content:
+            new_content = re.sub(r'QB_PORT=\d*', f'QB_PORT={port}', content)
+        elif 'QB_API_URL=' in content:
+            # Replace QB_API_URL with QB_PORT
+            new_content = re.sub(r'QB_API_URL=.*', f'QB_PORT={port}', content)
+        else:
+            new_content = content.rstrip() + f'\nQB_PORT={port}\n'
+        if new_content != content:
+            content = new_content
+            updated = True
 
-    print(f"\nCreating service: {service_path}")
-    service_path.write_text(service_content)
+        # Update or add QB_USER
+        if 'QB_USER=' in content:
+            new_content = re.sub(r'QB_USER=.*', f'QB_USER={user}', content)
+        else:
+            new_content = content.rstrip() + f'\nQB_USER={user}\n'
+        if new_content != content:
+            content = new_content
+            updated = True
 
-    # Reload systemd
-    subprocess.run(["systemctl", "daemon-reload"], check=False)
+        if updated:
+            config_file.write_text(content)
+            print(f"\nUpdated config: {config_file}")
+
+    # Generate service file using apply_config
+    print("\nCreating service files...")
+    _qbittorrent_apply_config(verbose=True)
 
     print("\nService created successfully!")
     print("\nNext steps:")
@@ -3486,8 +4302,154 @@ def _qbittorrent_status():
 
         # Get config for web URL
         config = Config()
-        print(f"\nWeb UI: http://{config.veth_vpn_ip}:8080")
-        print(f"        http://localhost:8080 (if socat configured)")
+        # Get port from qBittorrent service
+        result = subprocess.run(
+            ["systemctl", "cat", service],
+            capture_output=True, text=True
+        )
+        qb_port = 8080
+        if "--webui-port=" in result.stdout:
+            match = re.search(r'--webui-port=(\d+)', result.stdout)
+            if match:
+                qb_port = match.group(1)
+
+        print(f"\nWeb UI: http://{config.veth_vpn_ip}:{qb_port}")
+
+        # Check if passthrough is active
+        pt_result = subprocess.run(
+            ["systemctl", "is-active", "qbittorrent-passthrough"],
+            capture_output=True, text=True
+        )
+        if pt_result.stdout.strip() == "active":
+            print(f"        http://localhost:{qb_port} (passthrough active)")
+        else:
+            print(f"        (localhost passthrough not configured)")
+
+    return 0
+
+
+def _qbittorrent_passthrough(args):
+    """Enable localhost passthrough for qBittorrent Web UI"""
+    print(f"MOLE v{VERSION} - qBittorrent Passthrough")
+    print("=" * 50)
+
+    if os.geteuid() != 0:
+        print("Error: passthrough must be run as root (sudo mole qbittorrent passthrough)")
+        return 1
+
+    # Check if socat is installed
+    result = subprocess.run(["which", "socat"], capture_output=True)
+    if result.returncode != 0:
+        print("Error: socat is not installed")
+        print("Install with: sudo apt install socat")
+        return 1
+
+    # Check if qbittorrent-mole service exists
+    result = subprocess.run(
+        ["systemctl", "cat", "qbittorrent-mole"],
+        capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        print("Error: qbittorrent-mole service not found")
+        print("Run 'sudo mole qbittorrent setup' first")
+        return 1
+
+    config = Config()
+    pt_path = Path("/etc/systemd/system/qbittorrent-passthrough.service")
+
+    # Check if passthrough already exists
+    if pt_path.exists():
+        print(f"Passthrough service already exists")
+        result = subprocess.run(
+            ["systemctl", "is-active", "qbittorrent-passthrough"],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip() == "active":
+            print(f"Status: active (localhost:{config.qb_port} -> {config.veth_vpn_ip}:{config.qb_port})")
+        else:
+            print("Status: inactive")
+            response = input("Start it? [Y/n]: ").strip().lower()
+            if response in ('', 'y', 'yes'):
+                subprocess.run(["systemctl", "start", "qbittorrent-passthrough"], check=False)
+                print("Passthrough started!")
+        return 0
+
+    # Create passthrough service using apply_config
+    print(f"Creating localhost passthrough for port {config.qb_port}...")
+    _qbittorrent_apply_config(enable_passthrough=True, verbose=True)
+
+    subprocess.run(["systemctl", "enable", "qbittorrent-passthrough"], check=False)
+    subprocess.run(["systemctl", "start", "qbittorrent-passthrough"], check=False)
+
+    print(f"\nPassthrough enabled!")
+    print(f"qBittorrent Web UI: http://localhost:{config.qb_port}")
+
+    return 0
+
+
+def _qbittorrent_port(args):
+    """Change qBittorrent Web UI port"""
+
+    if os.geteuid() != 0:
+        print("Error: port must be run as root (sudo mole qbittorrent port <port>)")
+        return 1
+
+    new_port = getattr(args, 'port', None)
+    if not new_port:
+        print("Error: Please specify a port number")
+        print("Usage: sudo mole qbittorrent port --port <port>")
+        return 1
+
+    print(f"MOLE v{VERSION} - Change qBittorrent Port")
+    print("=" * 50)
+    print(f"\nChanging port to {new_port}...")
+
+    # Update config file - replace QB_PORT or QB_API_URL
+    config_file = Path(DEFAULT_CONFIG_FILE)
+    if config_file.exists():
+        content = config_file.read_text()
+
+        # Update QB_PORT if present, otherwise update QB_API_URL
+        if 'QB_PORT=' in content:
+            new_content = re.sub(r'QB_PORT=\d+', f'QB_PORT={new_port}', content)
+        else:
+            new_content = re.sub(
+                r'(QB_API_URL=http://[^:]+:)\d+',
+                f'\\g<1>{new_port}',
+                content
+            )
+
+        if new_content != content:
+            config_file.write_text(new_content)
+            print(f"  Updated: {config_file}")
+        else:
+            print(f"  No change needed: {config_file}")
+    else:
+        print(f"  Config not found: {config_file}")
+        return 1
+
+    # Apply config to regenerate service files
+    print("\nRegenerating service files...")
+    _qbittorrent_apply_config(verbose=True)
+
+    # Restart services if running
+    print("\nRestarting services...")
+    for service in ["qbittorrent-mole", "qbittorrent-passthrough"]:
+        result = subprocess.run(
+            ["systemctl", "is-active", service],
+            capture_output=True, text=True
+        )
+        if result.stdout.strip() == "active":
+            subprocess.run(["systemctl", "restart", service], check=False)
+            print(f"  Restarted: {service}")
+
+    config = Config()
+    pt_service = Path("/etc/systemd/system/qbittorrent-passthrough.service")
+
+    print(f"\nqBittorrent port changed to {new_port}")
+    print(f"Web UI: http://{config.veth_vpn_ip}:{new_port}")
+    if pt_service.exists():
+        print(f"        http://localhost:{new_port}")
 
     return 0
 
@@ -3512,6 +4474,7 @@ Commands:
   speedtest   Test VPN connection speed
   stats       Show bandwidth statistics
   validate    Validate configuration file
+  apply       Apply config to generated service files
   qbittorrent Manage qBittorrent in VPN namespace
   restart     Force VPN reconnection
   stop        Stop the VPN service
@@ -3521,6 +4484,7 @@ Commands:
 Examples:
   sudo mole init               # First-time setup
   mole validate                # Check config for errors
+  sudo mole apply              # Apply config to service files
   sudo mole status             # Check VPN status
   mole ip                      # Show VPN public IP
   mole regions pia             # List PIA regions
@@ -3533,6 +4497,8 @@ Examples:
   mole stats                   # Show bandwidth usage
   sudo mole qbittorrent setup  # Setup qBittorrent in VPN namespace
   sudo mole qbittorrent start  # Start qBittorrent service
+  sudo mole qbittorrent passthrough  # Enable localhost:port access
+  sudo mole qbittorrent port -p 9090  # Change Web UI port
   mole qbittorrent status      # Check qBittorrent status
   sudo mole restart            # Force reconnection
   sudo mole stop               # Stop the service
@@ -3643,13 +4609,16 @@ Examples:
         help="Path to configuration file"
     )
 
+    # apply command
+    subparsers.add_parser("apply", help="Apply config to generated service files (requires sudo)")
+
     # qbittorrent command
     qb_parser = subparsers.add_parser("qbittorrent", help="Manage qBittorrent in VPN namespace")
     qb_parser.add_argument(
         "action",
         nargs="?",
         default="status",
-        choices=["setup", "start", "stop", "status", "enable", "disable"],
+        choices=["setup", "start", "stop", "status", "enable", "disable", "passthrough", "port"],
         help="Action to perform (default: status)"
     )
     qb_parser.add_argument(
@@ -3718,6 +4687,8 @@ Examples:
         return cmd_stats(args)
     elif args.command == "validate":
         return cmd_validate(args)
+    elif args.command == "apply":
+        return cmd_apply(args)
     elif args.command == "qbittorrent":
         return cmd_qbittorrent(args)
     elif args.command == "restart":
