@@ -51,6 +51,58 @@ class QBittorrentClient(TorrentClient):
             log.error(f"Failed to get qBittorrent port: {e}")
             return None
 
+    async def get_connection_status(self) -> Optional[str]:
+        """Get libtorrent connection status (connected/firewalled/disconnected)"""
+        try:
+            with urllib.request.urlopen(
+                f"{self.config.qb_api_url}/transfer/info", timeout=5
+            ) as resp:
+                info = json.loads(resp.read().decode())
+                return info.get("connection_status")
+        except Exception as e:
+            log.error(f"Failed to get qBittorrent connection status: {e}")
+            return None
+
+    async def _toggle_port(self, port: int) -> bool:
+        """Toggle listen port off/on to force libtorrent to rebind the socket."""
+        log.info(f"Toggling port to force listener rebind on {port}")
+        try:
+            data = urllib.parse.urlencode({
+                "json": json.dumps({"listen_port": port - 1})
+            }).encode()
+            req = urllib.request.Request(
+                f"{self.config.qb_api_url}/setPreferences",
+                data=data, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+
+            await asyncio.sleep(2)
+
+            data = urllib.parse.urlencode({
+                "json": json.dumps({"listen_port": port})
+            }).encode()
+            req = urllib.request.Request(
+                f"{self.config.qb_api_url}/setPreferences",
+                data=data, method="POST"
+            )
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+
+            await asyncio.sleep(3)
+
+            status = await self.get_connection_status()
+            if status and status != "disconnected":
+                log.info(f"Port rebind successful (status: {status})")
+                return True
+
+            log.warning(f"Port rebind may have failed (status: {status})")
+            return False
+
+        except Exception as e:
+            log.error(f"Port toggle failed: {e}")
+            return False
+
     async def set_listen_port(self, port: int) -> bool:
         try:
             current = await self.get_listen_port()
@@ -72,15 +124,21 @@ class QBittorrentClient(TorrentClient):
             with urllib.request.urlopen(req, timeout=5):
                 pass
 
-            await asyncio.sleep(2)
+            await asyncio.sleep(3)
 
             new_port = await self.get_listen_port()
-            if new_port == port:
-                log.info("qBittorrent port updated successfully")
-                return True
-            else:
+            if new_port != port:
                 log.warning("qBittorrent port update may have failed")
                 return False
+
+            # Verify the listener is actually bound, not just the config value
+            status = await self.get_connection_status()
+            if status == "disconnected":
+                log.warning(f"Port {port} set but listener not bound (status: disconnected), toggling to force rebind")
+                return await self._toggle_port(port)
+
+            log.info(f"qBittorrent port updated successfully (status: {status})")
+            return True
 
         except Exception as e:
             log.error(f"Failed to set qBittorrent port: {e}")

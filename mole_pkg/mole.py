@@ -472,11 +472,25 @@ class Mole:
                 if result.returncode != 0:
                     return False
 
+            # Check torrent client listener is alive
+            if self.torrent and self.state.port:
+                await self._check_torrent_listener()
+
             return True
 
         except Exception as e:
             log.error(f"Health check error: {e}")
             return False
+
+    async def _check_torrent_listener(self):
+        """Check if torrent client listener is bound; fix via port toggle if not."""
+        try:
+            status = await self.torrent.get_connection_status()
+            if status == "disconnected":
+                log.warning("Torrent listener is disconnected, attempting port toggle fix")
+                await self.torrent._toggle_port(self.state.port)
+        except Exception as e:
+            log.error(f"Torrent listener check error: {e}")
 
     async def _update_torrent_client(self, max_retries: int = 10, retry_delay: float = 3.0, allow_restart: bool = True):
         """Update torrent client with new interface and port.
