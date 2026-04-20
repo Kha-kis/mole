@@ -52,10 +52,23 @@ class QBittorrentClient(TorrentClient):
             return None
 
     async def get_connection_status(self) -> Optional[str]:
-        """Get libtorrent connection status (connected/firewalled/disconnected)"""
+        """Get libtorrent connection status: 'connected', 'firewalled',
+        or 'disconnected'. Returns None on API error.
+
+        Note on URL construction: `qb_api_url` ends in `/api/v2/app`
+        (the application-namespaced endpoint base used by /preferences
+        and /setPreferences). `/transfer/info` is a *sibling* of /app,
+        not a child — the full path is `/api/v2/transfer/info`. Wiring
+        this as `{qb_api_url}/transfer/info` produces
+        `/api/v2/app/transfer/info`, which qBittorrent returns 404 for,
+        making the listener health check silently blind and spamming
+        `Failed to get qBittorrent connection status: HTTP Error 404`
+        in the logs. Strip the trailing `/app` segment before appending.
+        """
         try:
+            api_v2 = self.config.qb_api_url.removesuffix("/app")
             with urllib.request.urlopen(
-                f"{self.config.qb_api_url}/transfer/info", timeout=5
+                f"{api_v2}/transfer/info", timeout=5
             ) as resp:
                 info = json.loads(resp.read().decode())
                 return info.get("connection_status")
