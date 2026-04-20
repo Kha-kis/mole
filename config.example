@@ -232,6 +232,24 @@ WATCHDOG_MAX_FAILURES=3
 #   Or set nameserver 10.200.200.2 in /etc/resolv.conf
 
 # ═══════════════════════════════════════════════════════════════════
+# Connection Hooks
+# ═══════════════════════════════════════════════════════════════════
+#
+# Optional executable scripts that run inside the VPN namespace at
+# connection lifecycle events. Hooks receive connection info via env:
+#
+#   MOLE_VPN_IP          Peer IP inside the VPN tunnel
+#   MOLE_SERVER_IP       VPN entry server public IP
+#   MOLE_SERVER_HOSTNAME VPN entry server hostname
+#   MOLE_PORT            Forwarded port (empty if port forwarding is off)
+#
+# Script must be executable. Missing or non-executable hooks are logged
+# and skipped (not fatal). Hook failures do not abort the VPN lifecycle.
+
+# POST_CONNECT_HOOK=/etc/mole/hooks/post-connect.sh
+# POST_DISCONNECT_HOOK=/etc/mole/hooks/post-disconnect.sh
+
+# ═══════════════════════════════════════════════════════════════════
 # Advanced Settings (usually don't need to change)
 # ═══════════════════════════════════════════════════════════════════
 

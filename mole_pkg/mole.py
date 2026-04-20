@@ -268,6 +268,9 @@ class Mole:
         self._stop_subprocess(self._proxy_proc, "Proxy")
         self._stop_subprocess(self._dns_proc, "DNS")
 
+        # Run pre-disconnect hook while the VPN namespace is still live
+        self._run_hook(self.config.post_disconnect_hook, "POST_DISCONNECT_HOOK")
+
         # Bring down VPN
         disconnect_vpn(self.config)
         log.info("Cleanup complete")
@@ -322,6 +325,9 @@ class Mole:
             log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
         else:
             log.info(f"Renewal complete! Server: {self.state.server_hostname} (port forwarding disabled)")
+
+        # Run post-connect hook if configured
+        self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK")
 
         # Write state files for API to read
         self._write_state_files()
@@ -558,3 +564,49 @@ class Mole:
                 log.error(f"Failed to restart torrent client service: {result.stderr}")
         except Exception as e:
             log.error(f"Error restarting torrent client service: {e}")
+
+    def _run_hook(self, hook_path: str, hook_name: str):
+        """Run a hook script in the VPN namespace.
+
+        The hook receives environment variables with connection info:
+        - MOLE_VPN_IP: The VPN peer IP address
+        - MOLE_SERVER_IP: The VPN server IP
+        - MOLE_SERVER_HOSTNAME: The VPN server hostname
+        - MOLE_PORT: The forwarded port (if enabled)
+        """
+        if not hook_path:
+            return
+
+        hook_file = Path(hook_path)
+        if not hook_file.exists():
+            log.warning(f"{hook_name} not found: {hook_path}")
+            return
+
+        if not os.access(hook_path, os.X_OK):
+            log.warning(f"{hook_name} is not executable: {hook_path}")
+            return
+
+        log.info(f"Running {hook_name}: {hook_path}")
+
+        # Build environment with connection info
+        env = os.environ.copy()
+        env["MOLE_VPN_IP"] = self.state.peer_ip or ""
+        env["MOLE_SERVER_IP"] = self.state.server_ip or ""
+        env["MOLE_SERVER_HOSTNAME"] = self.state.server_hostname or ""
+        env["MOLE_PORT"] = str(self.state.port) if self.state.port else ""
+
+        try:
+            result = run_in_netns(
+                [hook_path],
+                self.config.netns,
+                check=False,
+                env=env
+            )
+            if result.returncode == 0:
+                log.info(f"{hook_name} completed successfully")
+            else:
+                log.warning(f"{hook_name} exited with code {result.returncode}")
+                if result.stderr:
+                    log.warning(f"{hook_name} stderr: {result.stderr[:500]}")
+        except Exception as e:
+            log.error(f"{hook_name} failed: {e}")

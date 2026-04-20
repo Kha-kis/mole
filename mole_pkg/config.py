@@ -248,6 +248,17 @@ class Config:
             return int(val[:-1]) * 60
         return int(val)
 
+    # Hooks
+    @property
+    def post_connect_hook(self) -> str:
+        """Script to run after VPN connects (runs in namespace)"""
+        return self.get('POST_CONNECT_HOOK', '')
+
+    @property
+    def post_disconnect_hook(self) -> str:
+        """Script to run before VPN disconnects"""
+        return self.get('POST_DISCONNECT_HOOK', '')
+
 
 def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[str]]:
     """Validate configuration file and return (is_valid, list of errors/warnings)"""
