@@ -47,9 +47,9 @@ class VPNState:
     connected: bool = False
 
 
-def run_cmd(cmd: list, check: bool = True) -> subprocess.CompletedProcess:
+def run_cmd(cmd: list, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
     """Run a shell command"""
-    return subprocess.run(cmd, capture_output=True, text=True, check=check)
+    return subprocess.run(cmd, capture_output=True, text=True, check=check, env=env)
 
 
 def secure_write_file(path: Path, content: str, mode: int = 0o600) -> None:
@@ -81,9 +81,9 @@ def sanitize_for_log(text: str, max_length: int = 200) -> str:
     return text
 
 
-def run_in_netns(cmd: list, netns: str, check: bool = True) -> subprocess.CompletedProcess:
+def run_in_netns(cmd: list, netns: str, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
     """Run a command inside a network namespace"""
-    return run_cmd(["ip", "netns", "exec", netns] + cmd, check=check)
+    return run_cmd(["ip", "netns", "exec", netns] + cmd, check=check, env=env)
 
 
 class VPNProvider(ABC):
