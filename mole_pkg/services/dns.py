@@ -3,26 +3,21 @@ MOLE DNS over TLS Service - Encrypted DNS with ad-blocking
 """
 
 import asyncio
-import ssl
 import struct
 import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple, TYPE_CHECKING
 
 from ..utils import log
+from .dns_upstream import (
+    DOT_PROVIDERS,
+    UpstreamExhausted,
+    UpstreamPool,
+    resolve_upstream,
+)
 
 if TYPE_CHECKING:
     from ..config import Config
-
-
-# DNS over TLS upstream providers: (ip, port, sni_hostname)
-DOT_PROVIDERS = {
-    'cloudflare': ('1.1.1.1', 853, 'cloudflare-dns.com'),
-    'cloudflare-family': ('1.1.1.3', 853, 'family.cloudflare-dns.com'),  # Blocks malware + adult content
-    'quad9': ('9.9.9.9', 853, 'dns.quad9.net'),              # Blocks malware
-    'quad9-unsecured': ('9.9.9.10', 853, 'dns.quad9.net'),   # No blocking
-    'google': ('8.8.8.8', 853, 'dns.google'),
-}
 
 # Blocklist URLs (hosts file format)
 BLOCKLIST_URLS = {
@@ -64,7 +59,14 @@ class DOTServer:
         self.netns = netns
         self.bind = config.dot_bind
         self.port = config.dot_port
-        self.upstream_ip, self.upstream_port, self.upstream_sni = self._get_upstream()
+        # Primary upstream info kept for backward-compatible callers/tests that
+        # read these attributes. The pool below is what actually serves queries
+        # and may failover across multiple upstreams.
+        upstreams = self._resolve_upstream_list()
+        primary_name = upstreams[0]
+        self.upstream_ip, self.upstream_port, self.upstream_sni = resolve_upstream(
+            primary_name, getattr(config, 'dot_custom_server', '') or ''
+        )
         self.blocked_domains: set = set()
         self._transport = None
         self._protocol = None
@@ -74,18 +76,68 @@ class DOTServer:
         self._cache_max_ttl = config.dot_cache_ttl  # 0 = use response TTL
         self._blocklist_update_task = None
         self._last_blocklist_update = 0.0
+        # In-flight singleflight map: (domain, qtype) -> Future[response_bytes].
+        # Followers await the same upstream query instead of stampeding.
+        self._in_flight: Dict[Tuple[str, int], asyncio.Future] = {}
+        # Stats counters. Kept as a plain dict; asyncio single-threaded so
+        # += is safe. Exposed via get_stats() / /v1/dns.
+        self._stats: Dict[str, int] = {
+            'queries_total': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'in_flight_peak': 0,
+            'singleflight_collapses': 0,
+            'blocked': 0,
+            'upstream_queries': 0,
+            'upstream_errors': 0,
+            'retries': 0,
+            'failovers': 0,
+            'resolve_errors': 0,
+        }
+        # Upstream pool. Created in __init__ (cheap — no sockets open yet);
+        # real TLS connections are lazy on first query.
+        custom_server = getattr(config, 'dot_custom_server', '') or ''
+        if not isinstance(custom_server, str):
+            custom_server = ''
+        self._pool = UpstreamPool(
+            upstreams=upstreams,
+            custom_server=custom_server,
+            pool_size=self._coerce_int(getattr(config, 'dot_pool_size', 2), 2),
+            query_timeout=self._coerce_float(getattr(config, 'dot_query_timeout', 2.0), 2.0),
+            query_retries=self._coerce_int(getattr(config, 'dot_query_retries', 2), 2),
+            retry_backoff_ms=self._coerce_int(getattr(config, 'dot_retry_backoff_ms', 200), 200),
+            stats=self._stats,
+        )
 
-    def _get_upstream(self) -> Tuple[str, int, str]:
-        """Get upstream DNS server (IP, port, SNI hostname)"""
-        upstream = self.config.dot_upstream.lower()
-        if upstream == 'custom':
-            custom = self.config.dot_custom_server
-            if ':' in custom:
-                ip, port = custom.rsplit(':', 1)
-                return (ip, int(port), ip)  # Use IP as hostname for custom
-            return (custom, 853, custom)
-        provider = DOT_PROVIDERS.get(upstream, DOT_PROVIDERS['cloudflare'])
-        return provider  # Returns (ip, port, sni_hostname)
+    def _resolve_upstream_list(self) -> list:
+        """Return the configured upstream list as a clean list of names.
+
+        Prefers config.dot_upstreams (new, list/tuple) when it's an actual
+        list/tuple of strings; otherwise splits config.dot_upstream (old, str)
+        on commas. Tolerant of unexpected attribute types to keep test mocks
+        and third-party config shims from blowing up.
+        """
+        explicit = getattr(self.config, 'dot_upstreams', None)
+        if isinstance(explicit, (list, tuple)) and explicit:
+            return [str(u).strip() for u in explicit if str(u).strip()] or ['cloudflare']
+        raw = getattr(self.config, 'dot_upstream', 'cloudflare')
+        if not isinstance(raw, str) or not raw:
+            return ['cloudflare']
+        return [u.strip() for u in raw.split(',') if u.strip()] or ['cloudflare']
+
+    @staticmethod
+    def _coerce_int(val, default: int) -> int:
+        try:
+            return int(val)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _coerce_float(val, default: float) -> float:
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return default
 
     async def start(self):
         """Start the DNS server"""
@@ -124,6 +176,8 @@ class DOTServer:
                 pass
         if self._transport:
             self._transport.close()
+        # Close upstream pool and fail any still-pending waiters.
+        await self._pool.close()
 
     async def _blocklist_update_loop(self):
         """Periodically update blocklists"""
@@ -207,55 +261,108 @@ class DOTServer:
                     self.blocked_domains.add(domain)
 
     async def resolve(self, query: bytes) -> Optional[bytes]:
-        """Resolve DNS query, blocking or forwarding as needed"""
+        """Resolve a DNS query: blocklist → cache → singleflight upstream.
+
+        Returns response bytes with the caller's xid preserved, or None on
+        unrecoverable failure.
+        """
+        self._stats['queries_total'] += 1
         try:
-            # Parse domain and query type from query
+            if len(query) < 12:
+                return None
+            client_xid = struct.unpack('!H', query[:2])[0]
             domain = self._extract_domain(query)
-            qtype = self._extract_qtype(query) if self._cache_enabled else 0
+            if domain:
+                qtype, qclass = self._extract_qtype_qclass(query)
+            else:
+                qtype, qclass = 0, 0
 
             if domain:
-                # Check blocklist first (no point caching blocked domains)
                 if self._is_blocked(domain):
+                    self._stats['blocked'] += 1
                     log.debug(f"DNS blocked: {domain}")
                     return self._make_nxdomain_response(query)
 
-                # Check cache
+                # Key singleflight AND cache on (domain, qtype, qclass) so
+                # queries that differ only in qclass (e.g. IN vs CH) don't
+                # collapse into one another.
+                key = (domain, qtype, qclass)
+
                 if self._cache_enabled:
-                    cache_key = (domain, qtype)
-                    cached = self._cache.get(cache_key)
+                    cached = self._cache.get(key)
                     if cached:
                         response, expiry = cached
                         if time.time() < expiry:
+                            self._stats['cache_hits'] += 1
                             log.debug(f"DNS cache hit: {domain}")
-                            # Update transaction ID to match query
                             return query[:2] + response[2:]
-                        else:
-                            # Expired, remove from cache
-                            del self._cache[cache_key]
+                        # Expired — drop and fall through to upstream
+                        del self._cache[key]
+                    # Only count misses when cache was actually consulted,
+                    # so hits/(hits+misses) stays a meaningful ratio.
+                    self._stats['cache_misses'] += 1
 
-            # Forward to upstream via TLS
-            response = await self._query_upstream(query)
+                # Singleflight: if an identical question is already in flight,
+                # await its result rather than firing a duplicate upstream query.
+                existing = self._in_flight.get(key)
+                if existing is not None:
+                    self._stats['singleflight_collapses'] += 1
+                    try:
+                        leader_response = await existing
+                    except Exception:
+                        return None
+                    if leader_response is None:
+                        return None
+                    return query[:2] + leader_response[2:]
 
-            # Cache successful response
-            if response and self._cache_enabled and domain:
-                ttl = self._extract_response_ttl(response)
-                # Apply max TTL cap if configured
-                if self._cache_max_ttl > 0:
-                    ttl = min(ttl, self._cache_max_ttl)
-                cache_key = (domain, qtype)
-                self._cache[cache_key] = (response, time.time() + ttl)
-                log.debug(f"DNS cached: {domain} (TTL={ttl}s)")
+                # Leader path. Register our Future before awaiting so late
+                # followers attach to it.
+                loop = asyncio.get_event_loop()
+                fut: asyncio.Future = loop.create_future()
+                self._in_flight[key] = fut
+                if len(self._in_flight) > self._stats['in_flight_peak']:
+                    self._stats['in_flight_peak'] = len(self._in_flight)
+                try:
+                    response = await self._forward(query, client_xid)
+                    # Store in cache BEFORE resolving the future so any waiter
+                    # that wakes up sees a consistent cache+singleflight world.
+                    if response and self._cache_enabled:
+                        ttl = self._extract_response_ttl(response)
+                        if self._cache_max_ttl > 0:
+                            ttl = min(ttl, self._cache_max_ttl)
+                        self._cache[key] = (response, time.time() + ttl)
+                        log.debug(f"DNS cached: {domain} (TTL={ttl}s)")
+                        if len(self._cache) > 1000:
+                            now = time.time()
+                            self._cache = {k: v for k, v in self._cache.items() if v[1] > now}
+                    if not fut.done():
+                        fut.set_result(response)
+                    return response
+                except Exception as e:
+                    if not fut.done():
+                        fut.set_exception(e)
+                    raise
+                finally:
+                    self._in_flight.pop(key, None)
 
-                # Simple cache cleanup: remove expired entries periodically
-                if len(self._cache) > 1000:
-                    now = time.time()
-                    self._cache = {k: v for k, v in self._cache.items() if v[1] > now}
+            # Domainless query (unusual) — forward without dedup/cache.
+            return await self._forward(query, client_xid)
 
-            return response
-
+        except UpstreamExhausted as e:
+            self._stats['resolve_errors'] += 1
+            log.debug(f"DNS resolve exhausted all upstreams: {e}")
+            return None
         except Exception as e:
+            self._stats['resolve_errors'] += 1
             log.debug(f"DNS resolve error: {e}")
             return None
+
+    async def _forward(self, query: bytes, client_xid: int) -> Optional[bytes]:
+        """Forward one query to upstream via the pool. Returns response bytes
+        with client_xid preserved. Propagates UpstreamExhausted so resolve()
+        can count it as a resolve_error; followers in singleflight are told
+        via the failed Future and convert it to None themselves."""
+        return await self._pool.query(query, client_xid)
 
     def _extract_domain(self, query: bytes) -> Optional[str]:
         """Extract domain name from DNS query"""
@@ -278,26 +385,32 @@ class DOTServer:
         except Exception:
             return None
 
-    def _extract_qtype(self, query: bytes) -> int:
-        """Extract query type from DNS query (A=1, AAAA=28, etc.)"""
+    def _extract_qtype_qclass(self, query: bytes) -> Tuple[int, int]:
+        """Extract (qtype, qclass) from DNS query. Returns (0, 0) on parse error.
+
+        qtype: A=1, AAAA=28, MX=15, TXT=16, etc. (RFC 1035 §3.2.2)
+        qclass: IN=1, CH=3, HS=4 (RFC 1035 §3.2.4). Almost always IN on the
+        public internet, but keyed here so we never collapse IN/CH queries.
+        """
         try:
             # Skip header (12 bytes) and find end of domain name
             pos = 12
             while pos < len(query) and query[pos] != 0:
                 length = query[pos]
-                if length >= 64:  # Compression pointer
+                if length >= 64:  # Compression pointer (not valid in question, defensive)
                     pos += 2
                     break
                 pos += 1 + length
             else:
                 pos += 1  # Skip null terminator
 
-            # QTYPE is 2 bytes after domain name
-            if pos + 2 <= len(query):
-                return struct.unpack('!H', query[pos:pos + 2])[0]
-            return 0
+            # QTYPE + QCLASS are 4 bytes after the domain name
+            if pos + 4 <= len(query):
+                qtype, qclass = struct.unpack('!HH', query[pos:pos + 4])
+                return qtype, qclass
+            return 0, 0
         except Exception:
-            return 0
+            return 0, 0
 
     def _extract_response_ttl(self, response: bytes) -> int:
         """Extract minimum TTL from DNS response for cache expiry"""
@@ -376,56 +489,18 @@ class DOTServer:
         response.extend(query[12:])
         return bytes(response)
 
-    async def _query_upstream(self, query: bytes) -> Optional[bytes]:
-        """Forward query to upstream DNS over TLS"""
-        try:
-            # Create TLS context
-            ctx = ssl.create_default_context()
-
-            # Connect to upstream with SNI hostname for certificate validation
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    self.upstream_ip, self.upstream_port,
-                    ssl=ctx, server_hostname=self.upstream_sni
-                ),
-                timeout=10.0
-            )
-
-            try:
-                # DNS over TLS uses length-prefixed messages
-                writer.write(struct.pack('!H', len(query)) + query)
-                await writer.drain()
-
-                # Read response
-                length_data = await asyncio.wait_for(reader.readexactly(2), timeout=10.0)
-                length = struct.unpack('!H', length_data)[0]
-                response = await asyncio.wait_for(reader.readexactly(length), timeout=10.0)
-
-                return response
-
-            finally:
-                writer.close()
-                try:
-                    await writer.wait_closed()
-                except Exception:
-                    pass
-
-        except asyncio.TimeoutError:
-            log.debug("DNS upstream timeout")
-            return None
-        except Exception as e:
-            log.debug(f"DNS upstream error: {e}")
-            return None
-
     def get_stats(self) -> dict:
-        """Get DNS server statistics"""
+        """Get DNS server statistics, including counters and upstream pool state."""
         return {
-            "enabled": self.config.dot_enabled,
-            "upstream": self.config.dot_upstream,
+            "enabled": getattr(self.config, 'dot_enabled', True),
+            "upstream": getattr(self.config, 'dot_upstream', 'cloudflare'),
             "upstream_ip": self.upstream_ip,
             "upstream_port": self.upstream_port,
+            "upstreams": self._pool.upstream_info(),
             "blocked_domains": len(self.blocked_domains),
             "cache_enabled": self._cache_enabled,
             "cache_size": len(self._cache),
+            "in_flight": len(self._in_flight),
             "last_blocklist_update": self._last_blocklist_update,
+            "counters": dict(self._stats),
         }

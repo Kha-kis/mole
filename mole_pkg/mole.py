@@ -156,6 +156,10 @@ class Mole:
             "--port", str(self.config.dot_port),
             "--upstream", self.config.dot_upstream,
             "--state-dir", self.config.state_dir,
+            "--pool-size", str(self.config.dot_pool_size),
+            "--query-timeout", str(self.config.dot_query_timeout),
+            "--query-retries", str(self.config.dot_query_retries),
+            "--retry-backoff-ms", str(self.config.dot_retry_backoff_ms),
         ]
 
         if self.config.dot_custom_server:

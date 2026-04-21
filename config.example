@@ -207,9 +207,12 @@ WATCHDOG_MAX_FAILURES=3
 # Bind address (default: 10.200.200.2 - inside namespace)
 # DOT_BIND=10.200.200.2
 
-# Upstream DNS provider: cloudflare, cloudflare-family, quad9,
-#                        quad9-unsecured, google, or 'custom'
+# Upstream DNS provider(s): cloudflare, cloudflare-family, quad9,
+#                           quad9-unsecured, google, or 'custom'
+# Accepts a comma-separated list — tried left-to-right, rotated on repeated
+# failure. First entry is the primary.
 # DOT_UPSTREAM=cloudflare
+# DOT_UPSTREAM=cloudflare,quad9   # Example with failover
 
 # Custom upstream DNS server (only used when DOT_UPSTREAM=custom)
 # DOT_CUSTOM_SERVER=1.1.1.1:853
@@ -222,6 +225,13 @@ WATCHDOG_MAX_FAILURES=3
 # DNS Caching (reduces latency and upstream queries)
 # DOT_CACHING=true          # Enable DNS response caching (default: enabled)
 # DOT_CACHE_TTL=0           # Max cache TTL in seconds (0 = use response TTL)
+
+# Upstream connection pool (for high-concurrency workloads — torrents, etc.)
+# DOT_POOL_SIZE=2           # Persistent TLS connections per upstream
+# DOT_QUERY_TIMEOUT=2.0     # Per-attempt timeout in seconds
+# DOT_QUERY_RETRIES=2       # Retries per upstream before failover
+# DOT_RETRY_BACKOFF_MS=200  # Delay between retries in milliseconds
+# Identical concurrent queries are automatically deduped (singleflight).
 
 # Blocklist Auto-Update
 # DOT_UPDATE_PERIOD=24h     # How often to update blocklists (0 = disabled)
