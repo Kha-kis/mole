@@ -73,6 +73,25 @@ The installer will:
 - Auto-detect best server/region
 - Start the VPN service
 
+## Upgrading
+
+For an in-place upgrade on a configured host, use `--upgrade`:
+
+```bash
+git pull
+sudo ./install.sh --upgrade
+sudo systemctl restart mole
+```
+
+`--upgrade` mirrors `mole_pkg/` into `/usr/local/lib/mole/` (deletions
+in the repo are propagated via `rsync --delete` so old modules don't
+linger), reinstalls the systemd unit, and **stops short of starting
+the service** so you can review the change before cutting over. It
+skips dependency installation and the interactive `mole init` wizard.
+
+After restart, allow up to ~3 minutes for the watchdog VPN-renewal
+cycle if the first reconnect attempt races with `wg-quick`.
+
 ## Uninstallation
 
 ```bash
@@ -171,6 +190,12 @@ HOST_INTERFACE=eth0
 TORRENT_CLIENT=qbittorrent
 QB_PORT=8080
 QB_USER=youruser
+
+# qBittorrent WebUI request timeout in seconds (default: 15)
+# Raise this if you have many torrents (10k+) and see repeated
+# "qBittorrent connection-status timed out" warnings — qBit's WebUI
+# is single-threaded and occasionally pauses under heavy state load.
+# QB_API_TIMEOUT=15
 ```
 
 ## Usage
@@ -367,11 +392,23 @@ The VPN runs in a separate network namespace, completely isolated from your host
 
 MOLE can run a DNS over TLS server that encrypts your DNS queries and optionally blocks ads, malware, and tracking domains.
 
+The resolver pools persistent TLS connections to each upstream so individual queries don't pay a TCP+TLS handshake. Concurrent identical queries are collapsed via singleflight — only one upstream call goes out, all callers receive the same response. With a comma-separated `DOT_UPSTREAM` list, queries failover to the next upstream after `DOT_QUERY_RETRIES` attempts on the current one.
+
 ### Configuration
 
 ```ini
 DOT_ENABLED=true
-DOT_UPSTREAM=cloudflare  # cloudflare, cloudflare-family, quad9, google, custom
+
+# Upstream(s) — built-in: cloudflare, cloudflare-family, quad9, google, custom
+# Comma-separated for failover (tried in order, per query)
+DOT_UPSTREAM=cloudflare
+# DOT_UPSTREAM=cloudflare,quad9     # failover example
+
+# Connection pool (per upstream)
+DOT_POOL_SIZE=2                     # persistent TLS connections kept open
+DOT_QUERY_TIMEOUT=2.0               # per-attempt upstream query timeout (s)
+DOT_QUERY_RETRIES=2                 # retries per upstream before failover
+DOT_RETRY_BACKOFF_MS=200            # backoff between retries (ms)
 
 # Filtering
 DOT_BLOCK_ADS=true
@@ -381,6 +418,8 @@ DOT_BLOCK_MALWARE=true
 DOT_CACHING=true
 DOT_UPDATE_PERIOD=24h
 ```
+
+Real-time pool state, per-upstream counters, and latency percentiles are exposed at `GET /v1/dns` (see HTTP Control API section below).
 
 ## HTTP Proxy
 
@@ -423,8 +462,83 @@ HTTP_API_KEY=your_api_key_here
 | GET | `/v1/ip` | Public IP address |
 | GET | `/v1/server` | Current server info |
 | GET | `/v1/health` | Health check status |
-| GET | `/v1/dns` | DNS cache and blocklist stats |
+| GET | `/v1/dns` | DoT resolver state: cache, blocklist, per-upstream pool stats, counters, latency percentiles |
 | PUT | `/v1/vpn/restart` | Trigger reconnection |
+
+### `/v1/dns` response shape
+
+```json
+{
+  "enabled": true,
+  "upstream": "cloudflare",
+  "upstreams": [
+    {
+      "name": "cloudflare",
+      "host": "1.1.1.1",
+      "port": 853,
+      "pool_size": 2,
+      "open_connections": 2,
+      "primary": true,
+      "query_p50_ms": 12.4,
+      "query_p95_ms": 28.1,
+      "query_p99_ms": 45.7,
+      "query_samples": 1024,
+      "counters": {
+        "queries": 5234,
+        "errors": 3,
+        "retries": 1,
+        "failovers_out": 0
+      }
+    }
+  ],
+  "caching": true,
+  "cache_entries": 412,
+  "cache_size_bytes": 38291,
+  "blocked_domains": 97057,
+  "in_flight": 0,
+  "counters": {
+    "queries_total": 8421,
+    "cache_hits": 3187,
+    "cache_misses": 5234,
+    "in_flight_peak": 14,
+    "singleflight_collapses": 1842,
+    "blocked": 0,
+    "upstream_queries": 5234,
+    "upstream_errors": 3,
+    "retries": 1,
+    "failovers": 0,
+    "resolve_errors": 0
+  },
+  "last_blocklist_update": 1776740747,
+  "block_ads": true,
+  "block_malware": true,
+  "block_tracking": false
+}
+```
+
+| Field | Meaning |
+|---|---|
+| `upstreams[]` | One entry per configured DoT target. The first is the primary; others are failover targets tried in order. |
+| `upstreams[].open_connections` | TLS connections currently open to this upstream. Oscillates `0..pool_size` with traffic — idle connections are closed by remote and reopened lazily. |
+| `upstreams[].query_p{50,95,99}_ms` | Latency percentiles (nearest-rank, no interpolation) over the rolling 1024-sample window of *successful* upstream queries against this target. Failures excluded so timeouts don't drag percentiles toward `DOT_QUERY_TIMEOUT`. |
+| `upstreams[].query_samples` | Number of samples backing the percentiles above. |
+| `upstreams[].counters.queries` | Attempts (success + fail) against this upstream. |
+| `upstreams[].counters.errors` | Failed attempts against this upstream. |
+| `upstreams[].counters.retries` | Same-upstream retries on this target (only when `DOT_QUERY_RETRIES > 0`). |
+| `upstreams[].counters.failovers_out` | Times we gave up on THIS upstream and moved to the next in the list. Always 0 for the last upstream. |
+| `in_flight` | Resolves currently in flight (waiting on upstream or singleflight leader). |
+| `cache_entries` | Number of cached responses. |
+| `cache_size_bytes` | Total bytes of cached response data. |
+| `counters.queries_total` | Every incoming query to the resolver. |
+| `counters.cache_hits` | Resolves served from cache. |
+| `counters.cache_misses` | Resolves that didn't find a cache entry (includes singleflight followers). |
+| `counters.singleflight_collapses` | Concurrent identical queries that piggy-backed on an in-flight upstream call instead of issuing their own. Sustained-high value on a single client = real workload dedup; near-zero with high `cache_misses` = mostly distinct names. |
+| `counters.upstream_queries` | Total upstream attempts. Equals the sum of `upstreams[].counters.queries`. |
+| `counters.upstream_errors` | Total upstream failures. Equals the sum of `upstreams[].counters.errors`. |
+| `counters.retries` | Total same-upstream retries across all targets. |
+| `counters.failovers` | Total cross-upstream failovers across all targets. |
+| `counters.resolve_errors` | Resolves that returned no answer to the client (every upstream failed). This is the client-visible failure count. |
+| `last_blocklist_update` | Unix epoch seconds of the last successful blocklist refresh, or `null` if none yet. |
 
 ## Troubleshooting
 
