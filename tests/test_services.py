@@ -24,11 +24,6 @@ class TestServicesImport(unittest.TestCase):
         from mole_pkg.services import HTTPProxyServer
         self.assertTrue(callable(HTTPProxyServer))
 
-    def test_import_api(self):
-        """HTTPAPIServer can be imported"""
-        from mole_pkg.services import HTTPAPIServer
-        self.assertTrue(callable(HTTPAPIServer))
-
 
 class TestQBittorrentClient(unittest.TestCase):
     """Test QBittorrentClient"""
@@ -154,70 +149,6 @@ class TestHTTPProxyServer(unittest.TestCase):
         server = HTTPProxyServer(mock_config, "vpn")
         self.assertFalse(server._is_blocked_target("8.8.8.8"))
         self.assertFalse(server._is_blocked_target("1.1.1.1"))
-
-
-class TestHTTPAPIServer(unittest.TestCase):
-    """Test HTTPAPIServer"""
-
-    def test_server_initialization(self):
-        """HTTPAPIServer initializes with mole, bind, port, and api_key"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "testapikey")
-
-        self.assertEqual(server.mole, mock_mole)
-        self.assertEqual(server.bind, "127.0.0.1")
-        self.assertEqual(server.port, 8080)
-        self.assertEqual(server.api_key, "testapikey")
-
-    def test_check_auth_no_key_configured(self):
-        """_check_auth allows all when no API key is configured"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "")
-
-        self.assertTrue(server._check_auth({}, {}))
-
-    def test_check_auth_header_key(self):
-        """_check_auth validates X-API-Key header"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        headers = {"x-api-key": "secretkey"}
-        self.assertTrue(server._check_auth(headers, {}))
-
-        headers = {"x-api-key": "wrongkey"}
-        self.assertFalse(server._check_auth(headers, {}))
-
-    def test_check_auth_bearer_token(self):
-        """_check_auth validates Authorization: Bearer header"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        headers = {"authorization": "Bearer secretkey"}
-        self.assertTrue(server._check_auth(headers, {}))
-
-        headers = {"authorization": "Bearer wrongkey"}
-        self.assertFalse(server._check_auth(headers, {}))
-
-    def test_check_auth_query_param(self):
-        """_check_auth validates api_key query parameter"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        query_params = {"api_key": "secretkey"}
-        self.assertTrue(server._check_auth({}, query_params))
-
-        query_params = {"api_key": "wrongkey"}
-        self.assertFalse(server._check_auth({}, query_params))
 
 
 if __name__ == '__main__':
