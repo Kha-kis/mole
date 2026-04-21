@@ -44,6 +44,64 @@ class TestQBittorrentClient(unittest.TestCase):
         self.assertEqual(client.config, mock_config)
 
 
+class TestQBittorrentConnectionStatusRetry(unittest.IsolatedAsyncioTestCase):
+    """get_connection_status retries on timeout and demotes single transient
+    failures from ERROR to WARNING. The previous behavior generated spurious
+    hourly ERRORs against high-torrent-count clients."""
+
+    def _make_config(self, timeout=15):
+        cfg = Mock()
+        cfg.qb_api_url = "http://localhost:8080/api/v2/app"
+        cfg.qb_api_timeout = timeout
+        return cfg
+
+    async def test_timeout_then_success_returns_value_at_warning(self):
+        from mole_pkg.services import QBittorrentClient
+        import socket
+
+        client = QBittorrentClient(self._make_config())
+
+        ok_resp = MagicMock()
+        ok_resp.read.return_value = b'{"connection_status": "connected"}'
+        ok_resp.__enter__ = lambda self_: self_
+        ok_resp.__exit__ = lambda *a: False
+
+        call_count = {"n": 0}
+        def fake_urlopen(url, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise socket.timeout("timed out")
+            return ok_resp
+
+        with patch("mole_pkg.services.qbittorrent.urllib.request.urlopen",
+                   side_effect=fake_urlopen), \
+             patch("mole_pkg.services.qbittorrent.log") as mock_log:
+            result = await client.get_connection_status()
+
+        self.assertEqual(result, "connected")
+        self.assertEqual(call_count["n"], 2)
+        mock_log.warning.assert_called_once()
+        mock_log.error.assert_not_called()
+
+    async def test_two_timeouts_returns_none_at_error(self):
+        from mole_pkg.services import QBittorrentClient
+        import socket
+
+        client = QBittorrentClient(self._make_config())
+
+        def fake_urlopen(url, timeout=None):
+            raise socket.timeout("timed out")
+
+        with patch("mole_pkg.services.qbittorrent.urllib.request.urlopen",
+                   side_effect=fake_urlopen), \
+             patch("mole_pkg.services.qbittorrent.log") as mock_log:
+            result = await client.get_connection_status()
+
+        self.assertIsNone(result)
+        mock_log.warning.assert_called_once()
+        mock_log.error.assert_called_once()
+
+
 class TestDOTServer(unittest.TestCase):
     """Test DOTServer"""
 

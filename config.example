@@ -124,6 +124,13 @@ QB_PORT=8080
 # Legacy option: qBittorrent Web API URL (QB_PORT is preferred)
 # QB_API_URL=http://localhost:8080/api/v2/app
 
+# qBittorrent WebUI request timeout in seconds (default: 15).
+# The WebUI is single-threaded for some operations and at high torrent
+# counts (10k+) can pause for several seconds during internal sweeps.
+# Raise this if you see repeated "timed out" warnings; lower it only
+# if you actively monitor and want faster failure detection.
+# QB_API_TIMEOUT=15
+
 # ═══════════════════════════════════════════════════════════════════
 # Timing Settings (in seconds)
 # ═══════════════════════════════════════════════════════════════════
