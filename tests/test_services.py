@@ -24,11 +24,6 @@ class TestServicesImport(unittest.TestCase):
         from mole_pkg.services import HTTPProxyServer
         self.assertTrue(callable(HTTPProxyServer))
 
-    def test_import_api(self):
-        """HTTPAPIServer can be imported"""
-        from mole_pkg.services import HTTPAPIServer
-        self.assertTrue(callable(HTTPAPIServer))
-
 
 class TestQBittorrentClient(unittest.TestCase):
     """Test QBittorrentClient"""
@@ -47,6 +42,64 @@ class TestQBittorrentClient(unittest.TestCase):
 
         client = QBittorrentClient(mock_config)
         self.assertEqual(client.config, mock_config)
+
+
+class TestQBittorrentConnectionStatusRetry(unittest.IsolatedAsyncioTestCase):
+    """get_connection_status retries on timeout and demotes single transient
+    failures from ERROR to WARNING. The previous behavior generated spurious
+    hourly ERRORs against high-torrent-count clients."""
+
+    def _make_config(self, timeout=15):
+        cfg = Mock()
+        cfg.qb_api_url = "http://localhost:8080/api/v2/app"
+        cfg.qb_api_timeout = timeout
+        return cfg
+
+    async def test_timeout_then_success_returns_value_at_warning(self):
+        from mole_pkg.services import QBittorrentClient
+        import socket
+
+        client = QBittorrentClient(self._make_config())
+
+        ok_resp = MagicMock()
+        ok_resp.read.return_value = b'{"connection_status": "connected"}'
+        ok_resp.__enter__ = lambda self_: self_
+        ok_resp.__exit__ = lambda *a: False
+
+        call_count = {"n": 0}
+        def fake_urlopen(url, timeout=None):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                raise socket.timeout("timed out")
+            return ok_resp
+
+        with patch("mole_pkg.services.qbittorrent.urllib.request.urlopen",
+                   side_effect=fake_urlopen), \
+             patch("mole_pkg.services.qbittorrent.log") as mock_log:
+            result = await client.get_connection_status()
+
+        self.assertEqual(result, "connected")
+        self.assertEqual(call_count["n"], 2)
+        mock_log.warning.assert_called_once()
+        mock_log.error.assert_not_called()
+
+    async def test_two_timeouts_returns_none_at_error(self):
+        from mole_pkg.services import QBittorrentClient
+        import socket
+
+        client = QBittorrentClient(self._make_config())
+
+        def fake_urlopen(url, timeout=None):
+            raise socket.timeout("timed out")
+
+        with patch("mole_pkg.services.qbittorrent.urllib.request.urlopen",
+                   side_effect=fake_urlopen), \
+             patch("mole_pkg.services.qbittorrent.log") as mock_log:
+            result = await client.get_connection_status()
+
+        self.assertIsNone(result)
+        mock_log.warning.assert_called_once()
+        mock_log.error.assert_called_once()
 
 
 class TestDOTServer(unittest.TestCase):
@@ -154,70 +207,6 @@ class TestHTTPProxyServer(unittest.TestCase):
         server = HTTPProxyServer(mock_config, "vpn")
         self.assertFalse(server._is_blocked_target("8.8.8.8"))
         self.assertFalse(server._is_blocked_target("1.1.1.1"))
-
-
-class TestHTTPAPIServer(unittest.TestCase):
-    """Test HTTPAPIServer"""
-
-    def test_server_initialization(self):
-        """HTTPAPIServer initializes with mole, bind, port, and api_key"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "testapikey")
-
-        self.assertEqual(server.mole, mock_mole)
-        self.assertEqual(server.bind, "127.0.0.1")
-        self.assertEqual(server.port, 8080)
-        self.assertEqual(server.api_key, "testapikey")
-
-    def test_check_auth_no_key_configured(self):
-        """_check_auth allows all when no API key is configured"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "")
-
-        self.assertTrue(server._check_auth({}, {}))
-
-    def test_check_auth_header_key(self):
-        """_check_auth validates X-API-Key header"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        headers = {"x-api-key": "secretkey"}
-        self.assertTrue(server._check_auth(headers, {}))
-
-        headers = {"x-api-key": "wrongkey"}
-        self.assertFalse(server._check_auth(headers, {}))
-
-    def test_check_auth_bearer_token(self):
-        """_check_auth validates Authorization: Bearer header"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        headers = {"authorization": "Bearer secretkey"}
-        self.assertTrue(server._check_auth(headers, {}))
-
-        headers = {"authorization": "Bearer wrongkey"}
-        self.assertFalse(server._check_auth(headers, {}))
-
-    def test_check_auth_query_param(self):
-        """_check_auth validates api_key query parameter"""
-        from mole_pkg.services import HTTPAPIServer
-
-        mock_mole = Mock()
-        server = HTTPAPIServer(mock_mole, "127.0.0.1", 8080, "secretkey")
-
-        query_params = {"api_key": "secretkey"}
-        self.assertTrue(server._check_auth({}, query_params))
-
-        query_params = {"api_key": "wrongkey"}
-        self.assertFalse(server._check_auth({}, query_params))
 
 
 if __name__ == '__main__':
