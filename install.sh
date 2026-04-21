@@ -162,10 +162,20 @@ fi  # end: dependency check skipped in --upgrade mode
 echo ""
 echo "Installing MOLE..."
 
-# Install Python package
+# Install Python package — mirror, don't merge.
+# `cp -r src/ dest/` merges into dest, so files removed from the repo
+# stay on disk forever. Use rsync --delete when available; otherwise
+# wipe and recopy. Either way the deployed tree exactly matches the
+# repo after this step. Stale .pyc files in __pycache__ also get
+# cleaned, so dropped modules can't accidentally load.
 echo -n "  Installing mole_pkg to /usr/local/lib/mole... "
 mkdir -p /usr/local/lib/mole
-cp -r "$SCRIPT_DIR/mole_pkg" /usr/local/lib/mole/
+if command -v rsync >/dev/null 2>&1; then
+    rsync -a --delete "$SCRIPT_DIR/mole_pkg/" /usr/local/lib/mole/mole_pkg/
+else
+    rm -rf /usr/local/lib/mole/mole_pkg
+    cp -r "$SCRIPT_DIR/mole_pkg" /usr/local/lib/mole/
+fi
 echo -e "${GREEN}done${NC}"
 
 # Create wrapper script
