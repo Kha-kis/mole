@@ -17,9 +17,16 @@ import asyncio
 import itertools
 import ssl
 import struct
-from typing import Dict, List, Optional, Tuple
+import time
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from ..utils import log
+
+
+# Bounded per-target window for percentile computation. Big enough to
+# smooth single-spike noise; small enough that sort() on read is trivial.
+_LATENCY_WINDOW = 1024
 
 
 # DoT presets. (ip, port, sni_hostname). This is the canonical definition;
@@ -251,10 +258,30 @@ class _UpstreamTarget:
             _Connection(host, port, sni) for _ in range(self.pool_size)
         ]
         self._rr = itertools.count()
+        # Successful-query latencies in ms. Failures are excluded — they're
+        # tracked in upstream_errors and including them skews percentiles
+        # toward the configured timeout.
+        self._latency_ms: Deque[float] = deque(maxlen=_LATENCY_WINDOW)
 
     def pick(self) -> _Connection:
         """Round-robin connection picker."""
         return self._connections[next(self._rr) % len(self._connections)]
+
+    def record_latency_ms(self, elapsed_ms: float) -> None:
+        self._latency_ms.append(elapsed_ms)
+
+    def percentiles(self) -> Tuple[Optional[float], Optional[float], Optional[float], int]:
+        """Returns (p50_ms, p95_ms, p99_ms, sample_count). Nearest-rank
+        percentile — exact for the recorded window, no interpolation."""
+        n = len(self._latency_ms)
+        if n == 0:
+            return None, None, None, 0
+        s = sorted(self._latency_ms)
+        # nearest-rank: index = ceil(p/100 * N) - 1, clamped
+        p50 = s[(n - 1) * 50 // 100]
+        p95 = s[(n - 1) * 95 // 100]
+        p99 = s[(n - 1) * 99 // 100]
+        return p50, p95, p99, n
 
     async def close(self) -> None:
         for c in self._connections:
@@ -306,10 +333,15 @@ class UpstreamPool:
 
         The first-listed upstream is always the configured primary; there is
         no sticky "active" state because failover is per-query only.
+
+        query_p{50,95,99}_ms and query_samples reflect the rolling window
+        of successful upstream queries (window size = _LATENCY_WINDOW).
+        Null when the target hasn't successfully served any queries yet.
         """
         out = []
         for i, t in enumerate(self._targets):
             open_count = sum(1 for c in t._connections if c.is_open())
+            p50, p95, p99, samples = t.percentiles()
             out.append({
                 'name': t.name,
                 'host': t.host,
@@ -317,6 +349,10 @@ class UpstreamPool:
                 'pool_size': t.pool_size,
                 'open_connections': open_count,
                 'primary': (i == 0),
+                'query_p50_ms': round(p50, 1) if p50 is not None else None,
+                'query_p95_ms': round(p95, 1) if p95 is not None else None,
+                'query_p99_ms': round(p99, 1) if p99 is not None else None,
+                'query_samples': samples,
             })
         return out
 
@@ -346,9 +382,12 @@ class UpstreamPool:
                 conn = target.pick()
                 try:
                     self._stats['upstream_queries'] = self._stats.get('upstream_queries', 0) + 1
-                    return await conn.query(
+                    start = time.monotonic()
+                    response = await conn.query(
                         query_bytes, client_xid, timeout=self._query_timeout,
                     )
+                    target.record_latency_ms((time.monotonic() - start) * 1000.0)
+                    return response
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
