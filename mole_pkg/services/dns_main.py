@@ -16,7 +16,8 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from mole_pkg.services.dns import DOTServer, DOT_PROVIDERS
+from mole_pkg.services.dns import DOTServer
+from mole_pkg.services.dns_upstream import DOT_PROVIDERS
 from mole_pkg.utils import log
 
 
@@ -27,6 +28,11 @@ class StandaloneConfig:
         self.dot_bind = args.bind
         self.dot_port = args.port
         self.dot_upstream = args.upstream
+        # Pre-parse the comma-separated list form so DOTServer's pool sees a
+        # clean list without re-splitting.
+        self.dot_upstreams = [
+            u.strip() for u in (args.upstream or '').split(',') if u.strip()
+        ] or ['cloudflare']
         self.dot_custom_server = args.custom_server or ""
         self.dot_block_ads = args.block_ads
         self.dot_block_malware = args.block_malware
@@ -34,6 +40,10 @@ class StandaloneConfig:
         self.dot_caching = args.caching
         self.dot_cache_ttl = args.cache_ttl
         self.dot_update_period = args.update_period
+        self.dot_pool_size = args.pool_size
+        self.dot_query_timeout = args.query_timeout
+        self.dot_query_retries = args.query_retries
+        self.dot_retry_backoff_ms = args.retry_backoff_ms
         self.dot_enabled = True
         self.state_dir = args.state_dir
 
@@ -89,10 +99,11 @@ Examples:
     parser.add_argument("--port", type=int, default=53,
                         help="Port to listen on (default: 53)")
     parser.add_argument("--upstream", default="cloudflare",
-                        choices=list(DOT_PROVIDERS.keys()) + ["custom"],
-                        help="Upstream DNS provider (default: cloudflare)")
+                        help="Upstream DNS provider (default: cloudflare). "
+                             "Accepts a comma-separated list for failover, "
+                             "e.g. 'cloudflare,quad9'.")
     parser.add_argument("--custom-server",
-                        help="Custom DoT server (ip:port) when --upstream=custom")
+                        help="Custom DoT server (ip:port) when upstream includes 'custom'")
     parser.add_argument("--block-ads", action="store_true", default=False,
                         help="Enable ad blocking")
     parser.add_argument("--block-malware", action="store_true", default=False,
@@ -109,6 +120,14 @@ Examples:
                         help="Blocklist update period in seconds (default: 86400)")
     parser.add_argument("--state-dir", default="/var/lib/mole",
                         help="State directory for caching blocklists")
+    parser.add_argument("--pool-size", type=int, default=2,
+                        help="Persistent TLS connections per upstream (default: 2)")
+    parser.add_argument("--query-timeout", type=float, default=2.0,
+                        help="Per-attempt upstream query timeout, seconds (default: 2.0)")
+    parser.add_argument("--query-retries", type=int, default=2,
+                        help="Retries per upstream before failover (default: 2)")
+    parser.add_argument("--retry-backoff-ms", type=int, default=200,
+                        help="Backoff between retries in milliseconds (default: 200)")
 
     args = parser.parse_args()
 

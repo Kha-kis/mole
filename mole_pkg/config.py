@@ -248,6 +248,40 @@ class Config:
             return int(val[:-1]) * 60
         return int(val)
 
+    @property
+    def dot_upstreams(self) -> List[str]:
+        """Ordered list of upstream DNS providers. Accepts the same values as
+        DOT_UPSTREAM (named preset or 'custom') as a comma-separated list.
+        Rotated on failover."""
+        raw = self.get('DOT_UPSTREAM', 'cloudflare')
+        return [u.strip() for u in raw.split(',') if u.strip()]
+
+    @property
+    def dot_pool_size(self) -> int:
+        """Persistent TLS connections per upstream. Higher = more parallelism
+        absorbed before queueing; 2 is plenty for most workloads."""
+        return max(1, self.get_int('DOT_POOL_SIZE', 2))
+
+    @property
+    def dot_query_timeout(self) -> float:
+        """Per-attempt upstream query timeout, seconds. Applies to the whole
+        send+receive cycle (not per-stage)."""
+        try:
+            return max(0.1, float(self.get('DOT_QUERY_TIMEOUT', '2.0')))
+        except (ValueError, TypeError):
+            return 2.0
+
+    @property
+    def dot_query_retries(self) -> int:
+        """Retries per upstream before failing over to the next upstream.
+        Total attempts = (retries + 1) * len(dot_upstreams)."""
+        return max(0, self.get_int('DOT_QUERY_RETRIES', 2))
+
+    @property
+    def dot_retry_backoff_ms(self) -> int:
+        """Bounded delay between retries, milliseconds."""
+        return max(0, self.get_int('DOT_RETRY_BACKOFF_MS', 200))
+
     # Hooks
     @property
     def post_connect_hook(self) -> str:
