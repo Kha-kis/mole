@@ -241,32 +241,42 @@ class HTTPAPIServer:
         }
 
     async def _get_dns(self) -> dict:
-        """GET /v1/dns - DNS over TLS status and cache stats"""
+        """GET /v1/dns - DNS over TLS status, cache stats, and query counters"""
         config = self.mole.config
         dns_server = getattr(self.mole, '_dns_server', None)
 
         cache_size = 0
         cache_entries = 0
         blocked_domains = 0
+        in_flight = 0
         last_blocklist_update = None
+        counters: dict = {}
+        upstreams: list = []
 
         if dns_server:
             cache_entries = len(dns_server._cache)
-            # Calculate approximate cache size
             cache_size = sum(len(v[0]) for v in dns_server._cache.values())
             blocked_domains = len(dns_server.blocked_domains)
+            in_flight = len(getattr(dns_server, '_in_flight', {}))
             if dns_server._last_blocklist_update > 0:
                 last_blocklist_update = int(dns_server._last_blocklist_update)
+            counters = dict(getattr(dns_server, '_stats', {}) or {})
+            pool = getattr(dns_server, '_pool', None)
+            if pool is not None:
+                upstreams = pool.upstream_info()
 
         return {
             'status': 200,
             'body': {
                 'enabled': config.dot_enabled,
                 'upstream': config.dot_upstream,
+                'upstreams': upstreams,
                 'caching': config.dot_caching,
                 'cache_entries': cache_entries,
                 'cache_size_bytes': cache_size,
                 'blocked_domains': blocked_domains,
+                'in_flight': in_flight,
+                'counters': counters,
                 'last_blocklist_update': last_blocklist_update,
                 'block_ads': config.dot_block_ads,
                 'block_malware': config.dot_block_malware,
