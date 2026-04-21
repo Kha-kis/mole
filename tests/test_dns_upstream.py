@@ -433,5 +433,95 @@ class TestUpstreamInfoIncludesLatency(unittest.TestCase):
         self.assertEqual(info[0]['query_samples'], 0)
 
 
+class TestPerUpstreamCounters(unittest.IsolatedAsyncioTestCase):
+    """Per-upstream counter dict tells you which specific upstream is degrading
+    when a multi-upstream failover list is configured. Aggregate counters in
+    UpstreamPool._stats stay unchanged — sum-of-per-upstream == aggregate."""
+
+    def _info_by_name(self, info):
+        return {u['name']: u for u in info}
+
+    async def test_counters_initialized_to_zero(self):
+        pool = UpstreamPool(['cloudflare'], pool_size=1)
+        info = pool.upstream_info()
+        self.assertEqual(info[0]['counters'],
+                         {'queries': 0, 'errors': 0, 'retries': 0,
+                          'failovers_out': 0})
+
+    async def test_single_upstream_success_increments_queries_only(self):
+        pool = UpstreamPool(['cloudflare'], pool_size=1, query_retries=0,
+                            query_timeout=2.0, retry_backoff_ms=0)
+        target = pool._targets[0]
+
+        async def ok(q, xid, timeout):
+            return _make_response(q)
+        target._connections[0].query = ok  # type: ignore
+
+        await pool.query(_make_query(), client_xid=0x1)
+        await pool.query(_make_query(), client_xid=0x2)
+
+        info = pool.upstream_info()[0]
+        self.assertEqual(info['counters']['queries'], 2)
+        self.assertEqual(info['counters']['errors'], 0)
+        self.assertEqual(info['counters']['retries'], 0)
+        self.assertEqual(info['counters']['failovers_out'], 0)
+
+    async def test_failover_counters_attribute_correctly(self):
+        """Two upstreams; primary always fails; secondary always succeeds.
+        After 5 queries: primary has 5 errors + 5 failovers_out; secondary
+        has 5 successful queries + 0 errors + 0 failovers_out."""
+        pool = UpstreamPool(['cloudflare', 'quad9'], pool_size=1,
+                            query_retries=0, query_timeout=2.0,
+                            retry_backoff_ms=0)
+        primary, secondary = pool._targets
+
+        async def fail(q, xid, timeout):
+            raise asyncio.TimeoutError()
+        async def ok(q, xid, timeout):
+            return _make_response(q)
+        primary._connections[0].query = fail  # type: ignore
+        secondary._connections[0].query = ok  # type: ignore
+
+        for i in range(5):
+            await pool.query(_make_query(xid=i), client_xid=i)
+
+        info = self._info_by_name(pool.upstream_info())
+        self.assertEqual(info['cloudflare']['counters']['queries'], 5)
+        self.assertEqual(info['cloudflare']['counters']['errors'], 5)
+        self.assertEqual(info['cloudflare']['counters']['failovers_out'], 5)
+        self.assertEqual(info['quad9']['counters']['queries'], 5)
+        self.assertEqual(info['quad9']['counters']['errors'], 0)
+        # The secondary never has anywhere to fail-over TO, so this is 0
+        # even though it serves all the traffic.
+        self.assertEqual(info['quad9']['counters']['failovers_out'], 0)
+
+        # Aggregate sanity: pool._stats.upstream_queries should equal the
+        # sum of per-upstream queries.
+        self.assertEqual(
+            pool._stats['upstream_queries'],
+            sum(u['counters']['queries'] for u in pool.upstream_info()),
+        )
+
+    async def test_retries_count_per_upstream(self):
+        """One upstream, query_retries=2, always fails. Expect:
+        queries=3 (1 initial + 2 retries), errors=3, retries=2."""
+        pool = UpstreamPool(['cloudflare'], pool_size=1, query_retries=2,
+                            query_timeout=2.0, retry_backoff_ms=0)
+        target = pool._targets[0]
+
+        async def fail(q, xid, timeout):
+            raise asyncio.TimeoutError()
+        target._connections[0].query = fail  # type: ignore
+
+        with self.assertRaises(UpstreamExhausted):
+            await pool.query(_make_query(), client_xid=0x1)
+
+        c = pool.upstream_info()[0]['counters']
+        self.assertEqual(c['queries'], 3)
+        self.assertEqual(c['errors'], 3)
+        self.assertEqual(c['retries'], 2)
+        self.assertEqual(c['failovers_out'], 0)
+
+
 if __name__ == '__main__':
     unittest.main()
