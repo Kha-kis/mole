@@ -17,6 +17,7 @@ from mole_pkg.services.dns_upstream import (
     UpstreamExhausted,
     UpstreamPool,
     _Connection,
+    _UpstreamTarget,
     resolve_upstream,
 )
 
@@ -338,6 +339,98 @@ class TestConnectionDispatch(unittest.IsolatedAsyncioTestCase):
             await t
 
         await conn.close()
+
+
+class TestLatencyHistogram(unittest.TestCase):
+    """Per-target latency window + nearest-rank percentiles."""
+
+    def _target(self):
+        return _UpstreamTarget("test", "1.1.1.1", 853, "x", pool_size=1)
+
+    def test_empty_returns_nones(self):
+        t = self._target()
+        p50, p95, p99, n = t.percentiles()
+        self.assertIsNone(p50)
+        self.assertIsNone(p95)
+        self.assertIsNone(p99)
+        self.assertEqual(n, 0)
+
+    def test_known_distribution(self):
+        t = self._target()
+        # 100 samples: 1.0 .. 100.0 ms
+        for i in range(1, 101):
+            t.record_latency_ms(float(i))
+        p50, p95, p99, n = t.percentiles()
+        self.assertEqual(n, 100)
+        # nearest-rank: index = (n-1)*p/100 = 49 / 94 / 98 -> values 50 / 95 / 99
+        self.assertEqual(p50, 50.0)
+        self.assertEqual(p95, 95.0)
+        self.assertEqual(p99, 99.0)
+
+    def test_window_eviction(self):
+        from mole_pkg.services.dns_upstream import _LATENCY_WINDOW
+        t = self._target()
+        # Fill with 9999 (would be p99) then overflow with low values.
+        # Once the high samples are evicted, percentiles must drop.
+        for _ in range(_LATENCY_WINDOW):
+            t.record_latency_ms(9999.0)
+        _, _, p99_initial, _ = t.percentiles()
+        self.assertEqual(p99_initial, 9999.0)
+        for _ in range(_LATENCY_WINDOW):
+            t.record_latency_ms(1.0)
+        _, _, p99_after, n = t.percentiles()
+        self.assertEqual(n, _LATENCY_WINDOW)
+        self.assertEqual(p99_after, 1.0)
+
+
+class TestPoolRecordsLatencyOnSuccessOnly(unittest.IsolatedAsyncioTestCase):
+    """UpstreamPool.query() must record latency on success and NOT on failure
+    (so timeouts can't drag percentiles toward the configured timeout)."""
+
+    async def test_success_records_latency(self):
+        pool = UpstreamPool(['cloudflare'], pool_size=1, query_retries=0,
+                            query_timeout=2.0, retry_backoff_ms=0)
+        target = pool._targets[0]
+
+        async def fake_query(q, xid, timeout):
+            await asyncio.sleep(0.005)
+            return _make_response(q)
+
+        target._connections[0].query = fake_query  # type: ignore
+        await pool.query(_make_query(), client_xid=0x1234)
+
+        _, _, _, n = target.percentiles()
+        self.assertEqual(n, 1)
+
+    async def test_failure_does_not_record(self):
+        pool = UpstreamPool(['cloudflare'], pool_size=1, query_retries=0,
+                            query_timeout=2.0, retry_backoff_ms=0)
+        target = pool._targets[0]
+
+        async def always_timeout(q, xid, timeout):
+            raise asyncio.TimeoutError()
+
+        target._connections[0].query = always_timeout  # type: ignore
+        with self.assertRaises(UpstreamExhausted):
+            await pool.query(_make_query(), client_xid=0x1234)
+
+        _, _, _, n = target.percentiles()
+        self.assertEqual(n, 0)
+
+
+class TestUpstreamInfoIncludesLatency(unittest.TestCase):
+    """upstream_info() must surface the new latency fields so they flow
+    through dns_stats.json -> /v1/dns automatically."""
+
+    def test_keys_present(self):
+        pool = UpstreamPool(['cloudflare'], pool_size=1)
+        info = pool.upstream_info()
+        self.assertEqual(len(info), 1)
+        for key in ('query_p50_ms', 'query_p95_ms', 'query_p99_ms', 'query_samples'):
+            self.assertIn(key, info[0])
+        # Empty histogram -> nulls + zero count
+        self.assertIsNone(info[0]['query_p50_ms'])
+        self.assertEqual(info[0]['query_samples'], 0)
 
 
 if __name__ == '__main__':
