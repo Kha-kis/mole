@@ -3,8 +3,33 @@
 # MOLE Installation Script
 # Managed Obfuscated Link Environment
 #
+# Usage:
+#   sudo ./install.sh             First-time install (deps + interactive init)
+#   sudo ./install.sh --upgrade   In-place upgrade on a configured host
+#                                 (skips deps, skips `mole init`, leaves the
+#                                 service stopped — operator restarts when ready)
+#
 
 set -e
+
+# Parse arguments
+MODE="install"
+case "${1:-}" in
+    --upgrade)
+        MODE="upgrade"
+        ;;
+    -h|--help)
+        sed -n '2,11p' "$0"
+        exit 0
+        ;;
+    "")
+        ;;
+    *)
+        echo "Unknown argument: $1" >&2
+        echo "Use --help for usage." >&2
+        exit 2
+        ;;
+esac
 
 # Colors for output
 RED='\033[0;31m'
@@ -15,7 +40,11 @@ NC='\033[0m' # No Color
 echo -e "${GREEN}"
 echo "╔═══════════════════════════════════════════════════════════════╗"
 echo "║  MOLE - Managed Obfuscated Link Environment                   ║"
+if [ "$MODE" = "upgrade" ]; then
+echo "║  Upgrade Mode (in-place)                                      ║"
+else
 echo "║  Installation Script                                          ║"
+fi
 echo "╚═══════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
@@ -42,8 +71,11 @@ else
 fi
 
 # ═══════════════════════════════════════════════════════════════════
-# Install system dependencies
+# Install system dependencies (skipped in --upgrade mode)
 # ═══════════════════════════════════════════════════════════════════
+if [ "$MODE" = "upgrade" ]; then
+    echo "Skipping dependency check (--upgrade mode)."
+else
 echo "Checking system dependencies..."
 
 install_package() {
@@ -122,6 +154,7 @@ else
     echo -n "  proton-client (ProtonVPN)... "
     pip3 install proton-client > /dev/null 2>&1 && echo -e "${GREEN}installed${NC}" || echo -e "${YELLOW}failed (install with: pip3 install proton-client)${NC}"
 fi
+fi  # end: dependency check skipped in --upgrade mode
 
 # ═══════════════════════════════════════════════════════════════════
 # Install MOLE
@@ -153,14 +186,25 @@ cp "$SCRIPT_DIR/mole.service" /etc/systemd/system/mole.service
 systemctl daemon-reload
 echo -e "${GREEN}done${NC}"
 
-# Enable service (but don't start yet)
-echo -n "  Enabling mole service... "
-systemctl enable mole >/dev/null 2>&1
-echo -e "${GREEN}done${NC}"
+# Enable service (skipped in --upgrade mode — already enabled)
+if [ "$MODE" != "upgrade" ]; then
+    echo -n "  Enabling mole service... "
+    systemctl enable mole >/dev/null 2>&1
+    echo -e "${GREEN}done${NC}"
+fi
 
 echo ""
-echo -e "${GREEN}Installation complete!${NC}"
-echo ""
-
-# Run interactive setup
-/usr/local/bin/mole init
+if [ "$MODE" = "upgrade" ]; then
+    echo -e "${GREEN}Upgrade complete.${NC}"
+    echo ""
+    echo "Files in place. To activate the new version:"
+    echo "    sudo systemctl restart mole"
+    echo ""
+    echo "After restart, allow up to ~3 minutes for the watchdog VPN-renewal"
+    echo "cycle if the first reconnect attempt races with wg-quick."
+else
+    echo -e "${GREEN}Installation complete!${NC}"
+    echo ""
+    # Run interactive setup
+    /usr/local/bin/mole init
+fi

@@ -127,6 +127,14 @@ class Config:
         return self.get('QB_USER', '')
 
     @property
+    def qb_api_timeout(self) -> int:
+        # qBittorrent's WebUI is single-threaded for some operations and at
+        # high torrent counts (10k+) can pause for several seconds during
+        # internal sweeps. 5s was producing spurious hourly ERRORs; 15s is
+        # tolerant of the realistic worst case without masking real outages.
+        return self.get_int('QB_API_TIMEOUT', 15)
+
+    @property
     def renewal_interval(self) -> int:
         return self.get_int('RENEWAL_INTERVAL', 72000)
 
