@@ -8,6 +8,8 @@ Usage:
 
 import argparse
 import asyncio
+import json
+import os
 import signal
 import sys
 from pathlib import Path
@@ -48,6 +50,26 @@ class StandaloneConfig:
         self.state_dir = args.state_dir
 
 
+async def _stats_writer_loop(server: DOTServer, state_dir: Path,
+                             interval: float = 1.0) -> None:
+    # api_main runs as a separate process and cannot read DOTServer state
+    # directly, so snapshot it to a file it can poll.
+    stats_path = state_dir / "dns_stats.json"
+    tmp_path = state_dir / "dns_stats.json.tmp"
+    while True:
+        try:
+            stats = server.get_stats()
+            stats['cache_entries'] = stats.pop('cache_size', 0)
+            stats['cache_size_bytes'] = sum(
+                len(v[0]) for v in server._cache.values()
+            )
+            tmp_path.write_text(json.dumps(stats))
+            os.replace(tmp_path, stats_path)
+        except Exception as e:
+            log.warning(f"Failed to write dns_stats.json: {e}")
+        await asyncio.sleep(interval)
+
+
 async def main_async(args):
     """Async main entry point"""
     config = StandaloneConfig(args)
@@ -66,17 +88,21 @@ async def main_async(args):
 
     # Start server in background
     server_task = asyncio.create_task(server.start())
+    stats_task = asyncio.create_task(
+        _stats_writer_loop(server, Path(args.state_dir))
+    )
 
     # Wait for shutdown signal
     await shutdown_event.wait()
 
     # Cleanup
     await server.stop()
-    server_task.cancel()
-    try:
-        await server_task
-    except asyncio.CancelledError:
-        pass
+    for task in (server_task, stats_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     log.info("DNS server stopped")
 
