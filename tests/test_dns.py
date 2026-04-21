@@ -3,14 +3,18 @@ Tests for mole_pkg.services.dns module - DNS over TLS service
 """
 
 import asyncio
+import json
 import struct
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 
 from mole_pkg.services.dns import (
     DOTServer,
     DOT_PROVIDERS,
 )
+from mole_pkg.services.dns_main import _stats_writer_loop
 from mole_pkg.services.dns_upstream import UpstreamExhausted
 
 
@@ -405,6 +409,67 @@ class TestDOTServerResolve(unittest.IsolatedAsyncioTestCase):
             await server.resolve(_make_query(xid=i, name=f'h{i}.example.com.'))
         self.assertEqual(server._stats['cache_misses'], 0)
         self.assertEqual(server._stats['cache_hits'], 0)
+        await server.stop()
+
+
+class TestStatsWriterLoop(unittest.IsolatedAsyncioTestCase):
+    """The writer is the IPC bridge from dns_main to api_main; if its output
+    shape changes, /v1/dns silently breaks."""
+
+    def _make_config(self):
+        cfg = MagicMock()
+        cfg.dot_bind = '127.0.0.1'
+        cfg.dot_port = 53
+        cfg.dot_upstream = 'cloudflare'
+        cfg.dot_upstreams = ['cloudflare']
+        cfg.dot_caching = True
+        cfg.dot_cache_ttl = 0
+        cfg.dot_custom_server = ''
+        cfg.dot_update_period = 0
+        cfg.dot_pool_size = 1
+        cfg.dot_query_timeout = 2.0
+        cfg.dot_query_retries = 0
+        cfg.dot_retry_backoff_ms = 0
+        cfg.dot_block_ads = False
+        cfg.dot_block_malware = False
+        cfg.dot_block_tracking = False
+        cfg.dot_enabled = True
+        return cfg
+
+    async def test_writer_emits_expected_shape(self):
+        server = DOTServer(self._make_config(), 'vpn')
+        # Seed cache so cache_size_bytes is non-zero
+        server._cache[('a.example.com.', 1)] = (b'\x00' * 42, 9999.0)
+        server._stats['queries_total'] = 7
+
+        with tempfile.TemporaryDirectory() as td:
+            state_dir = Path(td)
+            task = asyncio.create_task(
+                _stats_writer_loop(server, state_dir, interval=0.05)
+            )
+            try:
+                stats_path = state_dir / 'dns_stats.json'
+                for _ in range(40):
+                    await asyncio.sleep(0.025)
+                    if stats_path.exists():
+                        break
+                self.assertTrue(stats_path.exists(), "writer never produced file")
+                data = json.loads(stats_path.read_text())
+            finally:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
+        for key in ('upstreams', 'counters', 'cache_entries',
+                    'cache_size_bytes', 'in_flight', 'blocked_domains'):
+            self.assertIn(key, data, f"writer missing key: {key}")
+        self.assertEqual(data['cache_entries'], 1)
+        self.assertEqual(data['cache_size_bytes'], 42)
+        self.assertEqual(data['counters']['queries_total'], 7)
+        # Tmp file should not be left behind after a successful rename
+        self.assertFalse((state_dir / 'dns_stats.json.tmp').exists())
         await server.stop()
 
 

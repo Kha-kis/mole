@@ -310,24 +310,35 @@ class HTTPAPIServerStandalone:
         }
 
     async def _get_dns(self) -> dict:
-        """GET /v1/dns - DNS over TLS status"""
-        # Read DNS stats from file if available
+        """GET /v1/dns - DNS over TLS status, cache stats, and query counters.
+
+        Stats are produced by dns_main as JSON in dns_stats.json (the dns_main
+        process is the only one with live access to DOTServer state).
+        """
         dns_stats_file = self.state_dir / 'dns_stats.json'
-        dns_stats = {}
+        dns_stats: dict = {}
         try:
             if dns_stats_file.exists():
                 dns_stats = json.loads(dns_stats_file.read_text())
         except Exception:
             pass
 
+        last_update = dns_stats.get('last_blocklist_update') or 0
+        last_update_int = int(last_update) if last_update else None
+
         return {
             'status': 200,
             'body': {
                 'enabled': self._get_config_bool('DOT_ENABLED', False),
                 'upstream': self._get_config('DOT_UPSTREAM', 'cloudflare'),
+                'upstreams': dns_stats.get('upstreams', []),
                 'caching': self._get_config_bool('DOT_CACHING', True),
                 'cache_entries': dns_stats.get('cache_entries', 0),
+                'cache_size_bytes': dns_stats.get('cache_size_bytes', 0),
                 'blocked_domains': dns_stats.get('blocked_domains', 0),
+                'in_flight': dns_stats.get('in_flight', 0),
+                'counters': dns_stats.get('counters', {}),
+                'last_blocklist_update': last_update_int,
                 'block_ads': self._get_config_bool('DOT_BLOCK_ADS', True),
                 'block_malware': self._get_config_bool('DOT_BLOCK_MALWARE', True),
                 'block_tracking': self._get_config_bool('DOT_BLOCK_TRACKING', False),
