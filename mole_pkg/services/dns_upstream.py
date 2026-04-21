@@ -262,6 +262,19 @@ class _UpstreamTarget:
         # tracked in upstream_errors and including them skews percentiles
         # toward the configured timeout.
         self._latency_ms: Deque[float] = deque(maxlen=_LATENCY_WINDOW)
+        # Per-upstream counters. The pool's aggregate _stats is the sum of
+        # these across all targets; when a multi-upstream config is in use,
+        # these tell you which specific upstream is degrading.
+        # failovers_out: times we gave up on THIS upstream and moved to the
+        # next one in the failover list (so for the last upstream this is
+        # always 0; for the only upstream in a single-upstream config this
+        # is also always 0).
+        self._counters: Dict[str, int] = {
+            'queries': 0,
+            'errors': 0,
+            'retries': 0,
+            'failovers_out': 0,
+        }
 
     def pick(self) -> _Connection:
         """Round-robin connection picker."""
@@ -353,6 +366,7 @@ class UpstreamPool:
                 'query_p95_ms': round(p95, 1) if p95 is not None else None,
                 'query_p99_ms': round(p99, 1) if p99 is not None else None,
                 'query_samples': samples,
+                'counters': dict(t._counters),
             })
         return out
 
@@ -369,11 +383,16 @@ class UpstreamPool:
           upstream_errors:  one per failed attempt
           retries:          one per same-upstream retry
           failovers:        one per per-query move to a later upstream
+
+        Per-target mirrors live on _UpstreamTarget._counters and are
+        exposed in upstream_info(); the aggregate above is the sum over
+        all targets.
         """
         last_exc: Optional[BaseException] = None
         for upstream_idx, target in enumerate(self._targets):
             if upstream_idx > 0:
                 self._stats['failovers'] = self._stats.get('failovers', 0) + 1
+                self._targets[upstream_idx - 1]._counters['failovers_out'] += 1
                 log.debug(
                     f"DoT upstream {self._targets[upstream_idx - 1].name} "
                     f"exhausted, trying {target.name}"
@@ -382,6 +401,7 @@ class UpstreamPool:
                 conn = target.pick()
                 try:
                     self._stats['upstream_queries'] = self._stats.get('upstream_queries', 0) + 1
+                    target._counters['queries'] += 1
                     start = time.monotonic()
                     response = await conn.query(
                         query_bytes, client_xid, timeout=self._query_timeout,
@@ -393,8 +413,10 @@ class UpstreamPool:
                 except Exception as e:
                     last_exc = e
                     self._stats['upstream_errors'] = self._stats.get('upstream_errors', 0) + 1
+                    target._counters['errors'] += 1
                     if attempt < self._query_retries:
                         self._stats['retries'] = self._stats.get('retries', 0) + 1
+                        target._counters['retries'] += 1
                         if self._backoff:
                             await asyncio.sleep(self._backoff)
                         continue
