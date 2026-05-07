@@ -240,6 +240,24 @@ class Config:
         return self.get('DOT_CUSTOM_SERVER', '')
 
     @property
+    def dot_custom_sni(self) -> str:
+        """
+        Optional SNI hostname for the `custom` DoT upstream.
+
+        When DOT_UPSTREAM=custom, the SNI sent during the TLS handshake
+        normally matches the connect target from DOT_CUSTOM_SERVER. That
+        forces the connect target to be a hostname for cert validation,
+        which creates a bootstrap-circular dependency if the resolver
+        doing the lookup *is* the listener being started.
+
+        Setting DOT_CUSTOM_SNI to the cert hostname while leaving
+        DOT_CUSTOM_SERVER as a literal IP:port lets you connect by IP
+        (no DNS) but still validate against the upstream's certificate.
+        Empty (default) preserves the prior behavior.
+        """
+        return self.get('DOT_CUSTOM_SNI', '')
+
+    @property
     def dot_block_ads(self) -> bool:
         val = self.get('DOT_BLOCK_ADS', 'true').lower()
         return val in ('true', '1', 'yes', 'on')

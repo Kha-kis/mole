@@ -65,7 +65,9 @@ class DOTServer:
         upstreams = self._resolve_upstream_list()
         primary_name = upstreams[0]
         self.upstream_ip, self.upstream_port, self.upstream_sni = resolve_upstream(
-            primary_name, getattr(config, 'dot_custom_server', '') or ''
+            primary_name,
+            getattr(config, 'dot_custom_server', '') or '',
+            getattr(config, 'dot_custom_sni', '') or '',
         )
         self.blocked_domains: set = set()
         self._transport = None
@@ -99,9 +101,13 @@ class DOTServer:
         custom_server = getattr(config, 'dot_custom_server', '') or ''
         if not isinstance(custom_server, str):
             custom_server = ''
+        custom_sni = getattr(config, 'dot_custom_sni', '') or ''
+        if not isinstance(custom_sni, str):
+            custom_sni = ''
         self._pool = UpstreamPool(
             upstreams=upstreams,
             custom_server=custom_server,
+            custom_sni=custom_sni,
             pool_size=self._coerce_int(getattr(config, 'dot_pool_size', 2), 2),
             query_timeout=self._coerce_float(getattr(config, 'dot_query_timeout', 2.0), 2.0),
             query_retries=self._coerce_int(getattr(config, 'dot_query_retries', 2), 2),
