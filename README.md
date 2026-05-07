@@ -470,7 +470,24 @@ HTTP_API_ENABLED=true
 HTTP_API_PORT=8080
 HTTP_API_BIND=127.0.0.1
 HTTP_API_KEY=your_api_key_here
+
+# Auth policy. Tri-state: true | false | auto (default auto).
+#   auto:  require HTTP_API_KEY whenever the API is bound to a non-loopback
+#          address. Loopback-only binds without a key are allowed.
+#   true:  always require a key, even on loopback.
+#   false: never require a key (legacy unauthenticated mode — foot-gun if
+#          you bind non-loopback; logs a warning in that case).
+# When the policy resolves to "required" and HTTP_API_KEY is empty, mole
+# refuses to start (`mole run` exits non-zero) rather than silently spawn an
+# unauthenticated API server. Generate a key with `sudo mole api-key generate`.
+# HTTP_API_REQUIRE_AUTH=auto
 ```
+
+> **Migration note:** prior versions warned but still served. From this
+> release onward, the default policy refuses to start when bound non-loopback
+> without a key. If you have a deployment that intentionally exposes the API
+> without authentication, set `HTTP_API_REQUIRE_AUTH=false` to opt out (a
+> warning is still logged).
 
 ### Endpoints
 

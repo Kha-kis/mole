@@ -192,6 +192,39 @@ class Config:
     def http_api_key(self) -> str:
         return self.get('HTTP_API_KEY', '')
 
+    @property
+    def http_api_require_auth(self) -> str:
+        """
+        Tri-state policy for whether HTTP_API_KEY must be set:
+
+          - 'true'  : key is required regardless of bind address
+          - 'false' : key is never required (legacy unauthenticated mode;
+                      foot-gun if you bind non-loopback)
+          - 'auto'  : (default) require a key whenever the API is bound to
+                      a non-loopback address. Loopback-only binds without
+                      a key are allowed.
+
+        Aliases accepted: 1/yes/on for true, 0/no/off for false. Anything
+        else (including the empty string) resolves to 'auto'.
+        """
+        val = (self.get('HTTP_API_REQUIRE_AUTH', 'auto') or '').strip().lower()
+        if val in ('true', '1', 'yes', 'on'):
+            return 'true'
+        if val in ('false', '0', 'no', 'off'):
+            return 'false'
+        return 'auto'
+
+    def http_api_auth_required(self) -> bool:
+        """Returns True if the current configuration requires HTTP_API_KEY."""
+        mode = self.http_api_require_auth
+        if mode == 'true':
+            return True
+        if mode == 'false':
+            return False
+        # auto: required iff bound non-loopback
+        bind_addr = (self.http_api_bind or '').strip()
+        return bind_addr not in ('127.0.0.1', 'localhost', '::1', '[::1]')
+
     # HTTP Proxy
     @property
     def proxy_enabled(self) -> bool:
@@ -570,11 +603,33 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         if config.torrent_client.lower() in ('none', 'disabled', ''):
             warnings.append(f"PORT_FORWARD is enabled but TORRENT_CLIENT is disabled - port will be forwarded but not used")
 
-    # Check HTTP API security configuration
+    # Check HTTP API security configuration. The default policy
+    # (HTTP_API_REQUIRE_AUTH=auto) refuses to run when the API is bound to
+    # a non-loopback address without an HTTP_API_KEY. Operators who have a
+    # specific reason to keep the legacy unauthenticated-on-LAN behavior can
+    # set HTTP_API_REQUIRE_AUTH=false to opt out (a warning is still logged
+    # so the choice is visible in the journal).
     if config.http_api_enabled:
         bind_addr = config.http_api_bind
-        if not config.http_api_key and bind_addr not in ('127.0.0.1', 'localhost', '::1'):
-            warnings.append(f"SECURITY: HTTP API bound to '{bind_addr}' without authentication - set HTTP_API_KEY")
+        if config.http_api_auth_required() and not config.http_api_key:
+            errors.append(
+                f"HTTP_API_KEY is not set but the current configuration "
+                f"requires authentication (HTTP_API_REQUIRE_AUTH="
+                f"{config.http_api_require_auth}, HTTP_API_BIND='{bind_addr}'). "
+                f"Generate a key with 'sudo mole api-key generate' or set "
+                f"HTTP_API_REQUIRE_AUTH=false to explicitly opt out (not "
+                f"recommended for non-loopback binds)."
+            )
+        elif (
+            config.http_api_require_auth == 'false'
+            and not config.http_api_key
+            and bind_addr not in ('127.0.0.1', 'localhost', '::1', '[::1]')
+        ):
+            warnings.append(
+                f"HTTP_API_REQUIRE_AUTH=false with HTTP_API_BIND='{bind_addr}' "
+                f"and no HTTP_API_KEY — the API is reachable without auth. "
+                f"This is the legacy behavior and is the operator's choice."
+            )
 
     # Check HTTP Proxy authentication
     if config.proxy_enabled and not config.proxy_pass:
