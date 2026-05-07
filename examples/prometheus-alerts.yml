@@ -1,0 +1,156 @@
+# Prometheus alert rules for mole.
+#
+# Drop this file under your Prometheus rule_files: directory and reload.
+# Two severity tiers:
+#   - critical: page someone
+#   - warning : surface in a daily review / business-hours channel
+#
+# Most thresholds reflect mole's stock defaults (RENEWAL_INTERVAL=7d,
+# DoT pool, NAT-PMP keepalive). If you've tuned those, adjust the
+# `for:` durations + threshold expressions accordingly.
+
+groups:
+  - name: mole.tunnel
+    interval: 30s
+    rules:
+
+      - alert: MoleVpnDown
+        expr: mole_vpn_connected == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "mole VPN tunnel is down"
+          description: |
+            mole_vpn_connected has been 0 for 5 minutes. mole's watchdog
+            tries recovery on its own (3 health-check failures = full
+            renewal). If this alert fires, recovery has been failing —
+            check `journalctl -u mole.service` for the underlying error.
+
+      - alert: MoleScrapeMissing
+        expr: up{job="mole"} == 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus is not scraping mole"
+          description: |
+            Either mole's HTTP API is down, the Prometheus job is
+            misconfigured, or auth is failing. Check `curl -H 'X-API-Key:
+            $KEY' http://<mole>:8080/metrics` from the Prometheus host.
+
+      - alert: MoleHandshakeStale
+        expr: mole_vpn_handshake_age_seconds > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole WireGuard handshake is stale"
+          description: |
+            mole_vpn_connected says the interface is up but no peer
+            handshake in the last 5 minutes. This is the classic
+            "interface up but link dead" failure mode. Watchdog should
+            recover within ~3 min via a full renewal; if this persists,
+            inspect Proton/PIA reachability from the host.
+
+      - alert: MoleRenewalLagging
+        # Default RENEWAL_INTERVAL is 7d (604800s). Alert if no successful
+        # renewal in 2x that window so a single transient failure doesn't
+        # fire but a persistently-broken renewal does. If you've tuned
+        # RENEWAL_INTERVAL, adjust the threshold to 2x your value.
+        expr: time() - mole_vpn_renewal_last_success_timestamp_seconds > 1209600
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole has not completed a successful renewal in >2x RENEWAL_INTERVAL"
+          description: |
+            The last successful full VPN renewal was {{ humanizeDuration
+            $value }} ago. Either renewals have been failing silently or
+            mole.service has been down. Check
+            mole_vpn_renewals_total{result="failure"} for the failure
+            cadence.
+
+      - alert: MolePortForwardStale
+        expr: mole_vpn_port_forward_age_seconds > 600
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole port-forward keepalive is stale"
+          description: |
+            ProtonVPN's NAT-PMP mapping has a ~60s TTL; if the keepalive
+            hasn't refreshed in >10 min the port forward is dead and
+            inbound peer connections will silently fail. PIA's signed-
+            payload model is more forgiving but the same alert still
+            indicates a broken keepalive loop.
+
+  - name: mole.dns
+    interval: 30s
+    rules:
+
+      - alert: MoleHighDnsLatency
+        expr: mole_dns_upstream_query_latency_p99_seconds > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole DoT upstream p99 latency > 1s for {{ $labels.upstream }}"
+          description: |
+            Sustained high p99 latency on the DoT upstream. Check
+            upstream reachability and consider failing over via
+            DOT_UPSTREAM=primary,secondary.
+
+      - alert: MoleHighDnsErrorRate
+        expr: rate(mole_dns_resolve_errors_total[5m]) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole DNS resolve error rate > 0.5/s"
+          description: |
+            mole returned errors instead of valid responses to >0.5
+            queries/sec averaged over 5 minutes. This is upstream-
+            independent failures (no upstream returned a usable answer).
+
+      - alert: MoleHighUpstreamFailovers
+        expr: rate(mole_dns_upstream_failovers_total[5m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole DoT upstream failover rate elevated for {{ $labels.upstream }}"
+          description: |
+            mole is exhausting retries on upstream "{{ $labels.upstream }}"
+            and falling back to the next upstream more than 0.1/s.
+            Often a sign that the upstream is degrading even when
+            individual queries still succeed via failover.
+
+      - alert: MoleBlocklistStale
+        # Mole's default DOT_UPDATE_PERIOD is 86400s (24h). Alert if the
+        # last successful refresh is >2 days old.
+        expr: time() - mole_dns_blocklist_last_update_seconds > 172800
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole DNS blocklist >2 days stale"
+          description: |
+            The last successful blocklist refresh was
+            {{ humanizeDuration $value }} ago. Filtering still works
+            against the stale list, but new blocked domains aren't
+            being picked up. Check
+            mole_dns_blocklist_update_failures_total.
+
+      - alert: MoleBlocklistUpdatesFailing
+        expr: increase(mole_dns_blocklist_update_failures_total[1h]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "mole DNS blocklist updates are erroring"
+          description: |
+            One or more blocklist update attempts raised an exception
+            in the last hour. Check `journalctl -u mole.service` for
+            the underlying error (typically a network or upstream
+            blocklist source issue).
