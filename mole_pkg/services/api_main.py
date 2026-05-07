@@ -64,6 +64,8 @@ def _prom_num(value, default: float = 0.0) -> float:
 def format_prometheus_metrics(
     dns_stats: dict,
     vpn_status: dict,
+    renewal_state: dict = None,
+    port_forward_state: dict = None,
     version: str = "",
 ) -> str:
     """Render mole's runtime state as Prometheus text exposition format.
@@ -73,9 +75,22 @@ def format_prometheus_metrics(
     counters default to 0, per-upstream rows are skipped when no upstreams
     are configured, and any field that fails coercion falls back to 0
     rather than raising.
+
+    vpn_status keys recognised:
+      connected (bool), port (int), handshake_age_seconds (float),
+      hostname (str), server_ip (str), country (str)
+
+    renewal_state keys recognised:
+      success_total, failure_total, last_success_ts,
+      last_duration_seconds
+
+    port_forward_state keys recognised:
+      age_seconds, success_total, failure_total
     """
     dns_stats = dns_stats or {}
     vpn_status = vpn_status or {}
+    renewal_state = renewal_state or {}
+    port_forward_state = port_forward_state or {}
     counters = dns_stats.get("counters") or {}
     upstreams = dns_stats.get("upstreams") or []
 
@@ -119,6 +134,93 @@ def format_prometheus_metrics(
         "Currently forwarded VPN port (0 if no port forward).",
         [(None, int(_prom_num(port)))],
     )
+
+    # WireGuard handshake age — a "connected" tunnel with a stale handshake
+    # is a real silent-failure mode. The handshake should refresh roughly
+    # every 2-3 minutes; ages > 180s suggest the peer link is dead even if
+    # the interface itself is still administratively up.
+    if "handshake_age_seconds" in vpn_status:
+        emit(
+            "mole_vpn_handshake_age_seconds",
+            "gauge",
+            "Seconds since the last successful WireGuard handshake (a freshness check beyond mole_vpn_connected).",
+            [(None, _prom_num(vpn_status.get("handshake_age_seconds")))],
+        )
+
+    # Endpoint identity — a single labelled gauge=1 carrying the current
+    # connection's server hostname, country, and IP. Joinable in PromQL
+    # via `mole_vpn_connected * on() group_left(server, country)
+    # mole_vpn_endpoint_info` for "is this server, in this country, up?"
+    hostname = vpn_status.get("hostname") or ""
+    server_ip = vpn_status.get("server_ip") or ""
+    country = vpn_status.get("country") or ""
+    if hostname or server_ip or country:
+        emit(
+            "mole_vpn_endpoint_info",
+            "gauge",
+            "Current VPN endpoint identity. Always 1; the labels carry the data.",
+            [
+                (
+                    {
+                        "server": hostname,
+                        "country": country,
+                        "endpoint_ip": server_ip,
+                    },
+                    1,
+                )
+            ],
+        )
+
+    # ---- VPN renewal observability ----
+    # Counter for total renewal attempts split by outcome. Daily renewals
+    # show up as a stair-step on the success counter; failures are an
+    # alertable ratio. Pair with `mole_vpn_renewal_last_success_timestamp_seconds`
+    # to alert on "no successful renewal in N hours" even when nothing has
+    # explicitly failed (e.g. mole crashed mid-renewal).
+    if renewal_state:
+        emit(
+            "mole_vpn_renewals_total",
+            "counter",
+            "Total VPN renewal attempts split by outcome.",
+            [
+                ({"result": "success"}, int(_prom_num(renewal_state.get("success_total", 0)))),
+                ({"result": "failure"}, int(_prom_num(renewal_state.get("failure_total", 0)))),
+            ],
+        )
+        emit(
+            "mole_vpn_renewal_last_duration_seconds",
+            "gauge",
+            "Wall-clock duration of the most recent completed VPN renewal (success or failure).",
+            [(None, _prom_num(renewal_state.get("last_duration_seconds", 0)))],
+        )
+        emit(
+            "mole_vpn_renewal_last_success_timestamp_seconds",
+            "gauge",
+            "Unix timestamp of the most recent successful VPN renewal (0 if never).",
+            [(None, int(_prom_num(renewal_state.get("last_success_ts", 0))))],
+        )
+
+    # ---- Port-forward keepalive observability ----
+    # NAT-PMP keepalives can silently stop refreshing while mole still
+    # thinks it has a port. A staleness gauge catches it before trackers
+    # report "unreachable peer", well in advance of any user-visible impact.
+    if port_forward_state:
+        if "age_seconds" in port_forward_state:
+            emit(
+                "mole_vpn_port_forward_age_seconds",
+                "gauge",
+                "Seconds since the last successful port-forward keepalive (alertable on staleness).",
+                [(None, _prom_num(port_forward_state.get("age_seconds")))],
+            )
+        emit(
+            "mole_vpn_port_forward_renewals_total",
+            "counter",
+            "Total port-forward keepalive attempts split by outcome.",
+            [
+                ({"result": "success"}, int(_prom_num(port_forward_state.get("success_total", 0)))),
+                ({"result": "failure"}, int(_prom_num(port_forward_state.get("failure_total", 0)))),
+            ],
+        )
 
     # ---- DNS aggregates ----
     counter_specs = [
@@ -167,6 +269,22 @@ def format_prometheus_metrics(
         "gauge",
         "Unix timestamp of the most recent blocklist refresh (0 if never).",
         [(None, int(_prom_num(last_update)))],
+    )
+
+    last_update_duration = dns_stats.get("last_blocklist_update_duration") or 0
+    emit(
+        "mole_dns_blocklist_update_last_duration_seconds",
+        "gauge",
+        "Wall-clock duration of the most recent successful blocklist refresh (seconds).",
+        [(None, round(_prom_num(last_update_duration), 6))],
+    )
+
+    blocklist_failures = dns_stats.get("blocklist_update_failures_total") or 0
+    emit(
+        "mole_dns_blocklist_update_failures_total",
+        "counter",
+        "Total exceptions raised inside the blocklist update loop.",
+        [(None, int(_prom_num(blocklist_failures)))],
     )
 
     # ---- Per-upstream ----
@@ -595,11 +713,10 @@ class HTTPAPIServerStandalone:
     async def _get_metrics(self) -> dict:
         """GET /metrics - Prometheus exposition format.
 
-        Same data as /v1/dns and /v1/status, re-shaped for time-series
-        scraping. Reuses dns_stats.json (written by dns_main) plus state
-        files for VPN connectivity, so this is a thin formatter, not a
-        new collector. Goes through the same _check_auth path as the
-        rest of the API; Prometheus scrapers should set
+        Reuses dns_stats.json (written by dns_main) plus state files
+        written by mole.py for VPN connectivity, renewal counters, and
+        port-forward keepalive metrics. Goes through the same _check_auth
+        path as the rest of the API; Prometheus scrapers should set
         `authorization: { credentials: <HTTP_API_KEY> }` in scrape_config.
         """
         # DNS state (same source as _get_dns)
@@ -611,20 +728,68 @@ class HTTPAPIServerStandalone:
         except Exception:
             pass
 
-        # VPN status (same shape as _get_status without re-running wg show
-        # if we already determined connectivity). Read state files and
-        # check WireGuard.
+        # VPN status — connectivity comes from `wg show mole`; the handshake
+        # age comes from `wg show mole latest-handshakes` (output:
+        # `<pubkey>\t<unix-ts>` per line, ts=0 if no handshake yet).
         port_str = self._read_state_file('port')
         port = int(port_str) if port_str and port_str.isdigit() else 0
+
         wg_result = self._run_cmd(['wg', 'show', 'mole'])
+        connected = wg_result.returncode == 0
+
+        handshake_age = None
+        try:
+            hs_result = self._run_cmd(['wg', 'show', 'mole', 'latest-handshakes'])
+            if hs_result.returncode == 0:
+                # Take the freshest handshake across peers (mole has one peer
+                # in practice, but we don't hard-code that assumption).
+                latest_ts = 0
+                for line in hs_result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 2:
+                        try:
+                            latest_ts = max(latest_ts, int(parts[1]))
+                        except ValueError:
+                            pass
+                if latest_ts > 0:
+                    handshake_age = max(0, time.time() - latest_ts)
+        except Exception:
+            pass
+
         vpn_status = {
-            'connected': wg_result.returncode == 0,
+            'connected': connected,
             'port': port,
+            'hostname': self._read_state_file('hostname') or '',
+            'server_ip': self._read_state_file('server_ip') or '',
+            'country': self._read_state_file('server_country') or '',
         }
+        if handshake_age is not None:
+            vpn_status['handshake_age_seconds'] = handshake_age
+
+        # Renewal observability — counters + last-success markers persisted
+        # by mole.py:_full_renewal.
+        renewal_state = {
+            'success_total': self._read_state_int('renewals_success_total'),
+            'failure_total': self._read_state_int('renewals_failure_total'),
+            'last_success_ts': self._read_state_int('last_renewal_success_ts'),
+            'last_duration_seconds': self._read_state_float('last_renewal_duration_seconds'),
+        }
+
+        # Port-forward keepalive observability — counters + age derived from
+        # last_port_forward_success_ts persisted by mole.py:_keepalive_loop.
+        pf_last_ts = self._read_state_int('last_port_forward_success_ts')
+        port_forward_state = {
+            'success_total': self._read_state_int('port_forward_renewals_success_total'),
+            'failure_total': self._read_state_int('port_forward_renewals_failure_total'),
+        }
+        if pf_last_ts > 0:
+            port_forward_state['age_seconds'] = max(0, time.time() - pf_last_ts)
 
         body = format_prometheus_metrics(
             dns_stats=dns_stats,
             vpn_status=vpn_status,
+            renewal_state=renewal_state,
+            port_forward_state=port_forward_state,
             version=__version__,
         )
 
@@ -633,6 +798,22 @@ class HTTPAPIServerStandalone:
             'body': body,
             'content_type': _PROM_CONTENT_TYPE,
         }
+
+    def _read_state_int(self, name: str) -> int:
+        """Read a small integer state file; default 0 on miss/junk."""
+        raw = self._read_state_file(name)
+        try:
+            return int((raw or '').strip())
+        except (TypeError, ValueError):
+            return 0
+
+    def _read_state_float(self, name: str) -> float:
+        """Read a small float state file; default 0.0 on miss/junk."""
+        raw = self._read_state_file(name)
+        try:
+            return float((raw or '').strip())
+        except (TypeError, ValueError):
+            return 0.0
 
     async def _put_restart(self) -> dict:
         """PUT /v1/vpn/restart - Trigger VPN reconnection"""

@@ -421,12 +421,14 @@ class PIAProvider(VPNProvider):
                     if region["id"] == region_id:
                         wg_servers = region.get("servers", {}).get("wg", [])
 
+                        region_country = region.get("country") or ""
                         if target_hostname:
                             # Find specific server by hostname
                             for server in wg_servers:
                                 if server["cn"] == target_hostname:
                                     self.state.server_ip = server["ip"]
                                     self.state.server_hostname = server["cn"]
+                                    self.state.server_country = region_country
                                     log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
                                     return True
                             log.warning(f"Server '{target_hostname}' not found in region '{region_id}'")
@@ -435,6 +437,7 @@ class PIAProvider(VPNProvider):
                             server = wg_servers[0]
                             self.state.server_ip = server["ip"]
                             self.state.server_hostname = server["cn"]
+                            self.state.server_country = region_country
                             log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
                             return True
                         else:
@@ -455,6 +458,7 @@ class PIAProvider(VPNProvider):
                                 server = wg_servers[0]
                                 self.state.server_ip = server["ip"]
                                 self.state.server_hostname = server["cn"]
+                                self.state.server_country = region.get("country") or ""
                                 log.info(f"Server: {self.state.server_hostname} ({self.state.server_ip})")
                                 return True
                             break
