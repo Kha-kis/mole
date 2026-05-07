@@ -629,18 +629,24 @@ class ProtonProvider(VPNProvider):
             else:
                 dns_server = self._natpmp_gateway  # 10.2.0.1 is also DNS
 
-            # Write WireGuard config with X25519 private key
-            wg_config = f"""[Interface]
-PrivateKey = {x25519_private_key}
-Address = {peer_ip}/32
-DNS = {dns_server}
-
-[Peer]
-PublicKey = {server['public_key']}
-Endpoint = {server['entry_ip']}:51820
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-"""
+            # Write WireGuard config with X25519 private key.
+            # DNS line is opt-in: when running in a netns with a bind-mounted
+            # /etc/resolv.conf, wg-quick's resolvconf hook fails on mv. See
+            # Config.wg_dns_in_conf.
+            interface_lines = [
+                "[Interface]",
+                f"PrivateKey = {x25519_private_key}",
+                f"Address = {peer_ip}/32",
+            ]
+            if self.config.wg_dns_in_conf:
+                interface_lines.append(f"DNS = {dns_server}")
+            wg_config = "\n".join(interface_lines) + "\n\n" + (
+                f"[Peer]\n"
+                f"PublicKey = {server['public_key']}\n"
+                f"Endpoint = {server['entry_ip']}:51820\n"
+                f"AllowedIPs = 0.0.0.0/0\n"
+                f"PersistentKeepalive = 25\n"
+            )
             # Write WireGuard config with restricted permissions (contains private key)
             secure_write_file(Path(self.config.wg_conf), wg_config)
 

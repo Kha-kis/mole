@@ -82,6 +82,29 @@ class Config:
         return self.get('WG_CONF', DEFAULT_WG_CONF)
 
     @property
+    def wg_dns_in_conf(self) -> bool:
+        """
+        Whether to emit `DNS = ...` into the generated WireGuard config.
+
+        Default: False. With the default netns layout, DNS is configured via
+        the static /etc/netns/<NS>/resolv.conf bind mount (which appears as
+        /etc/resolv.conf inside the namespace), so a `DNS = ...` line in the
+        WG conf is redundant.
+
+        It is also harmful by default: with the bind mount in place,
+        `/run/resolvconf/resolv.conf` is non-replaceable via mv, and wg-quick's
+        resolvconf hook fails with `mv: cannot move ...: Device or resource
+        busy`. The wg-quick failure tears the interface down and forces a
+        full watchdog recovery cycle (3 health-check failures = ~3 minute
+        outage), repeated daily on the renewal schedule.
+
+        Set to True only when running mole without netns isolation and you
+        want wg-quick's resolvconf integration to manage system DNS.
+        """
+        val = self.get('WG_DNS_IN_CONF', 'false').lower()
+        return val in ('true', '1', 'yes', 'on')
+
+    @property
     def config_dir(self) -> str:
         return self.get('CONFIG_DIR', DEFAULT_CONFIG_DIR)
 

@@ -196,6 +196,15 @@ QB_USER=youruser
 # "qBittorrent connection-status timed out" warnings — qBit's WebUI
 # is single-threaded and occasionally pauses under heavy state load.
 # QB_API_TIMEOUT=15
+
+# Whether to write `DNS = ...` into the generated WireGuard config.
+# Default: false. With the standard netns layout, /etc/resolv.conf is
+# bind-mounted from /etc/netns/<NS>/resolv.conf, which makes wg-quick's
+# resolvconf hook fail (`mv: cannot move ...`). The interface comes up,
+# resolvconf fails, wg-quick tears it back down, and mole's watchdog
+# spends the next ~3 minutes recovering — repeated daily on renewal.
+# Set to true ONLY when running mole without netns isolation.
+# WG_DNS_IN_CONF=false
 ```
 
 ## Usage

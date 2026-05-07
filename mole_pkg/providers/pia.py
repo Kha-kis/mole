@@ -513,18 +513,24 @@ class PIAProvider(VPNProvider):
                 else:
                     dns_server = result['dns_servers'][0]
 
-                # Write WireGuard config
-                wg_config = f"""[Interface]
-PrivateKey = {priv_key}
-Address = {result['peer_ip']}/32
-DNS = {dns_server}
-
-[Peer]
-PublicKey = {result['server_key']}
-Endpoint = {self.state.server_ip}:{result['server_port']}
-AllowedIPs = 0.0.0.0/0
-PersistentKeepalive = 25
-"""
+                # Write WireGuard config.
+                # DNS line is opt-in: when running in a netns with a
+                # bind-mounted /etc/resolv.conf, wg-quick's resolvconf hook
+                # fails on mv. See Config.wg_dns_in_conf.
+                interface_lines = [
+                    "[Interface]",
+                    f"PrivateKey = {priv_key}",
+                    f"Address = {result['peer_ip']}/32",
+                ]
+                if self.config.wg_dns_in_conf:
+                    interface_lines.append(f"DNS = {dns_server}")
+                wg_config = "\n".join(interface_lines) + "\n\n" + (
+                    f"[Peer]\n"
+                    f"PublicKey = {result['server_key']}\n"
+                    f"Endpoint = {self.state.server_ip}:{result['server_port']}\n"
+                    f"AllowedIPs = 0.0.0.0/0\n"
+                    f"PersistentKeepalive = 25\n"
+                )
                 # Write WireGuard config with restricted permissions (contains private key)
                 secure_write_file(Path(self.config.wg_conf), wg_config)
 
