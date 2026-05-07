@@ -190,9 +190,28 @@ class Mole:
         log.info("Starting API server in namespace...")
 
         bind_addr = self.config.http_api_bind
-        if not self.config.http_api_key and bind_addr not in ('127.0.0.1', 'localhost', '::1'):
-            log.warning("SECURITY WARNING: HTTP API is exposed without authentication!")
-            log.warning(f"  Set HTTP_API_KEY in config or bind to 127.0.0.1")
+        # Defense in depth — cmd_run calls validate_config before instantiating
+        # Mole, so this branch is only reachable if validation was bypassed
+        # (e.g. running Mole directly from a script). Refusing here is safer
+        # than silently spawning an unauthenticated API server.
+        if self.config.http_api_auth_required() and not self.config.http_api_key:
+            raise RuntimeError(
+                f"HTTP API auth required (HTTP_API_REQUIRE_AUTH="
+                f"{self.config.http_api_require_auth}, bind='{bind_addr}') but "
+                f"HTTP_API_KEY is empty. Generate a key with 'sudo mole "
+                f"api-key generate', or set HTTP_API_REQUIRE_AUTH=false to opt "
+                f"out (not recommended for non-loopback binds)."
+            )
+        if (
+            self.config.http_api_require_auth == 'false'
+            and not self.config.http_api_key
+            and bind_addr not in ('127.0.0.1', 'localhost', '::1', '[::1]')
+        ):
+            log.warning(
+                f"HTTP API on '{bind_addr}' is unauthenticated "
+                f"(HTTP_API_REQUIRE_AUTH=false, no HTTP_API_KEY). Operator's "
+                f"choice; logging once for visibility."
+            )
 
         cmd = [
             "ip", "netns", "exec", self.config.netns,
