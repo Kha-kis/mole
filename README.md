@@ -577,6 +577,11 @@ scrape_configs:
       credentials: 'YOUR_HTTP_API_KEY'
 ```
 
+A ready-to-use Grafana dashboard and Prometheus alert rules ship in
+[`examples/`](examples/) — drop them into your provisioning paths to get
+a 22-panel dashboard plus 10 alert rules covering tunnel health, DNS
+performance, errors, and blocklist freshness.
+
 ### `/v1/dns` response shape
 
 ```json

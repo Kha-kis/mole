@@ -1,0 +1,803 @@
+{
+  "title": "Mole — VPN + DoT Resolver",
+  "uid": "mole",
+  "tags": ["mole", "vpn", "dns"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": { "from": "now-6h", "to": "now" },
+  "annotations": {
+    "list": [
+      {
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "expr": "changes(mole_vpn_renewals_total{result=\"success\"}[1m]) > 0",
+        "iconColor": "rgba(56, 141, 233, 0.9)",
+        "name": "VPN renewals",
+        "titleFormat": "VPN renewal succeeded",
+        "useValueForTime": false
+      },
+      {
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "expr": "changes(mole_vpn_renewals_total{result=\"failure\"}[1m]) > 0",
+        "iconColor": "rgba(233, 56, 56, 0.9)",
+        "name": "VPN renewal failures",
+        "titleFormat": "VPN renewal FAILED",
+        "useValueForTime": false
+      },
+      {
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "enable": true,
+        "expr": "changes(mole_vpn_connected[1m]) > 0",
+        "iconColor": "rgba(245, 196, 0, 0.9)",
+        "name": "VPN state changes",
+        "titleFormat": "VPN connect/disconnect",
+        "useValueForTime": false
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "text",
+      "title": "",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "## Mole — VPN tunnel + DoT resolver\n**Top strip:** at-a-glance health. **Lifecycle row:** daily renewal cadence + duration + freshness — flag here means tunnel is being re-established but the previous one was healthy. **Handshake & port-forward:** sawtooth lines mean the keepalive paths are alive; a flat or rising line is broken. **DNS:** throughput, latency, and errors. **Cache & blocklist:** capacity and refresh health. Vertical annotations: blue = renewal success, red = renewal failure, yellow = VPN connected/disconnected event."
+      }
+    },
+    {
+      "type": "stat",
+      "title": "VPN",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_vpn_connected", "refId": "A", "legendFormat": "" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": { "text": "DOWN", "color": "red", "index": 0 },
+                "1": { "text": "UP", "color": "green", "index": 1 }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Endpoint",
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_vpn_endpoint_info",
+          "refId": "A",
+          "legendFormat": "{{server}} ({{country}} · {{endpoint_ip}})"
+        }
+      ],
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Forwarded port",
+      "gridPos": { "h": 4, "w": 3, "x": 9, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_vpn_forwarded_port", "refId": "A", "legendFormat": "" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "0": { "text": "—", "color": "yellow" } } }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "yellow", "value": null },
+              { "color": "green", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Handshake age",
+      "gridPos": { "h": 4, "w": 3, "x": 12, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_vpn_handshake_age_seconds", "refId": "A", "legendFormat": "" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 120 },
+              { "color": "red", "value": 180 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "DNS query rate",
+      "gridPos": { "h": 4, "w": 3, "x": 15, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(mole_dns_queries_total[1m])", "refId": "A", "legendFormat": "" }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "qps", "decimals": 1 }
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "DNS p50",
+      "gridPos": { "h": 4, "w": 3, "x": 18, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(mole_dns_upstream_query_latency_p50_seconds)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.05 },
+              { "color": "red", "value": 0.2 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "DNS p99",
+      "gridPos": { "h": 4, "w": 3, "x": 21, "y": 3 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "max(mole_dns_upstream_query_latency_p99_seconds)",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "red", "value": 1 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "VPN renewal cadence",
+      "description": "Successful renewals climb monotonically; failure series jumps when a renewal failed. Daily 23:27 UTC scheduled-renewal pattern visible as a stair-step on success.",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "increase(mole_vpn_renewals_total{result=\"success\"}[1h])",
+          "refId": "A",
+          "legendFormat": "successes (per hour)"
+        },
+        {
+          "expr": "increase(mole_vpn_renewals_total{result=\"failure\"}[1h])",
+          "refId": "B",
+          "legendFormat": "failures (per hour)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "bars",
+            "lineWidth": 1,
+            "fillOpacity": 70,
+            "showPoints": "never",
+            "stacking": { "mode": "none" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "successes (per hour)" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "failures (per hour)" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Last renewal duration",
+      "description": "Wall-clock duration of each completed renewal, sampled at the moment renewal finished.",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_vpn_renewal_last_duration_seconds",
+          "refId": "A",
+          "legendFormat": "duration"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Time since last successful renewal",
+      "description": "Alertable on staleness. Healthy ≤ 25h (daily renewal). >48h indicates renewals have been failing silently.",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 7 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "time() - mole_vpn_renewal_last_success_timestamp_seconds",
+          "refId": "A",
+          "legendFormat": ""
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 90000 },
+              { "color": "red", "value": 172800 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "textMode": "value",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "WireGuard handshake age",
+      "description": "Should sawtooth — each peer handshake (typically every ~2 min) drops the gauge to ~0. A monotonic rise means the peer link has gone silent even though the interface is up.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_vpn_handshake_age_seconds",
+          "refId": "A",
+          "legendFormat": "handshake age"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never",
+            "thresholdsStyle": { "mode": "line" }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 120 },
+              { "color": "red", "value": 180 }
+            ]
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "NAT-PMP keepalive",
+      "description": "Should sawtooth every ~45s — each successful keepalive drops the age to ~0. Success/failure rates overlay on the right axis.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 15 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_vpn_port_forward_age_seconds",
+          "refId": "A",
+          "legendFormat": "PF age"
+        },
+        {
+          "expr": "rate(mole_vpn_port_forward_renewals_total{result=\"failure\"}[5m])",
+          "refId": "B",
+          "legendFormat": "failure rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "failure rate" },
+            "properties": [
+              { "id": "unit", "value": "ops" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "DNS query rate (per second)",
+      "description": "Total throughput plus composition: cache hits, upstream-resolved misses, blocked, and resolver errors.",
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(mole_dns_cache_hits_total[$__rate_interval])", "refId": "A", "legendFormat": "cache hits" },
+        { "expr": "rate(mole_dns_cache_misses_total[$__rate_interval])", "refId": "B", "legendFormat": "cache misses" },
+        { "expr": "rate(mole_dns_blocked_total[$__rate_interval])", "refId": "C", "legendFormat": "blocked" },
+        { "expr": "rate(mole_dns_resolve_errors_total[$__rate_interval])", "refId": "D", "legendFormat": "errors" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "qps",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 35,
+            "showPoints": "never",
+            "stacking": { "mode": "normal" }
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "cache hits" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "green" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "cache misses" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "blue" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "blocked" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "yellow" } }]
+          },
+          {
+            "matcher": { "id": "byName", "options": "errors" },
+            "properties": [{ "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache hit ratio",
+      "description": "rate(cache_hits) / rate(queries). Steady high values = effective caching; sustained dips suggest a workload change or cache eviction pressure.",
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(mole_dns_cache_hits_total[5m]) / clamp_min(rate(mole_dns_queries_total[5m]), 0.001)",
+          "refId": "A",
+          "legendFormat": "hit ratio"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "decimals": 2,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 25,
+            "showPoints": "never"
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.9 }
+            ]
+          },
+          "color": { "mode": "thresholds" }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": false },
+        "tooltip": { "mode": "single" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Upstream query latency (per upstream, p50 / p95 / p99)",
+      "description": "Log scale so small low-latency upstreams and slow ones share the chart cleanly.",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_dns_upstream_query_latency_p50_seconds", "refId": "A", "legendFormat": "{{upstream}} p50" },
+        { "expr": "mole_dns_upstream_query_latency_p95_seconds", "refId": "B", "legendFormat": "{{upstream}} p95" },
+        { "expr": "mole_dns_upstream_query_latency_p99_seconds", "refId": "C", "legendFormat": "{{upstream}} p99" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "scaleDistribution": { "type": "log", "log": 10 }
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true, "calcs": ["mean", "max"] },
+        "tooltip": { "mode": "multi", "sort": "asc" }
+      }
+    },
+    {
+      "type": "table",
+      "title": "Upstream summary",
+      "description": "Current state per upstream: latency p50, total queries, errors, error rate, failovers.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 29 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_dns_upstream_query_latency_p50_seconds",
+          "refId": "A",
+          "format": "table",
+          "instant": true,
+          "legendFormat": ""
+        },
+        {
+          "expr": "mole_dns_upstream_queries_total",
+          "refId": "B",
+          "format": "table",
+          "instant": true,
+          "legendFormat": ""
+        },
+        {
+          "expr": "mole_dns_upstream_errors_total",
+          "refId": "C",
+          "format": "table",
+          "instant": true,
+          "legendFormat": ""
+        },
+        {
+          "expr": "mole_dns_upstream_failovers_total",
+          "refId": "D",
+          "format": "table",
+          "instant": true,
+          "legendFormat": ""
+        },
+        {
+          "expr": "mole_dns_upstream_open_connections",
+          "refId": "E",
+          "format": "table",
+          "instant": true,
+          "legendFormat": ""
+        }
+      ],
+      "transformations": [
+        { "id": "merge", "options": {} },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true, "__name__": true, "instance": true, "job": true,
+              "Time 1": true, "Time 2": true, "Time 3": true, "Time 4": true, "Time 5": true,
+              "__name__ 1": true, "__name__ 2": true, "__name__ 3": true, "__name__ 4": true, "__name__ 5": true,
+              "instance 1": true, "instance 2": true, "instance 3": true, "instance 4": true, "instance 5": true,
+              "job 1": true, "job 2": true, "job 3": true, "job 4": true, "job 5": true
+            },
+            "renameByName": {
+              "upstream": "Upstream",
+              "Value #A": "p50 (s)",
+              "Value #B": "Queries",
+              "Value #C": "Errors",
+              "Value #D": "Failovers",
+              "Value #E": "Open conns"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "p50 (s)" },
+            "properties": [
+              { "id": "unit", "value": "s" },
+              { "id": "decimals", "value": 3 }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Errors over time",
+      "description": "Resolve-side errors (queries that failed before any upstream attempt) and per-upstream errors.",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(mole_dns_resolve_errors_total[$__rate_interval])", "refId": "A", "legendFormat": "resolve errors" },
+        { "expr": "rate(mole_dns_upstream_errors_total[$__rate_interval])", "refId": "B", "legendFormat": "{{upstream}} upstream errors" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Retries + failovers",
+      "description": "Retries are within-upstream attempts; failovers are giving-up-and-trying-the-next-upstream events.",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 37 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(mole_dns_upstream_retries_total[$__rate_interval])", "refId": "A", "legendFormat": "{{upstream}} retries" },
+        { "expr": "rate(mole_dns_upstream_failovers_total[$__rate_interval])", "refId": "B", "legendFormat": "{{upstream}} failovers" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Cache state",
+      "description": "Entries (left axis) and bytes (right axis). Cap-bound caches plateau here.",
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_dns_cache_entries", "refId": "A", "legendFormat": "entries" },
+        { "expr": "mole_dns_cache_size_bytes", "refId": "B", "legendFormat": "bytes" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "bytes" },
+            "properties": [
+              { "id": "unit", "value": "bytes" },
+              { "id": "custom.axisPlacement", "value": "right" }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Blocklist size",
+      "description": "Domains in the active blocklist + age of last successful refresh.",
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "mole_dns_blocked_domains", "refId": "A", "legendFormat": "blocklist domains" },
+        {
+          "expr": "time() - mole_dns_blocklist_last_update_seconds",
+          "refId": "B",
+          "legendFormat": "last update age (s)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": { "unit": "short" },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "last update age (s)" },
+            "properties": [{ "id": "unit", "value": "s" }]
+          }
+        ]
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Blocklist update health",
+      "description": "Duration of the most-recent successful refresh + cumulative failure count. Failure spikes mean updates have been erroring; staleness will show on the size panel.",
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 43 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "mole_dns_blocklist_update_last_duration_seconds",
+          "refId": "A",
+          "legendFormat": "last update duration"
+        },
+        {
+          "expr": "mole_dns_blocklist_update_failures_total",
+          "refId": "B",
+          "legendFormat": "failure count (total)"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 10,
+            "showPoints": "never"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "failure count (total)" },
+            "properties": [
+              { "id": "unit", "value": "short" },
+              { "id": "custom.axisPlacement", "value": "right" },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    }
+  ]
+}
