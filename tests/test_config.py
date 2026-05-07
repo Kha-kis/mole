@@ -231,6 +231,61 @@ class TestValidateConfig(unittest.TestCase):
             os.unlink(temp_path)
 
 
+# ---------- KEEPALIVE_INTERVAL provider-aware default ----------
+
+class TestKeepaliveIntervalProviderAware(unittest.TestCase):
+    """Default depends on VPN_PROVIDER. Explicit value always wins."""
+
+    def _config_with(self, **overrides) -> Config:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
+            f.write("PIA_USER=u\n")
+            f.write("PIA_PASS=p\n")
+            for key, val in overrides.items():
+                f.write(f"{key}={val}\n")
+            self._tmp_path = f.name
+        return Config(self._tmp_path)
+
+    def tearDown(self):
+        try:
+            os.unlink(self._tmp_path)
+        except (AttributeError, FileNotFoundError):
+            pass
+
+    def test_proton_default_is_45(self):
+        c = self._config_with(VPN_PROVIDER='proton')
+        self.assertEqual(c.keepalive_interval, 45)
+
+    def test_pia_default_is_900(self):
+        c = self._config_with(VPN_PROVIDER='pia')
+        self.assertEqual(c.keepalive_interval, 900)
+
+    def test_unknown_provider_falls_back_to_pia_default(self):
+        c = self._config_with(VPN_PROVIDER='mystery')
+        self.assertEqual(c.keepalive_interval, 900)
+
+    def test_explicit_value_wins_for_proton(self):
+        c = self._config_with(VPN_PROVIDER='proton', KEEPALIVE_INTERVAL='60')
+        self.assertEqual(c.keepalive_interval, 60)
+
+    def test_explicit_value_wins_for_pia(self):
+        c = self._config_with(VPN_PROVIDER='pia', KEEPALIVE_INTERVAL='45')
+        self.assertEqual(c.keepalive_interval, 45)
+
+    def test_garbage_explicit_falls_back_to_provider_default(self):
+        c = self._config_with(VPN_PROVIDER='proton', KEEPALIVE_INTERVAL='not-a-number')
+        self.assertEqual(c.keepalive_interval, 45)
+
+    def test_empty_explicit_value_falls_back_to_provider_default(self):
+        # Operator setting `KEEPALIVE_INTERVAL=` (empty) should still get
+        # the provider-aware default rather than parsing 0 or raising.
+        c = self._config_with(VPN_PROVIDER='proton', KEEPALIVE_INTERVAL='')
+        self.assertEqual(c.keepalive_interval, 45)
+
+    def test_provider_case_insensitive(self):
+        c = self._config_with(VPN_PROVIDER='PROTON')
+        self.assertEqual(c.keepalive_interval, 45)
+
+
 # ---------- HTTP_API_REQUIRE_AUTH tri-state ----------
 
 class TestHttpApiRequireAuth(unittest.TestCase):

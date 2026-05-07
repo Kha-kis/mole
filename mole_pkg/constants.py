@@ -86,7 +86,11 @@ RENEWAL_INTERVAL=604800   # 7 days. NAT-PMP keepalive keeps the port forward ali
                           # so the renewal cadence is just a periodic auth/server/WG re-validation
                           # rather than a port-forward refresh. Lower this if you want more aggressive
                           # cert/server health re-checks; lower bound is 1 hour (validated at startup).
-KEEPALIVE_INTERVAL=900
+# KEEPALIVE_INTERVAL: provider-aware default kicks in when unset.
+#   ProtonVPN: 45  (NAT-PMP TTL ~60s; mapping must refresh well before then)
+#   PIA:       900 (long-lived signed-payload model)
+# Set explicitly only to override the provider default.
+# KEEPALIVE_INTERVAL=45
 WATCHDOG_INTERVAL=60
 WATCHDOG_MAX_FAILURES=3
 
