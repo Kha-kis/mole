@@ -170,7 +170,32 @@ class Config:
 
     @property
     def keepalive_interval(self) -> int:
-        return self.get_int('KEEPALIVE_INTERVAL', 900)
+        """Seconds between port-forward keepalive refreshes.
+
+        Provider-aware default: ProtonVPN's NAT-PMP mapping has a ~60s
+        TTL and must refresh roughly every 45 seconds, so a Proton-on-
+        default config without an explicit value would otherwise have
+        its port forward expire 15 seconds after each `mole init` and
+        stay broken until the next renewal. PIA uses a long-lived
+        signed-payload model where 900s is plenty.
+
+        Operators who set KEEPALIVE_INTERVAL explicitly (e.g. via the
+        `mole init` wizard, which writes 45 for Proton + port_forward)
+        keep their configured value -- the provider-aware fallback
+        only fires when no explicit value is set. validate_config
+        still warns at startup if the chosen value is wrong for the
+        configured provider.
+        """
+        explicit = self.get('KEEPALIVE_INTERVAL', '').strip()
+        if explicit:
+            try:
+                return int(explicit)
+            except ValueError:
+                pass  # fall through to default
+        provider = (self.vpn_provider or '').strip().lower()
+        if provider == 'proton':
+            return 45
+        return 900
 
     @property
     def watchdog_interval(self) -> int:
