@@ -499,7 +499,56 @@ HTTP_API_KEY=your_api_key_here
 | GET | `/v1/server` | Current server info |
 | GET | `/v1/health` | Health check status |
 | GET | `/v1/dns` | DoT resolver state: cache, blocklist, per-upstream pool stats, counters, latency percentiles |
+| GET | `/metrics` | Prometheus exposition format — same data as `/v1/dns` + `/v1/status`, re-shaped for time-series scraping |
 | PUT | `/v1/vpn/restart` | Trigger reconnection |
+
+### Prometheus metrics
+
+`GET /metrics` returns Prometheus text exposition format. The endpoint goes
+through the same auth path as the rest of the API, so set `HTTP_API_KEY`
+and configure your Prometheus scrape with bearer-token auth.
+
+Sample output excerpt:
+
+```
+# HELP mole_vpn_connected 1 if the WireGuard tunnel is currently up, 0 otherwise.
+# TYPE mole_vpn_connected gauge
+mole_vpn_connected 1
+
+# HELP mole_dns_queries_total Total DNS queries received by the resolver.
+# TYPE mole_dns_queries_total counter
+mole_dns_queries_total 40
+
+# HELP mole_dns_upstream_query_latency_p50_seconds Per-upstream DoT query latency P50 over the rolling window (seconds).
+# TYPE mole_dns_upstream_query_latency_p50_seconds gauge
+mole_dns_upstream_query_latency_p50_seconds{upstream="cloudflare"} 0.0548
+```
+
+Top-level metrics include `mole_vpn_connected`, `mole_vpn_forwarded_port`,
+`mole_dns_queries_total`, `mole_dns_cache_hits_total`,
+`mole_dns_cache_misses_total`, `mole_dns_blocked_total`,
+`mole_dns_resolve_errors_total`, `mole_dns_in_flight_peak`,
+`mole_dns_cache_entries`, `mole_dns_blocked_domains`,
+`mole_dns_blocklist_last_update_seconds`, plus `mole_build_info{version}`.
+
+Per-upstream metrics carry an `upstream` label and include
+`queries_total`, `errors_total`, `retries_total`, `failovers_total`,
+`open_connections`, `pool_size`, `query_latency_p{50,95,99}_seconds`,
+and `query_latency_samples`.
+
+Example Prometheus scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: 'mole'
+    metrics_path: /metrics
+    scheme: http
+    static_configs:
+      - targets: ['mole.internal:8080']
+    authorization:
+      type: Bearer
+      credentials: 'YOUR_HTTP_API_KEY'
+```
 
 ### `/v1/dns` response shape
 

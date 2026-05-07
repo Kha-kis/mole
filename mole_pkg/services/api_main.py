@@ -25,6 +25,230 @@ if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from mole_pkg.utils import log
+from mole_pkg import __version__
+
+
+# Prometheus exposition format helpers — module-level so the formatter is a
+# pure function the tests can call without spinning up a server.
+
+_PROM_CONTENT_TYPE = "text/plain; version=0.0.4; charset=utf-8"
+
+
+def _prom_escape_label(value: str) -> str:
+    """Escape a Prometheus label value per the exposition format spec.
+
+    Order matters: backslash first so the others' escapes aren't re-escaped.
+    """
+    if value is None:
+        return ""
+    return (
+        str(value)
+        .replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("\n", "\\n")
+    )
+
+
+def _prom_num(value, default: float = 0.0) -> float:
+    """Coerce a metric value to a float for emission, defaulting on junk.
+
+    Prometheus accepts int and float; we always emit float-friendly numbers
+    via repr so 0 stays "0" and floats stay un-rounded.
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def format_prometheus_metrics(
+    dns_stats: dict,
+    vpn_status: dict,
+    version: str = "",
+) -> str:
+    """Render mole's runtime state as Prometheus text exposition format.
+
+    Inputs are dict-shaped to keep the function pure and trivially testable
+    without a running server. Empty/missing fields render gracefully:
+    counters default to 0, per-upstream rows are skipped when no upstreams
+    are configured, and any field that fails coercion falls back to 0
+    rather than raising.
+    """
+    dns_stats = dns_stats or {}
+    vpn_status = vpn_status or {}
+    counters = dns_stats.get("counters") or {}
+    upstreams = dns_stats.get("upstreams") or []
+
+    out: list = []
+
+    def emit(name: str, mtype: str, help_text: str, samples):
+        """Append one metric block (HELP, TYPE, sample lines, blank)."""
+        out.append(f"# HELP {name} {help_text}")
+        out.append(f"# TYPE {name} {mtype}")
+        for labels, value in samples:
+            if labels:
+                label_str = ",".join(
+                    f'{k}="{_prom_escape_label(v)}"' for k, v in labels.items()
+                )
+                out.append(f"{name}{{{label_str}}} {value}")
+            else:
+                out.append(f"{name} {value}")
+        out.append("")
+
+    # ---- Build info ----
+    if version:
+        emit(
+            "mole_build_info",
+            "gauge",
+            "Build metadata for the running mole instance.",
+            [({"version": version}, 1)],
+        )
+
+    # ---- VPN ----
+    emit(
+        "mole_vpn_connected",
+        "gauge",
+        "1 if the WireGuard tunnel is currently up, 0 otherwise.",
+        [(None, 1 if vpn_status.get("connected") else 0)],
+    )
+
+    port = vpn_status.get("port") or 0
+    emit(
+        "mole_vpn_forwarded_port",
+        "gauge",
+        "Currently forwarded VPN port (0 if no port forward).",
+        [(None, int(_prom_num(port)))],
+    )
+
+    # ---- DNS aggregates ----
+    counter_specs = [
+        ("mole_dns_queries_total", "queries_total",
+         "Total DNS queries received by the resolver."),
+        ("mole_dns_cache_hits_total", "cache_hits",
+         "DNS responses served from cache."),
+        ("mole_dns_cache_misses_total", "cache_misses",
+         "DNS queries that missed cache and went to an upstream."),
+        ("mole_dns_blocked_total", "blocked",
+         "DNS queries answered as blocked (NXDOMAIN/0.0.0.0)."),
+        ("mole_dns_resolve_errors_total", "resolve_errors",
+         "DNS queries that failed before any upstream attempt."),
+        ("mole_dns_singleflight_collapses_total", "singleflight_collapses",
+         "Concurrent identical queries collapsed onto one upstream call."),
+    ]
+    for metric_name, key, help_text in counter_specs:
+        emit(
+            metric_name,
+            "counter",
+            help_text,
+            [(None, int(_prom_num(counters.get(key, 0))))],
+        )
+
+    gauge_specs = [
+        ("mole_dns_in_flight_peak", "in_flight_peak", counters,
+         "Peak number of in-flight upstream queries observed."),
+        ("mole_dns_cache_entries", "cache_entries", dns_stats,
+         "Current number of cached DNS responses."),
+        ("mole_dns_cache_size_bytes", "cache_size_bytes", dns_stats,
+         "Approximate total bytes held in the DNS cache."),
+        ("mole_dns_blocked_domains", "blocked_domains", dns_stats,
+         "Number of domains in the active blocklist."),
+    ]
+    for metric_name, key, source, help_text in gauge_specs:
+        emit(
+            metric_name,
+            "gauge",
+            help_text,
+            [(None, int(_prom_num(source.get(key, 0))))],
+        )
+
+    last_update = dns_stats.get("last_blocklist_update") or 0
+    emit(
+        "mole_dns_blocklist_last_update_seconds",
+        "gauge",
+        "Unix timestamp of the most recent blocklist refresh (0 if never).",
+        [(None, int(_prom_num(last_update)))],
+    )
+
+    # ---- Per-upstream ----
+    if upstreams:
+        # Each metric is emitted with all upstreams as separate samples to
+        # keep HELP/TYPE blocks together (Prometheus rejects duplicate
+        # HELP/TYPE for the same metric name).
+        upstream_counter_specs = [
+            ("mole_dns_upstream_queries_total", "queries",
+             "Per-upstream successful query counter."),
+            ("mole_dns_upstream_errors_total", "errors",
+             "Per-upstream upstream errors (timeouts, connection failures)."),
+            ("mole_dns_upstream_retries_total", "retries",
+             "Per-upstream retry attempts within the upstream's own retry budget."),
+            ("mole_dns_upstream_failovers_total", "failovers_out",
+             "Times this upstream's retry budget was exhausted and the next upstream was tried."),
+        ]
+        for metric_name, key, help_text in upstream_counter_specs:
+            samples = []
+            for u in upstreams:
+                name = u.get("name") or "unknown"
+                cnt = (u.get("counters") or {}).get(key, 0)
+                samples.append(({"upstream": name}, int(_prom_num(cnt))))
+            emit(metric_name, "counter", help_text, samples)
+
+        # Open connections + pool size as gauges.
+        for metric_name, key, help_text in [
+            ("mole_dns_upstream_open_connections", "open_connections",
+             "Currently open TLS connections in the upstream's pool."),
+            ("mole_dns_upstream_pool_size", "pool_size",
+             "Configured pool size for the upstream."),
+        ]:
+            samples = []
+            for u in upstreams:
+                name = u.get("name") or "unknown"
+                samples.append(
+                    ({"upstream": name}, int(_prom_num(u.get(key, 0))))
+                )
+            emit(metric_name, "gauge", help_text, samples)
+
+        # Latency percentiles as separate gauges (one metric per quantile).
+        # Convert ms -> seconds to match Prometheus latency conventions.
+        # Skip upstreams with no samples yet (rendering "None" would be invalid).
+        for metric_name, key, help_text in [
+            ("mole_dns_upstream_query_latency_p50_seconds", "query_p50_ms",
+             "Per-upstream DoT query latency P50 over the rolling window (seconds)."),
+            ("mole_dns_upstream_query_latency_p95_seconds", "query_p95_ms",
+             "Per-upstream DoT query latency P95 over the rolling window (seconds)."),
+            ("mole_dns_upstream_query_latency_p99_seconds", "query_p99_ms",
+             "Per-upstream DoT query latency P99 over the rolling window (seconds)."),
+        ]:
+            samples = []
+            for u in upstreams:
+                ms = u.get(key)
+                if ms is None:
+                    continue
+                name = u.get("name") or "unknown"
+                # Round to 6 decimals to avoid IEEE 754 noise on the
+                # ms→s division (e.g. 54.8/1000 = 0.054799999999999995).
+                samples.append(
+                    ({"upstream": name}, round(_prom_num(ms) / 1000.0, 6))
+                )
+            if samples:
+                emit(metric_name, "gauge", help_text, samples)
+
+        # Latency sample count as a gauge — Prometheus convention would
+        # use _count for summaries, but we don't expose a sum so a plain
+        # gauge avoids the ambiguity.
+        samples = []
+        for u in upstreams:
+            name = u.get("name") or "unknown"
+            samples.append(
+                ({"upstream": name}, int(_prom_num(u.get("query_samples", 0))))
+            )
+        emit(
+            "mole_dns_upstream_query_latency_samples",
+            "gauge",
+            "Number of latency samples currently held in the upstream's rolling window.",
+            samples,
+        )
+
+    return "\n".join(out) + "\n"
 
 
 class HTTPAPIServerStandalone:
@@ -170,7 +394,12 @@ class HTTPAPIServerStandalone:
 
             # Route request
             response = await self._route_request(method, path)
-            await self._send_response(writer, response['status'], response['body'])
+            await self._send_response(
+                writer,
+                response['status'],
+                response['body'],
+                content_type=response.get('content_type'),
+            )
 
         except asyncio.TimeoutError:
             await self._send_response(writer, 408, {"error": "Request timeout"})
@@ -193,6 +422,7 @@ class HTTPAPIServerStandalone:
             ('GET', '/v1/server'): self._get_server,
             ('GET', '/v1/health'): self._get_health,
             ('GET', '/v1/dns'): self._get_dns,
+            ('GET', '/metrics'): self._get_metrics,
             ('PUT', '/v1/vpn/restart'): self._put_restart,
             ('POST', '/v1/vpn/restart'): self._put_restart,
         }
@@ -203,16 +433,33 @@ class HTTPAPIServerStandalone:
 
         return {'status': 404, 'body': {"error": "Not found", "path": path}}
 
-    async def _send_response(self, writer: asyncio.StreamWriter, status: int, body: dict):
-        """Send HTTP response"""
+    async def _send_response(
+        self,
+        writer: asyncio.StreamWriter,
+        status: int,
+        body,
+        content_type: str = None,
+    ):
+        """Send HTTP response.
+
+        body may be a dict (JSON-encoded) or a str (sent as-is). When
+        content_type is omitted the function picks JSON for dict and
+        text/plain for str so handlers don't have to specify it.
+        """
         status_messages = {
             200: 'OK', 400: 'Bad Request', 401: 'Unauthorized', 404: 'Not Found',
             408: 'Request Timeout', 500: 'Internal Server Error'
         }
-        body_bytes = json.dumps(body, indent=2).encode('utf-8')
+
+        if isinstance(body, str):
+            body_bytes = body.encode('utf-8')
+            ct = content_type or 'text/plain; charset=utf-8'
+        else:
+            body_bytes = json.dumps(body, indent=2).encode('utf-8')
+            ct = content_type or 'application/json'
 
         response = f"HTTP/1.1 {status} {status_messages.get(status, 'Unknown')}\r\n"
-        response += "Content-Type: application/json\r\n"
+        response += f"Content-Type: {ct}\r\n"
         response += f"Content-Length: {len(body_bytes)}\r\n"
         response += "Connection: close\r\n"
         response += "\r\n"
@@ -343,6 +590,48 @@ class HTTPAPIServerStandalone:
                 'block_malware': self._get_config_bool('DOT_BLOCK_MALWARE', True),
                 'block_tracking': self._get_config_bool('DOT_BLOCK_TRACKING', False),
             }
+        }
+
+    async def _get_metrics(self) -> dict:
+        """GET /metrics - Prometheus exposition format.
+
+        Same data as /v1/dns and /v1/status, re-shaped for time-series
+        scraping. Reuses dns_stats.json (written by dns_main) plus state
+        files for VPN connectivity, so this is a thin formatter, not a
+        new collector. Goes through the same _check_auth path as the
+        rest of the API; Prometheus scrapers should set
+        `authorization: { credentials: <HTTP_API_KEY> }` in scrape_config.
+        """
+        # DNS state (same source as _get_dns)
+        dns_stats_file = self.state_dir / 'dns_stats.json'
+        dns_stats: dict = {}
+        try:
+            if dns_stats_file.exists():
+                dns_stats = json.loads(dns_stats_file.read_text())
+        except Exception:
+            pass
+
+        # VPN status (same shape as _get_status without re-running wg show
+        # if we already determined connectivity). Read state files and
+        # check WireGuard.
+        port_str = self._read_state_file('port')
+        port = int(port_str) if port_str and port_str.isdigit() else 0
+        wg_result = self._run_cmd(['wg', 'show', 'mole'])
+        vpn_status = {
+            'connected': wg_result.returncode == 0,
+            'port': port,
+        }
+
+        body = format_prometheus_metrics(
+            dns_stats=dns_stats,
+            vpn_status=vpn_status,
+            version=__version__,
+        )
+
+        return {
+            'status': 200,
+            'body': body,
+            'content_type': _PROM_CONTENT_TYPE,
         }
 
     async def _put_restart(self) -> dict:
