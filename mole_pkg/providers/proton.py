@@ -437,6 +437,7 @@ class ProtonProvider(VPNProvider):
                         self._selected_server = server
                         self.state.server_ip = server["entry_ip"]
                         self.state.server_hostname = server["hostname"]
+                        self.state.server_country = server.get("country")
                         log.info(f"Server: {server['name']} ({server['entry_ip']})")
                         return True
 
@@ -460,6 +461,7 @@ class ProtonProvider(VPNProvider):
                 self._selected_server = server
                 self.state.server_ip = server["entry_ip"]
                 self.state.server_hostname = server["hostname"]
+                self.state.server_country = server.get("country")
                 log.info(f"Server: {server['name']} ({server['entry_ip']}) - {server['load']}% load")
                 return True
 

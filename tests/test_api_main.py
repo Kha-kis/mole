@@ -334,6 +334,192 @@ _LINE_RE = re.compile(
 )
 
 
+# ---------- New operational metric groups ----------
+
+class TestVpnHandshakeAge(unittest.TestCase):
+    """mole_vpn_handshake_age_seconds is opt-in: only emitted when the
+    api_main handler successfully parsed `wg show mole latest-handshakes`."""
+
+    def test_emitted_when_present(self):
+        text = format_prometheus_metrics(
+            {}, {"connected": True, "handshake_age_seconds": 42.5}, version=""
+        )
+        self.assertIn("mole_vpn_handshake_age_seconds 42.5", text)
+        self.assertIn("# TYPE mole_vpn_handshake_age_seconds gauge", text)
+
+    def test_omitted_when_absent(self):
+        text = format_prometheus_metrics({}, {"connected": True}, version="")
+        self.assertNotIn("mole_vpn_handshake_age_seconds", text)
+
+    def test_zero_age_still_emitted(self):
+        # 0.0 is a valid value (just-handshook). Don't accidentally drop it.
+        text = format_prometheus_metrics(
+            {}, {"connected": True, "handshake_age_seconds": 0.0}, version=""
+        )
+        self.assertRegex(text, r"(?m)^mole_vpn_handshake_age_seconds 0(\.0)?$")
+
+
+class TestVpnEndpointInfo(unittest.TestCase):
+    """mole_vpn_endpoint_info{server, country, endpoint_ip} 1 — labelled
+    gauge for joins. Emitted iff at least one of the labels has content."""
+
+    def test_emitted_with_full_metadata(self):
+        text = format_prometheus_metrics(
+            {},
+            {
+                "connected": True,
+                "hostname": "node-nl-47",
+                "server_ip": "138.199.7.129",
+                "country": "NL",
+            },
+            version="",
+        )
+        self.assertIn(
+            'mole_vpn_endpoint_info{server="node-nl-47",country="NL",endpoint_ip="138.199.7.129"} 1',
+            text,
+        )
+
+    def test_omitted_when_all_labels_empty(self):
+        text = format_prometheus_metrics({}, {"connected": True}, version="")
+        self.assertNotIn("mole_vpn_endpoint_info", text)
+
+    def test_emitted_with_partial_metadata(self):
+        # Cold-start case: hostname known, country/IP not yet.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True, "hostname": "node-nl-47"},
+            version="",
+        )
+        self.assertIn(
+            'mole_vpn_endpoint_info{server="node-nl-47",country="",endpoint_ip=""} 1',
+            text,
+        )
+
+
+class TestRenewalState(unittest.TestCase):
+
+    def test_emitted_when_state_provided(self):
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            renewal_state={
+                "success_total": 12,
+                "failure_total": 1,
+                "last_success_ts": 1778163652,
+                "last_duration_seconds": 7.234,
+            },
+            version="",
+        )
+        self.assertIn('mole_vpn_renewals_total{result="success"} 12', text)
+        self.assertIn('mole_vpn_renewals_total{result="failure"} 1', text)
+        self.assertIn(
+            "mole_vpn_renewal_last_duration_seconds 7.234", text
+        )
+        self.assertIn(
+            "mole_vpn_renewal_last_success_timestamp_seconds 1778163652", text
+        )
+
+    def test_omitted_when_state_absent(self):
+        text = format_prometheus_metrics(
+            {}, {"connected": True}, renewal_state=None, version=""
+        )
+        self.assertNotIn("mole_vpn_renewals_total", text)
+        self.assertNotIn("mole_vpn_renewal_last_", text)
+
+    def test_zero_success_zero_failure_still_emits(self):
+        # First-ever startup: counters at 0, last_success_ts still 0. We
+        # emit the counters anyway so Prometheus has a baseline; alerts
+        # that look for "success counter increased in the last day" then
+        # work from day one.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            renewal_state={
+                "success_total": 0,
+                "failure_total": 0,
+                "last_success_ts": 0,
+                "last_duration_seconds": 0,
+            },
+            version="",
+        )
+        self.assertIn('mole_vpn_renewals_total{result="success"} 0', text)
+        self.assertIn('mole_vpn_renewals_total{result="failure"} 0', text)
+
+
+class TestPortForwardState(unittest.TestCase):
+
+    def test_emitted_with_age(self):
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "age_seconds": 30.5,
+                "success_total": 100,
+                "failure_total": 2,
+            },
+            version="",
+        )
+        self.assertIn("mole_vpn_port_forward_age_seconds 30.5", text)
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{result="success"} 100', text
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{result="failure"} 2', text
+        )
+
+    def test_age_omitted_when_no_success_yet(self):
+        # If a port-forward keepalive has never succeeded, age is undefined
+        # — emitting "0" would say "we just succeeded" which is wrong, and
+        # emitting "infinity" doesn't render. The handler omits the gauge
+        # entirely (consistent with handshake_age behaviour).
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={"success_total": 0, "failure_total": 0},
+            version="",
+        )
+        self.assertNotIn("mole_vpn_port_forward_age_seconds", text)
+        # Counters still present though.
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{result="success"} 0', text
+        )
+
+    def test_omitted_when_state_absent(self):
+        text = format_prometheus_metrics(
+            {}, {"connected": True}, port_forward_state=None, version=""
+        )
+        self.assertNotIn("mole_vpn_port_forward_", text)
+
+
+class TestBlocklistUpdateHealth(unittest.TestCase):
+
+    def test_full_input(self):
+        text = format_prometheus_metrics(
+            {
+                "last_blocklist_update": 1778163652,
+                "last_blocklist_update_duration": 1.234567,
+                "blocklist_update_failures_total": 3,
+            },
+            {"connected": True},
+            version="",
+        )
+        # Duration emitted with 6-decimal rounding (matches latency convention).
+        self.assertRegex(
+            text,
+            r"(?m)^mole_dns_blocklist_update_last_duration_seconds 1\.234567$",
+        )
+        self.assertIn("mole_dns_blocklist_update_failures_total 3", text)
+
+    def test_defaults_when_dns_stats_empty(self):
+        text = format_prometheus_metrics({}, {"connected": True}, version="")
+        # Both metrics still emit at 0, so a fresh deployment has the
+        # series present from the first scrape.
+        self.assertIn("mole_dns_blocklist_update_last_duration_seconds 0", text)
+        self.assertIn("mole_dns_blocklist_update_failures_total 0", text)
+
+
+# ---------- Existing "output is parseable" check (kept) ----------
+
 class TestPrometheusOutputParseable(unittest.TestCase):
     """Spot-check that every non-blank line matches the exposition grammar.
 
