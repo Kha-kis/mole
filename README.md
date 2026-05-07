@@ -548,12 +548,15 @@ VPN-tunnel observability:
   current endpoint identity as labels. Joinable in PromQL with
   `mole_vpn_connected` for "is this server, in this country, up?"
 - `mole_vpn_renewals_total{result="success|failure"}` (counter) — every
-  full renewal attempt logged here. The daily renewal cadence appears as
-  a stair-step on success; rising failure ratio is alertable.
+  full renewal attempt logged here. The configured renewal cadence
+  (`RENEWAL_INTERVAL`, default 7 days) appears as a stair-step on success;
+  rising failure ratio is alertable.
 - `mole_vpn_renewal_last_duration_seconds` (gauge) — wall-clock duration
   of the most recent renewal.
 - `mole_vpn_renewal_last_success_timestamp_seconds` (gauge) — Unix ts of
-  the most recent successful renewal. Alert on `time() - this > 1d`.
+  the most recent successful renewal. Alert on
+  `time() - this > 2 * RENEWAL_INTERVAL` (so a single missed renewal
+  doesn't fire, but a stuck-down state does).
 - `mole_vpn_port_forward_age_seconds` (gauge) — seconds since the last
   successful NAT-PMP keepalive. Catches silent-stale port forwards.
 - `mole_vpn_port_forward_renewals_total{result}` (counter).
