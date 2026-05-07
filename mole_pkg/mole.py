@@ -164,6 +164,8 @@ class Mole:
 
         if self.config.dot_custom_server:
             cmd.extend(["--custom-server", self.config.dot_custom_server])
+        if self.config.dot_custom_sni:
+            cmd.extend(["--custom-sni", self.config.dot_custom_sni])
         if self.config.dot_block_ads:
             cmd.append("--block-ads")
         if self.config.dot_block_malware:

@@ -126,6 +126,27 @@ class TestResolveUpstream(unittest.TestCase):
         ip, port, _ = resolve_upstream('custom', '10.0.0.1')
         self.assertEqual((ip, port), ('10.0.0.1', 853))
 
+    def test_custom_with_sni_override(self):
+        ip, port, sni = resolve_upstream('custom', '10.0.0.1:853', 'dns.example.com')
+        self.assertEqual((ip, port, sni), ('10.0.0.1', 853, 'dns.example.com'))
+
+    def test_custom_default_port_with_sni_override(self):
+        ip, port, sni = resolve_upstream('custom', '10.0.0.1', 'dns.example.com')
+        self.assertEqual((ip, port, sni), ('10.0.0.1', 853, 'dns.example.com'))
+
+    def test_custom_sni_whitespace_stripped(self):
+        _, _, sni = resolve_upstream('custom', '10.0.0.1:853', '  dns.example.com  ')
+        self.assertEqual(sni, 'dns.example.com')
+
+    def test_empty_custom_sni_falls_back_to_target(self):
+        _, _, sni = resolve_upstream('custom', '10.0.0.1:853', '')
+        self.assertEqual(sni, '10.0.0.1')
+
+    def test_custom_sni_ignored_for_presets(self):
+        # Presets carry their own canonical SNI; custom_sni must not affect them.
+        ip, port, sni = resolve_upstream('cloudflare', '', 'attacker.example.com')
+        self.assertEqual((ip, port, sni), DOT_PROVIDERS['cloudflare'])
+
 
 # ---------- UpstreamPool happy path ----------
 

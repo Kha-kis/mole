@@ -413,6 +413,16 @@ DOT_ENABLED=true
 DOT_UPSTREAM=cloudflare
 # DOT_UPSTREAM=cloudflare,quad9     # failover example
 
+# Custom upstream (only when DOT_UPSTREAM includes 'custom')
+# DOT_CUSTOM_SERVER=10.0.0.1:853    # connect target (ip:port or hostname:port)
+# DOT_CUSTOM_SNI=dns.example.com    # optional: SNI for cert validation
+#
+# Use DOT_CUSTOM_SNI when DOT_CUSTOM_SERVER is a literal IP — connect by IP
+# (no DNS lookup at startup) but still validate the upstream's certificate
+# against the named hostname. This is required when mole's own resolver is
+# the only resolver available in the namespace, since looking up the upstream
+# hostname would otherwise create a bootstrap-circular dependency.
+
 # Connection pool (per upstream)
 DOT_POOL_SIZE=2                     # persistent TLS connections kept open
 DOT_QUERY_TIMEOUT=2.0               # per-attempt upstream query timeout (s)
