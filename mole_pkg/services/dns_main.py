@@ -36,6 +36,7 @@ class StandaloneConfig:
             u.strip() for u in (args.upstream or '').split(',') if u.strip()
         ] or ['cloudflare']
         self.dot_custom_server = args.custom_server or ""
+        self.dot_custom_sni = args.custom_sni or ""
         self.dot_block_ads = args.block_ads
         self.dot_block_malware = args.block_malware
         self.dot_block_tracking = args.block_tracking
@@ -130,6 +131,10 @@ Examples:
                              "e.g. 'cloudflare,quad9'.")
     parser.add_argument("--custom-server",
                         help="Custom DoT server (ip:port) when upstream includes 'custom'")
+    parser.add_argument("--custom-sni",
+                        help="Optional SNI hostname for the custom DoT upstream "
+                             "(connect by IP via --custom-server, validate cert "
+                             "against this hostname)")
     parser.add_argument("--block-ads", action="store_true", default=False,
                         help="Enable ad blocking")
     parser.add_argument("--block-malware", action="store_true", default=False,

@@ -40,17 +40,32 @@ DOT_PROVIDERS = {
 }
 
 
-def resolve_upstream(name: str, custom_server: str = "") -> Tuple[str, int, str]:
+def resolve_upstream(
+    name: str,
+    custom_server: str = "",
+    custom_sni: str = "",
+) -> Tuple[str, int, str]:
     """Resolve an upstream name (preset or 'custom') to (ip, port, sni).
 
-    For 'custom', reads custom_server in the form 'ip[:port]'.
+    For 'custom', reads custom_server in the form 'ip[:port]'. By default
+    the SNI matches the connect target — that's correct for hostname-based
+    custom servers. Pass custom_sni to override (typical use: connect by
+    literal IP to avoid a DNS-bootstrap circular dependency, but validate
+    the upstream's certificate against a hostname).
+
+    custom_sni only applies in the 'custom' branch; presets carry their
+    own canonical SNI in DOT_PROVIDERS.
     """
     key = (name or "").strip().lower()
     if key == 'custom':
         if ':' in custom_server:
             ip, port = custom_server.rsplit(':', 1)
-            return (ip.strip(), int(port), ip.strip())
-        return (custom_server.strip(), 853, custom_server.strip())
+            ip = ip.strip()
+            sni = custom_sni.strip() or ip
+            return (ip, int(port), sni)
+        target = custom_server.strip()
+        sni = custom_sni.strip() or target
+        return (target, 853, sni)
     return DOT_PROVIDERS.get(key, DOT_PROVIDERS['cloudflare'])
 
 
@@ -317,6 +332,7 @@ class UpstreamPool:
         self,
         upstreams: List[str],
         custom_server: str = "",
+        custom_sni: str = "",
         pool_size: int = 2,
         query_timeout: float = 2.0,
         query_retries: int = 2,
@@ -327,7 +343,7 @@ class UpstreamPool:
             upstreams = ['cloudflare']
         self._targets: List[_UpstreamTarget] = []
         for name in upstreams:
-            ip, port, sni = resolve_upstream(name, custom_server)
+            ip, port, sni = resolve_upstream(name, custom_server, custom_sni)
             self._targets.append(
                 _UpstreamTarget(name=name, host=ip, port=port, sni=sni,
                                 pool_size=pool_size)
