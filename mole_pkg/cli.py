@@ -733,6 +733,7 @@ def cmd_init(args):
     dot_block_ads = False
     dot_block_malware = False
     dot_custom_server = ""
+    dot_custom_sni = ""
 
     dot_response = input("\nEnable DNS over TLS? [y/N]: ").strip().lower()
     if dot_response in ('y', 'yes'):
@@ -756,6 +757,10 @@ def cmd_init(args):
             if not dot_custom_server:
                 print("  No server entered, using Cloudflare")
                 dot_upstream = "cloudflare"
+            else:
+                print("  Optional: cert SNI hostname if --custom-server is a literal IP")
+                print("  (leave blank to use the connect target as the SNI)")
+                dot_custom_sni = input("  SNI hostname [none]: ").strip()
 
         print("\nAd & tracker blocking (uses auto-updating blocklists):")
         block_response = input("Block ads and trackers? [Y/n]: ").strip().lower()
@@ -881,6 +886,8 @@ DOT_UPSTREAM={dot_upstream}
 """
         if dot_upstream == "custom" and dot_custom_server:
             config_content += f"DOT_CUSTOM_SERVER={dot_custom_server}\n"
+            if dot_custom_sni:
+                config_content += f"DOT_CUSTOM_SNI={dot_custom_sni}\n"
         config_content += f"""DOT_BLOCK_ADS={'true' if dot_block_ads else 'false'}
 DOT_BLOCK_MALWARE={'true' if dot_block_malware else 'false'}
 DOT_CACHING=true
