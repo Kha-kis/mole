@@ -171,8 +171,10 @@ PROTON_PREFER_LAST_SERVER=true
 # Port Forwarding (requires Plus plan)
 PORT_FORWARD=true
 
-# ProtonVPN NAT-PMP requires more frequent refresh
-KEEPALIVE_INTERVAL=45
+# Optional. Default for VPN_PROVIDER=proton is 45 (NAT-PMP TTL ~60s);
+# default for PIA is 900 (long-lived signed-payload model). Set
+# explicitly only to override the provider-aware default.
+# KEEPALIVE_INTERVAL=45
 ```
 
 ### Common Settings
