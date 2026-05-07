@@ -9,6 +9,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -19,7 +20,17 @@ from .constants import DEFAULT_CONFIG_FILE
 from .network import setup_namespace, disconnect_vpn, allow_vpn_server_ip
 from .providers import PIAProvider, ProtonProvider
 from .services import QBittorrentClient
-from .utils import VPNState, VPNProvider, log, run_cmd, run_in_netns, sanitize_for_log, secure_write_file
+from .utils import (
+    VPNState,
+    VPNProvider,
+    atomic_write_state,
+    increment_counter,
+    log,
+    run_cmd,
+    run_in_netns,
+    sanitize_for_log,
+    secure_write_file,
+)
 
 
 def get_vpn_provider(config: Config, state: VPNState) -> VPNProvider:
@@ -308,6 +319,8 @@ class Mole:
             secure_write_file(state_dir / 'server_ip', self.state.server_ip)
         if self.state.server_hostname:
             secure_write_file(state_dir / 'hostname', self.state.server_hostname)
+        if self.state.server_country:
+            secure_write_file(state_dir / 'server_country', self.state.server_country)
         if self.state.server_vip:
             secure_write_file(state_dir / 'server_vip', self.state.server_vip)
         if self.state.peer_ip:
@@ -316,48 +329,75 @@ class Mole:
             secure_write_file(state_dir / 'port', str(self.state.port))
 
     async def _full_renewal(self) -> bool:
-        """Full VPN renewal process"""
+        """Full VPN renewal process.
+
+        Operationally instrumented: every renewal attempt increments either
+        renewals_success_total or renewals_failure_total in $STATE_DIR, and
+        on success persists last_renewal_success_ts plus
+        last_renewal_duration_seconds. api_main exposes these as Prometheus
+        counters/gauges so the daily renewal cadence is chartable and a
+        rising failure rate is alertable. Counters survive process restart
+        because they're plain text files.
+        """
         log.info("Starting full renewal...")
+
+        state_dir = Path(self.config.state_dir)
+        renewal_start = time.time()
+        success = False
 
         old_server_ip = self.state.server_ip
 
-        # Step 1: Authenticate
-        if not await self.provider.authenticate():
-            return False
-
-        # Step 2: Get server
-        if not await self.provider.get_server():
-            return False
-
-        # Step 3: Register WireGuard
-        if not await self.provider.register_wireguard():
-            return False
-
-        # Step 4: Connect VPN
-        if not await self._connect_vpn(old_server_ip):
-            return False
-
-        # Step 5: Setup port forwarding (if enabled)
-        if self.config.port_forward:
-            if not await self.provider.setup_port_forward():
+        try:
+            # Step 1: Authenticate
+            if not await self.provider.authenticate():
                 return False
 
-            # Step 6: Update torrent client interface and port (if configured)
-            # Retry with delay since torrent client may still be starting up
-            if self.torrent:
-                await self._update_torrent_client()
+            # Step 2: Get server
+            if not await self.provider.get_server():
+                return False
 
-            log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
-        else:
-            log.info(f"Renewal complete! Server: {self.state.server_hostname} (port forwarding disabled)")
+            # Step 3: Register WireGuard
+            if not await self.provider.register_wireguard():
+                return False
 
-        # Run post-connect hook if configured
-        self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK")
+            # Step 4: Connect VPN
+            if not await self._connect_vpn(old_server_ip):
+                return False
 
-        # Write state files for API to read
-        self._write_state_files()
+            # Step 5: Setup port forwarding (if enabled)
+            if self.config.port_forward:
+                if not await self.provider.setup_port_forward():
+                    return False
 
-        return True
+                # Step 6: Update torrent client interface and port (if configured)
+                # Retry with delay since torrent client may still be starting up
+                if self.torrent:
+                    await self._update_torrent_client()
+
+                log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
+            else:
+                log.info(f"Renewal complete! Server: {self.state.server_hostname} (port forwarding disabled)")
+
+            # Run post-connect hook if configured
+            self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK")
+
+            # Write state files for API to read
+            self._write_state_files()
+
+            success = True
+            return True
+        finally:
+            duration = time.time() - renewal_start
+            try:
+                if success:
+                    increment_counter(state_dir, 'renewals_success_total')
+                    atomic_write_state(state_dir, 'last_renewal_success_ts', str(int(renewal_start + duration)))
+                    atomic_write_state(state_dir, 'last_renewal_duration_seconds', f"{duration:.3f}")
+                else:
+                    increment_counter(state_dir, 'renewals_failure_total')
+            except Exception as e:
+                # Never let metrics bookkeeping mask a real renewal outcome.
+                log.warning(f"Failed to persist renewal metrics: {e}")
 
     async def _connect_vpn(self, old_server_ip: Optional[str]) -> bool:
         """Establish VPN connection"""
@@ -398,19 +438,45 @@ class Mole:
         return True
 
     async def _keepalive_loop(self):
-        """Port forwarding keepalive loop"""
+        """Port forwarding keepalive loop.
+
+        Operationally instrumented: each refresh attempt increments either
+        port_forward_renewals_success_total or port_forward_renewals_failure_total
+        and on success persists last_port_forward_success_ts. api_main exposes
+        these so a silently-failing NAT-PMP keepalive (port still configured
+        but actually unforwarded) is alertable on staleness rather than only
+        becoming visible when trackers report unreachable peer.
+        """
         if not self.config.port_forward:
             log.info("Port forwarding disabled, keepalive loop not needed")
             return
 
         log.info("Keepalive loop started")
 
+        state_dir = Path(self.config.state_dir)
+
         while not self.shutdown_event.is_set():
             try:
                 await asyncio.sleep(self.config.keepalive_interval)
 
-                if self.state.port_payload and self.state.connected:
-                    if await self.provider.refresh_port_forward():
+                # Gate: VPN must be up and a port must currently be forwarded.
+                # Don't gate on `port_payload` -- that's PIA-specific state.
+                # Proton uses NAT-PMP and never sets port_payload, so the
+                # previous gate skipped its keepalive entirely; the mapping
+                # only re-established at full renewal. Each provider's
+                # refresh_port_forward() does its own no-op short-circuit
+                # when there's nothing to do, so the loop just delegates.
+                if self.state.connected and self.state.port:
+                    refresh_ok = await self.provider.refresh_port_forward()
+                    try:
+                        if refresh_ok:
+                            increment_counter(state_dir, 'port_forward_renewals_success_total')
+                            atomic_write_state(state_dir, 'last_port_forward_success_ts', str(int(time.time())))
+                        else:
+                            increment_counter(state_dir, 'port_forward_renewals_failure_total')
+                    except Exception as e:
+                        log.warning(f"Failed to persist port-forward metrics: {e}")
+                    if refresh_ok:
                         log.info(f"Port {self.state.port} keepalive OK")
                     else:
                         log.warning("Port keepalive failed")

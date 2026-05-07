@@ -529,12 +529,34 @@ Top-level metrics include `mole_vpn_connected`, `mole_vpn_forwarded_port`,
 `mole_dns_cache_misses_total`, `mole_dns_blocked_total`,
 `mole_dns_resolve_errors_total`, `mole_dns_in_flight_peak`,
 `mole_dns_cache_entries`, `mole_dns_blocked_domains`,
-`mole_dns_blocklist_last_update_seconds`, plus `mole_build_info{version}`.
+`mole_dns_blocklist_last_update_seconds`,
+`mole_dns_blocklist_update_last_duration_seconds`,
+`mole_dns_blocklist_update_failures_total`,
+plus `mole_build_info{version}`.
 
-Per-upstream metrics carry an `upstream` label and include
+Per-upstream DNS metrics carry an `upstream` label and include
 `queries_total`, `errors_total`, `retries_total`, `failovers_total`,
 `open_connections`, `pool_size`, `query_latency_p{50,95,99}_seconds`,
 and `query_latency_samples`.
+
+VPN-tunnel observability:
+
+- `mole_vpn_handshake_age_seconds` (gauge) — seconds since the last
+  WireGuard handshake. A "connected" tunnel with a stale handshake is a
+  real silent-failure mode. Alert on `> 300`.
+- `mole_vpn_endpoint_info{server, country, endpoint_ip}` (gauge=1) —
+  current endpoint identity as labels. Joinable in PromQL with
+  `mole_vpn_connected` for "is this server, in this country, up?"
+- `mole_vpn_renewals_total{result="success|failure"}` (counter) — every
+  full renewal attempt logged here. The daily renewal cadence appears as
+  a stair-step on success; rising failure ratio is alertable.
+- `mole_vpn_renewal_last_duration_seconds` (gauge) — wall-clock duration
+  of the most recent renewal.
+- `mole_vpn_renewal_last_success_timestamp_seconds` (gauge) — Unix ts of
+  the most recent successful renewal. Alert on `time() - this > 1d`.
+- `mole_vpn_port_forward_age_seconds` (gauge) — seconds since the last
+  successful NAT-PMP keepalive. Catches silent-stale port forwards.
+- `mole_vpn_port_forward_renewals_total{result}` (counter).
 
 Example Prometheus scrape config:
 

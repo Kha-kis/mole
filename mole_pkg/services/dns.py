@@ -78,6 +78,13 @@ class DOTServer:
         self._cache_max_ttl = config.dot_cache_ttl  # 0 = use response TTL
         self._blocklist_update_task = None
         self._last_blocklist_update = 0.0
+        # Blocklist update health metrics. _last_blocklist_update_duration is
+        # the wall-clock duration of the most recent successful refresh;
+        # _blocklist_update_failures_total is the lifetime count of
+        # exceptions raised inside _blocklist_update_loop's body. Both are
+        # surfaced via get_stats() → dns_stats.json → /metrics.
+        self._last_blocklist_update_duration = 0.0
+        self._blocklist_update_failures_total = 0
         # In-flight singleflight map: (domain, qtype) -> Future[response_bytes].
         # Followers await the same upstream query instead of stampeding.
         self._in_flight: Dict[Tuple[str, int], asyncio.Future] = {}
@@ -193,13 +200,20 @@ class DOTServer:
                 await asyncio.sleep(update_period)
                 log.info("Updating DNS blocklists...")
                 old_count = len(self.blocked_domains)
+                start = time.time()
                 await self._load_blocklists()
+                duration = time.time() - start
                 new_count = len(self.blocked_domains)
                 self._last_blocklist_update = time.time()
-                log.info(f"DNS blocklists updated: {old_count} -> {new_count} domains")
+                self._last_blocklist_update_duration = duration
+                log.info(
+                    f"DNS blocklists updated: {old_count} -> {new_count} domains "
+                    f"in {duration:.2f}s"
+                )
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                self._blocklist_update_failures_total += 1
                 log.error(f"Blocklist update error: {e}")
 
     async def _load_blocklists(self):
@@ -508,5 +522,7 @@ class DOTServer:
             "cache_size": len(self._cache),
             "in_flight": len(self._in_flight),
             "last_blocklist_update": self._last_blocklist_update,
+            "last_blocklist_update_duration": self._last_blocklist_update_duration,
+            "blocklist_update_failures_total": self._blocklist_update_failures_total,
             "counters": dict(self._stats),
         }
