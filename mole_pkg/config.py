@@ -159,7 +159,14 @@ class Config:
 
     @property
     def renewal_interval(self) -> int:
-        return self.get_int('RENEWAL_INTERVAL', 72000)
+        # Default 7 days. Each renewal tears down and re-establishes the
+        # WG tunnel, which is a ~5-10s outage; the post-PR-15 NAT-PMP
+        # keepalive keeps the port forward alive between renewals so the
+        # daily-renewal-as-a-port-forward-refresh pattern is no longer
+        # load-bearing. Operators who want more aggressive re-validation
+        # of cert/server health can lower this; lower bound 1h is checked
+        # by validate_config().
+        return self.get_int('RENEWAL_INTERVAL', 604800)
 
     @property
     def keepalive_interval(self) -> int:
