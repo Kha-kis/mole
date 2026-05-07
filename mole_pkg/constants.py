@@ -82,7 +82,10 @@ QB_PORT=8080
 QB_USER=
 
 # Timing (seconds)
-RENEWAL_INTERVAL=72000
+RENEWAL_INTERVAL=604800   # 7 days. NAT-PMP keepalive keeps the port forward alive between renewals,
+                          # so the renewal cadence is just a periodic auth/server/WG re-validation
+                          # rather than a port-forward refresh. Lower this if you want more aggressive
+                          # cert/server health re-checks; lower bound is 1 hour (validated at startup).
 KEEPALIVE_INTERVAL=900
 WATCHDOG_INTERVAL=60
 WATCHDOG_MAX_FAILURES=3
