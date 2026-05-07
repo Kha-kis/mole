@@ -2172,6 +2172,27 @@ def cmd_run(args):
     from .mole import Mole
 
     config_path = getattr(args, 'config', DEFAULT_CONFIG_FILE)
+
+    # Validate before bringing anything up. Errors (e.g. HTTP_API_KEY missing
+    # under HTTP_API_REQUIRE_AUTH=auto with non-loopback bind) abort startup
+    # so we don't establish a VPN tunnel only to fail at API spawn.
+    is_valid, issues = validate_config(config_path)
+    if not is_valid:
+        sys.stderr.write(f"MOLE: refusing to start, configuration has errors:\n")
+        for issue in issues:
+            if issue.startswith("Warning:"):
+                continue
+            sys.stderr.write(f"  [ERROR] {issue}\n")
+        sys.stderr.write(
+            "  Run 'mole validate' to see the full report, or fix the listed "
+            "issues and try again.\n"
+        )
+        return 1
+    # Surface non-fatal warnings on the console so they're not silently lost.
+    for issue in issues:
+        if issue.startswith("Warning:"):
+            sys.stderr.write(f"MOLE: [WARN] {issue[len('Warning: '):]}\n")
+
     mole = Mole(config_path)
     asyncio.run(mole.run())
     return 0
