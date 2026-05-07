@@ -231,5 +231,155 @@ class TestValidateConfig(unittest.TestCase):
             os.unlink(temp_path)
 
 
+# ---------- HTTP_API_REQUIRE_AUTH tri-state ----------
+
+class TestHttpApiRequireAuth(unittest.TestCase):
+    """Test the tri-state HTTP_API_REQUIRE_AUTH parsing + helper logic."""
+
+    def _config_with(self, **overrides) -> Config:
+        """Build a Config from a tempfile with the given KEY=VALUE pairs."""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
+            f.write("VPN_PROVIDER=pia\n")
+            f.write("PIA_USER=u\n")
+            f.write("PIA_PASS=p\n")
+            for key, val in overrides.items():
+                f.write(f"{key}={val}\n")
+            self._tmp_path = f.name
+        return Config(self._tmp_path)
+
+    def tearDown(self):
+        try:
+            os.unlink(self._tmp_path)
+        except (AttributeError, FileNotFoundError):
+            pass
+
+    def test_default_is_auto(self):
+        c = self._config_with()
+        self.assertEqual(c.http_api_require_auth, 'auto')
+
+    def test_aliases_resolve_to_true(self):
+        for raw in ('true', 'TRUE', '1', 'yes', 'YES', 'on', '  on  '):
+            with self.subTest(raw=raw):
+                c = self._config_with(HTTP_API_REQUIRE_AUTH=raw)
+                self.assertEqual(c.http_api_require_auth, 'true')
+
+    def test_aliases_resolve_to_false(self):
+        for raw in ('false', 'FALSE', '0', 'no', 'NO', 'off'):
+            with self.subTest(raw=raw):
+                c = self._config_with(HTTP_API_REQUIRE_AUTH=raw)
+                self.assertEqual(c.http_api_require_auth, 'false')
+
+    def test_unknown_value_falls_back_to_auto(self):
+        c = self._config_with(HTTP_API_REQUIRE_AUTH='maybe')
+        self.assertEqual(c.http_api_require_auth, 'auto')
+
+    def test_auto_loopback_bind_no_key_does_not_require(self):
+        c = self._config_with(HTTP_API_BIND='127.0.0.1')
+        self.assertFalse(c.http_api_auth_required())
+
+    def test_auto_localhost_bind_no_key_does_not_require(self):
+        c = self._config_with(HTTP_API_BIND='localhost')
+        self.assertFalse(c.http_api_auth_required())
+
+    def test_auto_ipv6_loopback_bind_no_key_does_not_require(self):
+        c = self._config_with(HTTP_API_BIND='::1')
+        self.assertFalse(c.http_api_auth_required())
+
+    def test_auto_non_loopback_bind_requires(self):
+        c = self._config_with(HTTP_API_BIND='0.0.0.0')
+        self.assertTrue(c.http_api_auth_required())
+
+    def test_auto_non_loopback_lan_bind_requires(self):
+        c = self._config_with(HTTP_API_BIND='10.0.0.5')
+        self.assertTrue(c.http_api_auth_required())
+
+    def test_explicit_true_requires_even_on_loopback(self):
+        c = self._config_with(HTTP_API_BIND='127.0.0.1', HTTP_API_REQUIRE_AUTH='true')
+        self.assertTrue(c.http_api_auth_required())
+
+    def test_explicit_false_does_not_require_even_on_lan(self):
+        c = self._config_with(HTTP_API_BIND='0.0.0.0', HTTP_API_REQUIRE_AUTH='false')
+        self.assertFalse(c.http_api_auth_required())
+
+
+class TestValidateConfigHttpApiAuth(unittest.TestCase):
+    """validate_config behavior across the HTTP_API_REQUIRE_AUTH matrix."""
+
+    @staticmethod
+    def _write_config(extra: str = "") -> str:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
+            f.write("VPN_PROVIDER=pia\n")
+            f.write("PIA_USER=u\n")
+            f.write("PIA_PASS=p\n")
+            f.write("HTTP_API_ENABLED=true\n")
+            f.write(extra)
+            return f.name
+
+    def test_auto_lan_bind_no_key_is_error(self):
+        """The flagship case: default policy refuses unauth API on a LAN bind."""
+        path = self._write_config("HTTP_API_BIND=0.0.0.0\n")
+        try:
+            is_valid, issues = validate_config(path)
+            self.assertFalse(is_valid)
+            self.assertTrue(
+                any("HTTP_API_KEY" in i and not i.startswith("Warning:") for i in issues),
+                f"expected an error mentioning HTTP_API_KEY, got: {issues}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_auto_loopback_no_key_is_valid(self):
+        """Loopback-only bind without a key is allowed under auto policy."""
+        path = self._write_config("HTTP_API_BIND=127.0.0.1\n")
+        try:
+            is_valid, issues = validate_config(path)
+            self.assertTrue(is_valid, f"expected valid, got issues: {issues}")
+            self.assertFalse(
+                any("HTTP_API_KEY" in i for i in issues),
+                f"did not expect HTTP_API_KEY issues, got: {issues}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_auto_lan_bind_with_key_is_valid(self):
+        """LAN bind with a key set satisfies the policy."""
+        path = self._write_config("HTTP_API_BIND=0.0.0.0\nHTTP_API_KEY=xyz\n")
+        try:
+            is_valid, issues = validate_config(path)
+            self.assertTrue(is_valid, f"expected valid, got issues: {issues}")
+            self.assertFalse(any("HTTP_API_KEY" in i for i in issues))
+        finally:
+            os.unlink(path)
+
+    def test_explicit_false_lan_bind_no_key_is_warning_not_error(self):
+        """Explicit opt-out is allowed but logged as a warning."""
+        path = self._write_config(
+            "HTTP_API_BIND=0.0.0.0\nHTTP_API_REQUIRE_AUTH=false\n"
+        )
+        try:
+            is_valid, issues = validate_config(path)
+            self.assertTrue(is_valid, f"expected valid, got issues: {issues}")
+            self.assertTrue(
+                any(i.startswith("Warning:") and "HTTP_API_REQUIRE_AUTH" in i for i in issues),
+                f"expected a warning, got: {issues}",
+            )
+        finally:
+            os.unlink(path)
+
+    def test_explicit_true_loopback_no_key_is_error(self):
+        """Strict mode requires a key even on loopback."""
+        path = self._write_config(
+            "HTTP_API_BIND=127.0.0.1\nHTTP_API_REQUIRE_AUTH=true\n"
+        )
+        try:
+            is_valid, issues = validate_config(path)
+            self.assertFalse(is_valid)
+            self.assertTrue(
+                any("HTTP_API_KEY" in i and not i.startswith("Warning:") for i in issues)
+            )
+        finally:
+            os.unlink(path)
+
+
 if __name__ == '__main__':
     unittest.main()
