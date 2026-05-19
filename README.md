@@ -562,6 +562,13 @@ VPN-tunnel observability:
 - `mole_vpn_port_forward_age_seconds` (gauge) — seconds since the last
   successful NAT-PMP keepalive. Catches silent-stale port forwards.
 - `mole_vpn_port_forward_renewals_total{result}` (counter).
+- `mole_vpn_receive_bytes_total` / `mole_vpn_transmit_bytes_total`
+  (counter) — kernel byte counters for the `mole` WireGuard interface.
+  Useful for throughput dashboards (`rate(...) * 8` for bits/sec) and
+  for detecting the "tunnel up but no traffic" failure mode (rate ≈ 0
+  while `mole_vpn_connected == 1`). The interface is recreated on each
+  renewal, which resets these to zero; Prometheus's `rate()` and
+  `increase()` automatically handle the reset.
 
 Example Prometheus scrape config:
 
@@ -579,8 +586,8 @@ scrape_configs:
 
 A ready-to-use Grafana dashboard and Prometheus alert rules ship in
 [`examples/`](examples/) — drop them into your provisioning paths to get
-a 22-panel dashboard plus 10 alert rules covering tunnel health, DNS
-performance, errors, and blocklist freshness.
+a 23-panel dashboard plus 10 alert rules covering tunnel health,
+throughput, DNS performance, errors, and blocklist freshness.
 
 ### `/v1/dns` response shape
 

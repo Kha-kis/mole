@@ -442,9 +442,36 @@
     },
     {
       "type": "timeseries",
+      "title": "VPN throughput",
+      "description": "Bits-per-second through the WireGuard tunnel. Derived from kernel byte counters via rate(); zero rate while connected=1 is the 'tunnel up but dead' silent failure mode.",
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        { "expr": "rate(mole_vpn_receive_bytes_total[5m]) * 8", "refId": "A", "legendFormat": "download" },
+        { "expr": "rate(mole_vpn_transmit_bytes_total[5m]) * 8", "refId": "B", "legendFormat": "upload" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bps",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 15,
+            "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
       "title": "DNS query rate (per second)",
       "description": "Total throughput plus composition: cache hits, upstream-resolved misses, blocked, and resolver errors.",
-      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 21 },
+      "gridPos": { "h": 8, "w": 14, "x": 0, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "rate(mole_dns_cache_hits_total[$__rate_interval])", "refId": "A", "legendFormat": "cache hits" },
@@ -491,7 +518,7 @@
       "type": "timeseries",
       "title": "Cache hit ratio",
       "description": "rate(cache_hits) / rate(queries). Steady high values = effective caching; sustained dips suggest a workload change or cache eviction pressure.",
-      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 21 },
+      "gridPos": { "h": 8, "w": 10, "x": 14, "y": 27 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -532,7 +559,7 @@
       "type": "timeseries",
       "title": "Upstream query latency (per upstream, p50 / p95 / p99)",
       "description": "Log scale so small low-latency upstreams and slow ones share the chart cleanly.",
-      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 29 },
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "mole_dns_upstream_query_latency_p50_seconds", "refId": "A", "legendFormat": "{{upstream}} p50" },
@@ -560,7 +587,7 @@
       "type": "table",
       "title": "Upstream summary",
       "description": "Current state per upstream: latency p50, total queries, errors, error rate, failovers.",
-      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 29 },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 35 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {
@@ -642,7 +669,7 @@
       "type": "timeseries",
       "title": "Errors over time",
       "description": "Resolve-side errors (queries that failed before any upstream attempt) and per-upstream errors.",
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 37 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 43 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "rate(mole_dns_resolve_errors_total[$__rate_interval])", "refId": "A", "legendFormat": "resolve errors" },
@@ -668,7 +695,7 @@
       "type": "timeseries",
       "title": "Retries + failovers",
       "description": "Retries are within-upstream attempts; failovers are giving-up-and-trying-the-next-upstream events.",
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 37 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 43 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "rate(mole_dns_upstream_retries_total[$__rate_interval])", "refId": "A", "legendFormat": "{{upstream}} retries" },
@@ -694,7 +721,7 @@
       "type": "timeseries",
       "title": "Cache state",
       "description": "Entries (left axis) and bytes (right axis). Cap-bound caches plateau here.",
-      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 43 },
+      "gridPos": { "h": 6, "w": 8, "x": 0, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "mole_dns_cache_entries", "refId": "A", "legendFormat": "entries" },
@@ -729,7 +756,7 @@
       "type": "stat",
       "title": "Blocklist size",
       "description": "Domains in the active blocklist + age of last successful refresh.",
-      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 43 },
+      "gridPos": { "h": 6, "w": 8, "x": 8, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "mole_dns_blocked_domains", "refId": "A", "legendFormat": "blocklist domains" },
@@ -759,7 +786,7 @@
       "type": "timeseries",
       "title": "Blocklist update health",
       "description": "Duration of the most-recent successful refresh + cumulative failure count. Failure spikes mean updates have been erroring; staleness will show on the size panel.",
-      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 43 },
+      "gridPos": { "h": 6, "w": 8, "x": 16, "y": 49 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         {

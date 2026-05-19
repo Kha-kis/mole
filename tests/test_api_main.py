@@ -359,6 +359,77 @@ class TestVpnHandshakeAge(unittest.TestCase):
         self.assertRegex(text, r"(?m)^mole_vpn_handshake_age_seconds 0(\.0)?$")
 
 
+class TestVpnByteCounters(unittest.TestCase):
+    """mole_vpn_{receive,transmit}_bytes_total — opt-in counters that
+    surface the WireGuard interface's RX/TX byte totals so dashboards
+    can derive throughput via rate(). The interface is recreated on
+    every renewal, which resets the kernel counters to zero; Prometheus
+    handles counter resets internally, so a `counter` TYPE is correct."""
+
+    def test_emitted_when_present(self):
+        text = format_prometheus_metrics(
+            {},
+            {
+                "connected": True,
+                "receive_bytes_total": 123456789,
+                "transmit_bytes_total": 987654321,
+            },
+            version="",
+        )
+        self.assertIn("mole_vpn_receive_bytes_total 123456789", text)
+        self.assertIn("mole_vpn_transmit_bytes_total 987654321", text)
+        self.assertIn("# TYPE mole_vpn_receive_bytes_total counter", text)
+        self.assertIn("# TYPE mole_vpn_transmit_bytes_total counter", text)
+
+    def test_omitted_when_absent(self):
+        text = format_prometheus_metrics({}, {"connected": True}, version="")
+        self.assertNotIn("mole_vpn_receive_bytes_total", text)
+        self.assertNotIn("mole_vpn_transmit_bytes_total", text)
+
+    def test_zero_values_still_emitted(self):
+        # 0 is a valid fresh-interface value (renewal just happened).
+        # Don't accidentally drop it.
+        text = format_prometheus_metrics(
+            {},
+            {
+                "connected": True,
+                "receive_bytes_total": 0,
+                "transmit_bytes_total": 0,
+            },
+            version="",
+        )
+        self.assertRegex(text, r"(?m)^mole_vpn_receive_bytes_total 0$")
+        self.assertRegex(text, r"(?m)^mole_vpn_transmit_bytes_total 0$")
+
+    def test_emitted_independently(self):
+        # If only one direction was successfully parsed (partial wg-tool
+        # output), the other shouldn't be invented.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True, "receive_bytes_total": 42},
+            version="",
+        )
+        self.assertIn("mole_vpn_receive_bytes_total 42", text)
+        self.assertNotIn("mole_vpn_transmit_bytes_total", text)
+
+    def test_large_values_as_integers(self):
+        # 64-bit counters can comfortably exceed 2^32. Prometheus accepts
+        # decimal integers; we must not drift into scientific notation.
+        big = 5 * 10**12  # 5 TB
+        text = format_prometheus_metrics(
+            {},
+            {
+                "connected": True,
+                "receive_bytes_total": big,
+                "transmit_bytes_total": big,
+            },
+            version="",
+        )
+        self.assertIn(f"mole_vpn_receive_bytes_total {big}", text)
+        self.assertIn(f"mole_vpn_transmit_bytes_total {big}", text)
+        self.assertNotIn("e+", text.lower().split("mole_vpn_receive_bytes_total")[1].split("\n")[0])
+
+
 class TestVpnEndpointInfo(unittest.TestCase):
     """mole_vpn_endpoint_info{server, country, endpoint_ip} 1 — labelled
     gauge for joins. Emitted iff at least one of the labels has content."""

@@ -6,11 +6,12 @@ through `prometheus_client.parser` and the alerts pass `promtool check rules`.
 
 ## Files
 
-- **`grafana-dashboard.json`** — 22-panel Grafana dashboard organised in
-  five rows: at-a-glance KPI strip, VPN renewal lifecycle, handshake +
-  port-forward keepalives, DNS throughput / latency / errors, and cache
-  + blocklist health. Annotations mark VPN reconnects, renewal successes,
-  and renewal failures on every time-series.
+- **`grafana-dashboard.json`** — 23-panel Grafana dashboard organised in
+  six rows: at-a-glance KPI strip, VPN renewal lifecycle, handshake +
+  port-forward keepalives, VPN tunnel throughput, DNS throughput /
+  latency / errors, and cache + blocklist health. Annotations mark VPN
+  reconnects, renewal successes, and renewal failures on every
+  time-series.
 
 - **`prometheus-alerts.yml`** — 10 alert rules across two groups
   (`mole.tunnel` and `mole.dns`), each annotated with a one-line summary
