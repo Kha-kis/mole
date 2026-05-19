@@ -144,6 +144,41 @@ def read_dict_counter(state_dir: Path, name: str) -> dict:
         return {}
 
 
+def append_ring_buffer(state_dir: Path, name: str, entry: dict, max_entries: int = 20) -> int:
+    """Atomically append `entry` to a JSON-list ring buffer, capped at
+    `max_entries`. Returns the new length after truncation.
+
+    Used for per-event state (e.g. recent VPN renewals) where dashboards
+    want a "last N" view rather than a counter aggregate. Same single-
+    owner assumption as `increment_counter`. Malformed/missing files are
+    treated as empty so a corrupted state file can't crash the writer.
+    """
+    import json
+    path = state_dir / name
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, list):
+            data = []
+    except (FileNotFoundError, ValueError):
+        data = []
+    data.append(entry)
+    if len(data) > max_entries:
+        # Drop oldest entries — preserves the newest at the tail.
+        data = data[-max_entries:]
+    atomic_write_state(state_dir, name, json.dumps(data))
+    return len(data)
+
+
+def read_ring_buffer(state_dir: Path, name: str) -> list:
+    """Read a ring-buffer JSON list back; empty list on any failure."""
+    import json
+    try:
+        data = json.loads((state_dir / name).read_text())
+        return data if isinstance(data, list) else []
+    except (FileNotFoundError, ValueError):
+        return []
+
+
 def sanitize_for_log(text: str, max_length: int = 200) -> str:
     """Sanitize text for logging by removing sensitive patterns and truncating"""
     if not text:

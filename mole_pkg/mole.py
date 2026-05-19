@@ -23,6 +23,7 @@ from .services import QBittorrentClient
 from .utils import (
     VPNState,
     VPNProvider,
+    append_ring_buffer,
     atomic_write_state,
     increment_counter,
     increment_dict_counter,
@@ -396,6 +397,22 @@ class Mole:
                     atomic_write_state(state_dir, 'last_renewal_duration_seconds', f"{duration:.3f}")
                 else:
                     increment_counter(state_dir, 'renewals_failure_total')
+                # Per-event log for the renewal-detail table. Captures
+                # whatever state we have at the moment of completion;
+                # failed renewals legitimately have empty server/port.
+                append_ring_buffer(
+                    state_dir,
+                    'renewals_recent.json',
+                    {
+                        'ts': int(renewal_start),
+                        'duration_seconds': round(duration, 3),
+                        'outcome': 'success' if success else 'failure',
+                        'server': self.state.server_hostname or '',
+                        'country': (self.state.server_country or '').upper(),
+                        'endpoint_ip': self.state.server_ip or '',
+                        'port': int(self.state.port or 0),
+                    },
+                )
             except Exception as e:
                 # Never let metrics bookkeeping mask a real renewal outcome.
                 log.warning(f"Failed to persist renewal metrics: {e}")

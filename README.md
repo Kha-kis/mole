@@ -501,6 +501,7 @@ HTTP_API_KEY=your_api_key_here
 | GET | `/v1/server` | Current server info |
 | GET | `/v1/health` | Health check status |
 | GET | `/v1/dns` | DoT resolver state: cache, blocklist, per-upstream pool stats, counters, latency percentiles |
+| GET | `/v1/renewals/recent` | Last 20 full-renewal events (timestamp, outcome, server, country, endpoint_ip, port, duration). Powers Grafana table panels via the Infinity datasource. |
 | GET | `/metrics` | Prometheus exposition format — same data as `/v1/dns` + `/v1/status`, re-shaped for time-series scraping |
 | PUT | `/v1/vpn/restart` | Trigger reconnection |
 
@@ -596,6 +597,34 @@ A ready-to-use Grafana dashboard and Prometheus alert rules ship in
 a 24-panel dashboard plus 10 alert rules covering tunnel health,
 throughput, NAT-PMP region breakdown, DNS performance, errors, and
 blocklist freshness.
+
+### Renewal-detail table (optional)
+
+The bundled example dashboard stays Prometheus-only so it works on any
+Grafana install. If you also want a "last 20 renewals" table (sourced
+from `/v1/renewals/recent` — a per-event log that Prometheus doesn't
+model well), install the
+[Infinity datasource plugin](https://grafana.com/grafana/plugins/yesoreyeram-infinity-datasource/)
+and configure a datasource pointing at mole's API with the `X-API-Key`
+header. Then add a table panel querying `http://<mole>:8080/v1/renewals/recent`
+with `root_selector = events`. The endpoint returns:
+
+```json
+{
+  "count": 1,
+  "events": [
+    {
+      "ts": 1779198481,
+      "duration_seconds": 11.277,
+      "outcome": "success",
+      "server": "node-nl-47.protonvpn.net",
+      "country": "NL",
+      "endpoint_ip": "138.199.7.129",
+      "port": 43886
+    }
+  ]
+}
+```
 
 ### `/v1/dns` response shape
 
