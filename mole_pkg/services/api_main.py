@@ -24,7 +24,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from mole_pkg.utils import log, read_dict_counter
+from mole_pkg.utils import log, read_dict_counter, read_ring_buffer
 from mole_pkg import __version__
 
 
@@ -588,6 +588,7 @@ class HTTPAPIServerStandalone:
             ('GET', '/v1/server'): self._get_server,
             ('GET', '/v1/health'): self._get_health,
             ('GET', '/v1/dns'): self._get_dns,
+            ('GET', '/v1/renewals/recent'): self._get_renewals_recent,
             ('GET', '/metrics'): self._get_metrics,
             ('PUT', '/v1/vpn/restart'): self._put_restart,
             ('POST', '/v1/vpn/restart'): self._put_restart,
@@ -756,6 +757,27 @@ class HTTPAPIServerStandalone:
                 'block_malware': self._get_config_bool('DOT_BLOCK_MALWARE', True),
                 'block_tracking': self._get_config_bool('DOT_BLOCK_TRACKING', False),
             }
+        }
+
+    async def _get_renewals_recent(self) -> dict:
+        """GET /v1/renewals/recent - last N renewal events as a JSON list.
+
+        Backed by `renewals_recent.json`, a ring buffer (default cap 20)
+        appended by mole.py:_full_renewal on every completion (success or
+        failure). Each entry carries enough metadata to populate a "last
+        renewals" table panel in Grafana via the Infinity datasource —
+        ts, duration, outcome, server, country, endpoint_ip, port.
+
+        Returned in chronological order (oldest first). Empty list on
+        cold start or after a state reset; never raises.
+        """
+        events = read_ring_buffer(self.state_dir, 'renewals_recent.json')
+        return {
+            'status': 200,
+            'body': {
+                'count': len(events),
+                'events': events,
+            },
         }
 
     async def _get_metrics(self) -> dict:

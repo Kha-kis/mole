@@ -11,8 +11,10 @@ import json
 
 from mole_pkg.utils import (
     VPNState,
+    append_ring_buffer,
     increment_dict_counter,
     read_dict_counter,
+    read_ring_buffer,
     run_cmd,
     secure_write_file,
     sanitize_for_log,
@@ -232,6 +234,83 @@ class TestReadDictCounter(unittest.TestCase):
             d = Path(tmpdir)
             (d / "pf.json").write_text("not json")
             self.assertEqual(read_dict_counter(d, "pf.json"), {})
+
+
+class TestAppendRingBuffer(unittest.TestCase):
+    """Bounded append-only event log used for the renewal-detail table."""
+
+    def test_appends_to_empty(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            n = append_ring_buffer(d, "r.json", {"ts": 1, "outcome": "success"})
+            self.assertEqual(n, 1)
+            self.assertEqual(
+                json.loads((d / "r.json").read_text()),
+                [{"ts": 1, "outcome": "success"}],
+            )
+
+    def test_appends_preserves_order(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            for i in range(3):
+                append_ring_buffer(d, "r.json", {"ts": i})
+            self.assertEqual(
+                [e["ts"] for e in json.loads((d / "r.json").read_text())],
+                [0, 1, 2],
+            )
+
+    def test_truncates_to_max_entries(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            for i in range(25):
+                append_ring_buffer(d, "r.json", {"ts": i}, max_entries=10)
+            data = json.loads((d / "r.json").read_text())
+            self.assertEqual(len(data), 10)
+            # Newest entries kept; oldest dropped.
+            self.assertEqual([e["ts"] for e in data], list(range(15, 25)))
+
+    def test_recovers_from_malformed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "r.json").write_text("not json")
+            n = append_ring_buffer(d, "r.json", {"ts": 99})
+            self.assertEqual(n, 1)
+
+    def test_recovers_from_non_list_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "r.json").write_text('{"some": "dict"}')
+            n = append_ring_buffer(d, "r.json", {"ts": 99})
+            self.assertEqual(n, 1)
+            self.assertEqual(
+                json.loads((d / "r.json").read_text()),
+                [{"ts": 99}],
+            )
+
+
+class TestReadRingBuffer(unittest.TestCase):
+
+    def test_returns_empty_on_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(read_ring_buffer(Path(tmpdir), "missing.json"), [])
+
+    def test_returns_list_on_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "r.json").write_text('[{"ts": 1}, {"ts": 2}]')
+            self.assertEqual(read_ring_buffer(d, "r.json"), [{"ts": 1}, {"ts": 2}])
+
+    def test_returns_empty_on_non_list_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "r.json").write_text('{"not": "a list"}')
+            self.assertEqual(read_ring_buffer(d, "r.json"), [])
+
+    def test_returns_empty_on_malformed(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "r.json").write_text("garbage")
+            self.assertEqual(read_ring_buffer(d, "r.json"), [])
 
 
 if __name__ == '__main__':
