@@ -25,6 +25,7 @@ from .utils import (
     VPNProvider,
     atomic_write_state,
     increment_counter,
+    increment_dict_counter,
     log,
     run_cmd,
     run_in_netns,
@@ -469,11 +470,14 @@ class Mole:
                 if self.state.connected and self.state.port:
                     refresh_ok = await self.provider.refresh_port_forward()
                     try:
+                        country = (self.state.server_country or "").upper() or "unknown"
                         if refresh_ok:
                             increment_counter(state_dir, 'port_forward_renewals_success_total')
+                            increment_dict_counter(state_dir, 'port_forward_renewals.json', country, 'success')
                             atomic_write_state(state_dir, 'last_port_forward_success_ts', str(int(time.time())))
                         else:
                             increment_counter(state_dir, 'port_forward_renewals_failure_total')
+                            increment_dict_counter(state_dir, 'port_forward_renewals.json', country, 'failure')
                     except Exception as e:
                         log.warning(f"Failed to persist port-forward metrics: {e}")
                     if refresh_ok:

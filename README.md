@@ -561,7 +561,14 @@ VPN-tunnel observability:
   doesn't fire, but a stuck-down state does).
 - `mole_vpn_port_forward_age_seconds` (gauge) — seconds since the last
   successful NAT-PMP keepalive. Catches silent-stale port forwards.
-- `mole_vpn_port_forward_renewals_total{result}` (counter).
+- `mole_vpn_port_forward_renewals_total{country, result}` (counter) —
+  port-forward keepalive attempts, labelled by VPN country and outcome.
+  Lets you see whether NAT-PMP failures cluster on a region (`sum by
+  (country)(rate(...failure...[15m]))`) or distribute randomly across
+  the fleet. On ProtonVPN, failures are typically transient per-server
+  and don't cluster — this label exposes that empirically. Existing
+  unlabelled queries continue to work; `rate(...)` just returns
+  multi-series.
 - `mole_vpn_receive_bytes_total` / `mole_vpn_transmit_bytes_total`
   (counter) — kernel byte counters for the `mole` WireGuard interface.
   Useful for throughput dashboards (`rate(...) * 8` for bits/sec) and
@@ -586,8 +593,9 @@ scrape_configs:
 
 A ready-to-use Grafana dashboard and Prometheus alert rules ship in
 [`examples/`](examples/) — drop them into your provisioning paths to get
-a 23-panel dashboard plus 10 alert rules covering tunnel health,
-throughput, DNS performance, errors, and blocklist freshness.
+a 24-panel dashboard plus 10 alert rules covering tunnel health,
+throughput, NAT-PMP region breakdown, DNS performance, errors, and
+blocklist freshness.
 
 ### `/v1/dns` response shape
 

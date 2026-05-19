@@ -96,6 +96,54 @@ def increment_counter(state_dir: Path, name: str) -> int:
     return new_value
 
 
+def increment_dict_counter(state_dir: Path, name: str, dict_key: str, field: str) -> int:
+    """Atomically increment a nested-dict counter persisted as JSON.
+
+    Used for labelled Prometheus counters that need per-(dict_key, field)
+    accumulators — e.g. NAT-PMP success/failure counts per VPN country.
+    Schema on disk:
+        {"NL": {"success": 21184, "failure": 49}, "US": {...}}
+
+    Same single-owner assumption as `increment_counter`: mole increments
+    these from one task, so read-modify-write is safe without locking.
+    Empty/missing dict_key falls back to "unknown" so we never silently
+    drop attempted writes (a connected-but-unlabelled state still counts).
+    """
+    import json
+    if not dict_key:
+        dict_key = "unknown"
+    path = state_dir / name
+    try:
+        data = json.loads(path.read_text())
+        if not isinstance(data, dict):
+            data = {}
+    except (FileNotFoundError, ValueError):
+        data = {}
+    bucket = data.setdefault(dict_key, {})
+    if not isinstance(bucket, dict):
+        bucket = {}
+        data[dict_key] = bucket
+    new_value = int(bucket.get(field, 0)) + 1
+    bucket[field] = new_value
+    atomic_write_state(state_dir, name, json.dumps(data))
+    return new_value
+
+
+def read_dict_counter(state_dir: Path, name: str) -> dict:
+    """Read a JSON dict-counter file back as a plain dict.
+
+    Returns an empty dict on any read/parse failure — readers should treat
+    "no file" and "malformed file" identically (i.e. no labelled samples
+    to emit) rather than raise into the scrape path.
+    """
+    import json
+    try:
+        data = json.loads((state_dir / name).read_text())
+        return data if isinstance(data, dict) else {}
+    except (FileNotFoundError, ValueError):
+        return {}
+
+
 def sanitize_for_log(text: str, max_length: int = 200) -> str:
     """Sanitize text for logging by removing sensitive patterns and truncating"""
     if not text:
