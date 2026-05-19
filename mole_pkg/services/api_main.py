@@ -147,6 +147,27 @@ def format_prometheus_metrics(
             [(None, _prom_num(vpn_status.get("handshake_age_seconds")))],
         )
 
+    # WireGuard byte counters — cumulative RX/TX from the kernel since the
+    # `mole` interface was created. The interface is recreated on each
+    # renewal, so these reset to 0; Prometheus's rate()/increase()
+    # automatically handle counter resets, so this is correctly typed as
+    # a counter. Useful for: a) detecting "tunnel up, no traffic" failure
+    # modes (rate≈0 while connected=1), b) bandwidth dashboards.
+    if "receive_bytes_total" in vpn_status:
+        emit(
+            "mole_vpn_receive_bytes_total",
+            "counter",
+            "Total bytes received from the VPN peer (download). Resets on interface recreation; Prometheus handles the reset.",
+            [(None, int(_prom_num(vpn_status.get("receive_bytes_total"))))],
+        )
+    if "transmit_bytes_total" in vpn_status:
+        emit(
+            "mole_vpn_transmit_bytes_total",
+            "counter",
+            "Total bytes transmitted to the VPN peer (upload). Resets on interface recreation; Prometheus handles the reset.",
+            [(None, int(_prom_num(vpn_status.get("transmit_bytes_total"))))],
+        )
+
     # Endpoint identity — a single labelled gauge=1 carrying the current
     # connection's server hostname, country, and IP. Joinable in PromQL
     # via `mole_vpn_connected * on() group_left(server, country)
@@ -756,6 +777,30 @@ class HTTPAPIServerStandalone:
         except Exception:
             pass
 
+        # Byte counters — `wg show mole transfer` emits one line per peer:
+        # `<pubkey>\t<rx_bytes>\t<tx_bytes>`. Sum across peers (mole has one
+        # in practice; summing is forward-compatible). Skip on any failure
+        # so a transient wg-tool error doesn't break the whole scrape.
+        receive_bytes = None
+        transmit_bytes = None
+        try:
+            tx_result = self._run_cmd(['wg', 'show', 'mole', 'transfer'])
+            if tx_result.returncode == 0:
+                rx_sum = 0
+                tx_sum = 0
+                for line in tx_result.stdout.strip().splitlines():
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        try:
+                            rx_sum += int(parts[1])
+                            tx_sum += int(parts[2])
+                        except ValueError:
+                            pass
+                receive_bytes = rx_sum
+                transmit_bytes = tx_sum
+        except Exception:
+            pass
+
         vpn_status = {
             'connected': connected,
             'port': port,
@@ -765,6 +810,10 @@ class HTTPAPIServerStandalone:
         }
         if handshake_age is not None:
             vpn_status['handshake_age_seconds'] = handshake_age
+        if receive_bytes is not None:
+            vpn_status['receive_bytes_total'] = receive_bytes
+        if transmit_bytes is not None:
+            vpn_status['transmit_bytes_total'] = transmit_bytes
 
         # Renewal observability — counters + last-success markers persisted
         # by mole.py:_full_renewal.
