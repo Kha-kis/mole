@@ -408,9 +408,9 @@
           "legendFormat": "PF age"
         },
         {
-          "expr": "rate(mole_vpn_port_forward_renewals_total{result=\"failure\"}[5m])",
+          "expr": "sum(rate(mole_vpn_port_forward_renewals_total{result=\"failure\"}[5m]))",
           "refId": "B",
-          "legendFormat": "failure rate"
+          "legendFormat": "failure rate (all countries)"
         }
       ],
       "fieldConfig": {
@@ -444,7 +444,7 @@
       "type": "timeseries",
       "title": "VPN throughput",
       "description": "Bits-per-second through the WireGuard tunnel. Derived from kernel byte counters via rate(); zero rate while connected=1 is the 'tunnel up but dead' silent failure mode.",
-      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 21 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 21 },
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "targets": [
         { "expr": "rate(mole_vpn_receive_bytes_total[5m]) * 8", "refId": "A", "legendFormat": "download" },
@@ -459,6 +459,37 @@
             "lineWidth": 2,
             "fillOpacity": 15,
             "showPoints": "never"
+          }
+        }
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi" }
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "NAT-PMP failures by VPN country",
+      "description": "Per-country failure rate of the port-forward keepalive. Lets you see whether NAT-PMP errors cluster on a specific region — on ProtonVPN they typically don't (failures are transient per-server across the fleet).",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 21 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "sum by (country) (rate(mole_vpn_port_forward_renewals_total{result=\"failure\"}[15m]))",
+          "refId": "A",
+          "legendFormat": "{{country}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "min": 0,
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 2,
+            "fillOpacity": 30,
+            "showPoints": "never",
+            "stacking": { "mode": "normal" }
           }
         }
       },

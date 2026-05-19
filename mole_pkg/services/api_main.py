@@ -24,7 +24,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from mole_pkg.utils import log
+from mole_pkg.utils import log, read_dict_counter
 from mole_pkg import __version__
 
 
@@ -233,15 +233,42 @@ def format_prometheus_metrics(
                 "Seconds since the last successful port-forward keepalive (alertable on staleness).",
                 [(None, _prom_num(port_forward_state.get("age_seconds")))],
             )
-        emit(
-            "mole_vpn_port_forward_renewals_total",
-            "counter",
-            "Total port-forward keepalive attempts split by outcome.",
-            [
-                ({"result": "success"}, int(_prom_num(port_forward_state.get("success_total", 0)))),
-                ({"result": "failure"}, int(_prom_num(port_forward_state.get("failure_total", 0)))),
-            ],
-        )
+        # Per-country breakdown is the strictly-additive way to expose this
+        # counter — adding a `country` label preserves existing queries
+        # (they just become multi-series) while enabling `sum by (country)`
+        # for "are NAT-PMP failures clustered on a region?" diagnostics.
+        # We fall back to the unlabelled aggregate when no per-country state
+        # has been written yet (fresh install, or pre-upgrade mole still
+        # running) so the metric never goes missing on a scrape.
+        breakdown = port_forward_state.get("breakdown") or {}
+        if breakdown:
+            samples = []
+            for country, bucket in sorted(breakdown.items()):
+                if not isinstance(bucket, dict):
+                    continue
+                for result in ("success", "failure"):
+                    samples.append(
+                        (
+                            {"country": country, "result": result},
+                            int(_prom_num(bucket.get(result, 0))),
+                        )
+                    )
+            emit(
+                "mole_vpn_port_forward_renewals_total",
+                "counter",
+                "Total port-forward keepalive attempts split by VPN country and outcome.",
+                samples,
+            )
+        else:
+            emit(
+                "mole_vpn_port_forward_renewals_total",
+                "counter",
+                "Total port-forward keepalive attempts split by outcome.",
+                [
+                    ({"result": "success"}, int(_prom_num(port_forward_state.get("success_total", 0)))),
+                    ({"result": "failure"}, int(_prom_num(port_forward_state.get("failure_total", 0)))),
+                ],
+            )
 
     # ---- DNS aggregates ----
     counter_specs = [
@@ -826,10 +853,15 @@ class HTTPAPIServerStandalone:
 
         # Port-forward keepalive observability — counters + age derived from
         # last_port_forward_success_ts persisted by mole.py:_keepalive_loop.
+        # `breakdown` carries per-country {success, failure} buckets so the
+        # emitted metric can be labelled by VPN country; absent (fresh
+        # install, or pre-upgrade running mole) → fall back to the legacy
+        # unlabelled aggregate counters.
         pf_last_ts = self._read_state_int('last_port_forward_success_ts')
         port_forward_state = {
             'success_total': self._read_state_int('port_forward_renewals_success_total'),
             'failure_total': self._read_state_int('port_forward_renewals_failure_total'),
+            'breakdown': read_dict_counter(self.state_dir, 'port_forward_renewals.json'),
         }
         if pf_last_ts > 0:
             port_forward_state['age_seconds'] = max(0, time.time() - pf_last_ts)
