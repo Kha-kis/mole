@@ -7,8 +7,12 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import json
+
 from mole_pkg.utils import (
     VPNState,
+    increment_dict_counter,
+    read_dict_counter,
     run_cmd,
     secure_write_file,
     sanitize_for_log,
@@ -139,6 +143,95 @@ class TestSanitizeForLog(unittest.TestCase):
         text = '{"token": "abc123def456"}'
         result = sanitize_for_log(text)
         self.assertIn("[REDACTED]", result)
+
+
+class TestIncrementDictCounter(unittest.TestCase):
+    """Atomic JSON-dict counter helper for labelled Prometheus metrics."""
+
+    def test_creates_file_on_first_increment(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            v = increment_dict_counter(d, "pf.json", "NL", "success")
+            self.assertEqual(v, 1)
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data, {"NL": {"success": 1}})
+
+    def test_increments_existing_bucket(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            for _ in range(5):
+                increment_dict_counter(d, "pf.json", "NL", "success")
+            v = increment_dict_counter(d, "pf.json", "NL", "failure")
+            self.assertEqual(v, 1)
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data["NL"]["success"], 5)
+            self.assertEqual(data["NL"]["failure"], 1)
+
+    def test_multiple_keys_isolated(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            increment_dict_counter(d, "pf.json", "NL", "success")
+            increment_dict_counter(d, "pf.json", "US", "success")
+            increment_dict_counter(d, "pf.json", "US", "success")
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data["NL"]["success"], 1)
+            self.assertEqual(data["US"]["success"], 2)
+
+    def test_empty_dict_key_falls_back_to_unknown(self):
+        # Pre-connect or transient state where server_country isn't
+        # populated yet — must not silently drop the count.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            increment_dict_counter(d, "pf.json", "", "success")
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data["unknown"]["success"], 1)
+
+    def test_recovers_from_malformed_file(self):
+        # Hand-edit, partial-write, or unrelated content shouldn't make
+        # mole's keepalive loop crash on the next increment.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "pf.json").write_text("{this is not json")
+            v = increment_dict_counter(d, "pf.json", "NL", "success")
+            self.assertEqual(v, 1)
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data, {"NL": {"success": 1}})
+
+    def test_recovers_from_non_dict_root(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "pf.json").write_text('["not", "a", "dict"]')
+            v = increment_dict_counter(d, "pf.json", "NL", "success")
+            self.assertEqual(v, 1)
+
+    def test_recovers_from_non_dict_bucket(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "pf.json").write_text('{"NL": "broken"}')
+            v = increment_dict_counter(d, "pf.json", "NL", "success")
+            self.assertEqual(v, 1)
+            data = json.loads((d / "pf.json").read_text())
+            self.assertEqual(data["NL"], {"success": 1})
+
+
+class TestReadDictCounter(unittest.TestCase):
+
+    def test_returns_empty_on_missing(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            self.assertEqual(read_dict_counter(Path(tmpdir), "missing.json"), {})
+
+    def test_returns_data_on_success(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "pf.json").write_text('{"NL": {"success": 5}}')
+            self.assertEqual(read_dict_counter(d, "pf.json"), {"NL": {"success": 5}})
+
+    def test_returns_empty_on_malformed(self):
+        # Readers must never raise into the scrape path.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            d = Path(tmpdir)
+            (d / "pf.json").write_text("not json")
+            self.assertEqual(read_dict_counter(d, "pf.json"), {})
 
 
 if __name__ == '__main__':

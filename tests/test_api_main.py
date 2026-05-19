@@ -562,6 +562,142 @@ class TestPortForwardState(unittest.TestCase):
         self.assertNotIn("mole_vpn_port_forward_", text)
 
 
+class TestPortForwardCountryBreakdown(unittest.TestCase):
+    """When the keepalive loop has written per-country buckets, the metric
+    is emitted with both a `country` and `result` label. The fallback to
+    the unlabelled aggregate covers the upgrade-window case where pre-PR
+    mole is still running but the api server has been restarted on the
+    new code path."""
+
+    def test_breakdown_emits_labelled_samples(self):
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "age_seconds": 5.0,
+                "success_total": 25,
+                "failure_total": 3,
+                "breakdown": {
+                    "NL": {"success": 20, "failure": 3},
+                    "US": {"success": 5, "failure": 0},
+                },
+            },
+            version="",
+        )
+        # Each (country, result) tuple is a separate sample.
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="NL",result="success"} 20',
+            text,
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="NL",result="failure"} 3',
+            text,
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="US",result="success"} 5',
+            text,
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="US",result="failure"} 0',
+            text,
+        )
+        # HELP/TYPE block emitted exactly once for the labelled form.
+        self.assertEqual(
+            text.count("# TYPE mole_vpn_port_forward_renewals_total counter"), 1
+        )
+        # No unlabelled emission alongside the labelled one.
+        self.assertNotIn(
+            'mole_vpn_port_forward_renewals_total{result="success"} ', text
+        )
+
+    def test_falls_back_to_aggregate_when_breakdown_empty(self):
+        # Pre-upgrade or post-fresh-install: breakdown JSON not yet written.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "success_total": 100,
+                "failure_total": 2,
+                "breakdown": {},
+            },
+            version="",
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{result="success"} 100', text
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{result="failure"} 2', text
+        )
+        # No country-labelled samples appear.
+        self.assertNotIn('country="', text)
+
+    def test_unknown_country_bucket(self):
+        # Connection came up before server_country was populated → still
+        # accounted under "unknown" rather than silently dropped.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "success_total": 1,
+                "failure_total": 0,
+                "breakdown": {"unknown": {"success": 1, "failure": 0}},
+            },
+            version="",
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="unknown",result="success"} 1',
+            text,
+        )
+
+    def test_non_dict_bucket_skipped_gracefully(self):
+        # Defensive: malformed JSON state (e.g. partial write or hand-edit)
+        # shouldn't crash the scrape — just skip the bad entry.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "success_total": 0,
+                "failure_total": 0,
+                "breakdown": {
+                    "NL": {"success": 5, "failure": 1},
+                    "BROKEN": "not-a-dict",
+                },
+            },
+            version="",
+        )
+        self.assertIn(
+            'mole_vpn_port_forward_renewals_total{country="NL",result="success"} 5',
+            text,
+        )
+        self.assertNotIn('country="BROKEN"', text)
+
+    def test_breakdown_country_keys_sorted(self):
+        # Stable output ordering matters for diff-friendly scrape responses
+        # and predictable Prometheus series identity.
+        text = format_prometheus_metrics(
+            {},
+            {"connected": True},
+            port_forward_state={
+                "success_total": 0,
+                "failure_total": 0,
+                "breakdown": {
+                    "US": {"success": 1, "failure": 0},
+                    "DE": {"success": 1, "failure": 0},
+                    "NL": {"success": 1, "failure": 0},
+                },
+            },
+            version="",
+        )
+        # Find the order in which the country labels appear.
+        order = []
+        for line in text.splitlines():
+            if line.startswith("mole_vpn_port_forward_renewals_total{country="):
+                country = line.split('country="', 1)[1].split('"', 1)[0]
+                if country not in order:
+                    order.append(country)
+        self.assertEqual(order, ["DE", "NL", "US"])
+
+
 class TestBlocklistUpdateHealth(unittest.TestCase):
 
     def test_full_input(self):
