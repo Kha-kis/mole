@@ -131,6 +131,24 @@ QB_PORT=8080
 # if you actively monitor and want faster failure detection.
 # QB_API_TIMEOUT=15
 
+# Address the passthrough socat listener binds on (default: 127.0.0.1).
+# The passthrough adds TCP keepalive on both sides so qBittorrent
+# connection closes are propagated immediately, preventing stale-
+# connection RSTs in Sonarr/Radarr/Lidarr.
+#
+# Common values:
+#   127.0.0.1        Host-only (default, most restrictive)
+#   172.x.x.1        Docker bridge gateway — *arr containers on that
+#                    bridge can connect without extra network config
+#   192.168.x.x      LAN IP — allows automation tools on other LAN
+#                    machines to reach the API
+#   0.0.0.0          All interfaces (Docker + LAN + host)
+#
+# Security note: qBittorrent's AuthSubnetWhitelist bypasses the WebUI
+# login for subnets you list there. Binding to a LAN or all-interfaces
+# address is safe only if that whitelist matches your trust boundary.
+# QB_PASSTHROUGH_BIND=127.0.0.1
+
 # ═══════════════════════════════════════════════════════════════════
 # Timing Settings (in seconds)
 # ═══════════════════════════════════════════════════════════════════
