@@ -131,6 +131,15 @@ QB_PORT=8080
 # if you actively monitor and want faster failure detection.
 # QB_API_TIMEOUT=15
 
+# Address the passthrough socat listener binds on (default: 127.0.0.1).
+# Change to your Docker bridge gateway IP (e.g. 172.24.0.1) if your
+# *arr containers need to reach qBittorrent directly.  The passthrough
+# adds TCP keepalive on both sides so qBittorrent connection closes are
+# propagated immediately, preventing stale-connection RSTs in Sonarr/
+# Radarr/Lidarr when the download-monitoring poll interval exceeds
+# qBittorrent's HTTP keep-alive timeout.
+# QB_PASSTHROUGH_BIND=127.0.0.1
+
 # ═══════════════════════════════════════════════════════════════════
 # Timing Settings (in seconds)
 # ═══════════════════════════════════════════════════════════════════
