@@ -428,9 +428,18 @@ fi
 
 QB_PORT_RUN="${QB_PORT:-8080}"
 VETH_VPN_IP_RUN="${VETH_VPN_IP:-10.200.200.2}"
+QB_PASSTHROUGH_BIND_RUN="${QB_PASSTHROUGH_BIND:-127.0.0.1}"
 
-# Forward localhost:port to VPN namespace
-exec /usr/bin/socat TCP-LISTEN:"$QB_PORT_RUN",bind=127.0.0.1,fork,reuseaddr TCP:"$VETH_VPN_IP_RUN":"$QB_PORT_RUN"
+# Keepalive options: probes start after 30 s idle, retry every 10 s, give up
+# after 3 misses (60 s total).  Applied to both sides so that when qBittorrent
+# closes an idle HTTP connection the OS detects it promptly and socat propagates
+# the close to the client side — preventing clients (e.g. Sonarr/Radarr) from
+# reusing a dead pooled connection and receiving a spurious RST.
+KEEPALIVE="keepalive,keepidle=30,keepintvl=10,keepcnt=3"
+
+exec /usr/bin/socat \
+  "TCP-LISTEN:${QB_PORT_RUN},bind=${QB_PASSTHROUGH_BIND_RUN},fork,reuseaddr,${KEEPALIVE}" \
+  "TCP:${VETH_VPN_IP_RUN}:${QB_PORT_RUN},${KEEPALIVE}"
 '''
     pt_wrapper.write_text(pt_wrapper_content)
     pt_wrapper.chmod(0o755)
@@ -466,13 +475,19 @@ WantedBy=multi-user.target
         else:
             pt_service = Path("/etc/systemd/system/qbittorrent-passthrough.service")
             pt_service_content = """[Unit]
-Description=qBittorrent localhost passthrough
+Description=qBittorrent passthrough (host → VPN namespace)
 After=qbittorrent-mole.service
 BindsTo=qbittorrent-mole.service
 
 [Service]
 Type=simple
-ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh
+# Config variables injected at service start; no shell wrapper needed so the
+# service can run unprivileged (e.g. with a User= drop-in).
+EnvironmentFile=-/etc/mole/config
+Environment=QB_PORT=10048
+Environment=VETH_VPN_IP=10.200.200.2
+Environment=QB_PASSTHROUGH_BIND=127.0.0.1
+ExecStart=/usr/bin/socat TCP-LISTEN:${QB_PORT},bind=${QB_PASSTHROUGH_BIND},fork,reuseaddr,keepalive,keepidle=30,keepintvl=10,keepcnt=3 TCP:${VETH_VPN_IP}:${QB_PORT},keepalive,keepidle=30,keepintvl=10,keepcnt=3
 Restart=on-failure
 
 [Install]
