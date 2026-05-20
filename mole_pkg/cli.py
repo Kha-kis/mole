@@ -481,12 +481,11 @@ BindsTo=qbittorrent-mole.service
 
 [Service]
 Type=simple
-# Config variables injected at service start; no shell wrapper needed so the
-# service can run unprivileged (e.g. with a User= drop-in).
-EnvironmentFile=-/etc/mole/config
+# Defaults first, then config overrides — order matters in systemd.
 Environment=QB_PORT=10048
 Environment=VETH_VPN_IP=10.200.200.2
 Environment=QB_PASSTHROUGH_BIND=127.0.0.1
+EnvironmentFile=-/etc/mole/config
 ExecStart=/usr/bin/socat TCP-LISTEN:${QB_PORT},bind=${QB_PASSTHROUGH_BIND},fork,reuseaddr,keepalive,keepidle=30,keepintvl=10,keepcnt=3 TCP:${VETH_VPN_IP}:${QB_PORT},keepalive,keepidle=30,keepintvl=10,keepcnt=3
 Restart=on-failure
 
