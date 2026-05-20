@@ -5,6 +5,12 @@ All notable changes to MOLE will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **`QB_PASSTHROUGH_BIND`**: Configurable bind address for the qBittorrent passthrough socat listener (default: `127.0.0.1`). Set to your Docker bridge gateway (e.g. `172.24.0.1`) to allow containers on that bridge to connect directly.
+- **TCP keepalive on passthrough**: Both sides of the socat tunnel now set `keepalive,keepidle=30,keepintvl=10,keepcnt=3`. This ensures qBittorrent's HTTP connection closes are propagated immediately to the client side, preventing Sonarr/Radarr/Lidarr from receiving spurious RST errors when their download-monitoring poll interval exceeds qBittorrent's HTTP keep-alive timeout.
+
 ## [0.4.0] - 2026-01-16
 
 ### Added

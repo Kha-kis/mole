@@ -150,6 +150,16 @@ class Config:
         return self.get('QB_USER', '')
 
     @property
+    def qb_passthrough_bind(self) -> str:
+        # Address the passthrough socat listener binds on.  Default 127.0.0.1
+        # (host-only).  Set to the Docker bridge gateway (e.g. 172.24.0.1) to
+        # allow containers on that bridge to connect directly, which eliminates
+        # the stale-connection RSTs seen in Sonarr/Radarr/Lidarr when the
+        # download-monitoring poll interval exceeds qBittorrent's HTTP
+        # keep-alive timeout.
+        return self.get('QB_PASSTHROUGH_BIND', '127.0.0.1')
+
+    @property
     def qb_api_timeout(self) -> int:
         # qBittorrent's WebUI is single-threaded for some operations and at
         # high torrent counts (10k+) can pause for several seconds during
