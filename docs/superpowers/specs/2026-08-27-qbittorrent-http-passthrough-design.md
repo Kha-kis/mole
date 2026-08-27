@@ -22,7 +22,7 @@ This host will opt into `nginx` after the repository change is tested.
 
 ## Runtime Design
 
-The existing `qbittorrent-passthrough.service` remains the lifecycle boundary. It executes a MOLE-owned wrapper at `/usr/local/lib/mole/qbittorrent-passthrough.sh`.
+The existing `qbittorrent-passthrough.service` remains the lifecycle boundary. It imports the root-owned MOLE configuration through systemd and executes a MOLE-owned wrapper at `/usr/local/lib/mole/qbittorrent-passthrough.sh`. The wrapper also sources a directly readable configuration file when run outside systemd.
 
 In `socat` mode, the wrapper retains the current TCP relay behavior.
 
@@ -44,7 +44,7 @@ proxy_read_timeout 100s;
 
 `Connection close` is the key behavior: downstream clients cannot cache a connection beyond qBittorrent's upstream lifetime. The upstream `Host` value is explicit because qBittorrent validates the host header.
 
-The Nginx process uses stderr logging, disables access logs, binds only the configured passthrough address, and stores its PID in the service runtime directory. Existing systemd user drop-ins remain compatible.
+The service uses a dynamic unprivileged user by default. The Nginx process uses stderr logging, disables access logs, binds only the configured passthrough address, and stores its PID and temporary files in the service runtime directory. Existing systemd user drop-ins remain compatible.
 
 ## Dependency and Failure Behavior
 

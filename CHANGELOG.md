@@ -8,8 +8,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **`QB_PASSTHROUGH_BIND`**: Configurable bind address for the qBittorrent passthrough socat listener (default: `127.0.0.1`). Set to your Docker bridge gateway (e.g. `172.24.0.1`) to allow containers on that bridge to connect directly.
-- **TCP keepalive on passthrough**: Both sides of the socat tunnel now set `keepalive,keepidle=30,keepintvl=10,keepcnt=3`. This ensures qBittorrent's HTTP connection closes are propagated immediately to the client side, preventing Sonarr/Radarr/Lidarr from receiving spurious RST errors when their download-monitoring poll interval exceeds qBittorrent's HTTP keep-alive timeout.
+- **`QB_PASSTHROUGH_MODE`**: Select `socat` (backward-compatible default) or an isolated, HTTP-aware `nginx` relay for qBittorrent Web API access. Nginx mode prevents Arr clients from reusing connections beyond qBittorrent's upstream HTTP keep-alive lifetime.
+- **`QB_PASSTHROUGH_BIND`**: Configurable bind address for the qBittorrent passthrough listener (default: `127.0.0.1`). Set to your Docker bridge gateway (e.g. `172.24.0.1`) to allow containers on that bridge to connect directly.
+- **TCP keepalive on socat passthrough**: Both sides of the raw TCP relay set `keepalive,keepidle=30,keepintvl=10,keepcnt=3` to detect dead peers. TCP keepalive does not resolve qBittorrent's shorter HTTP connection lifetime; use `QB_PASSTHROUGH_MODE=nginx` for that case.
 
 ## [0.4.0] - 2026-01-16
 
