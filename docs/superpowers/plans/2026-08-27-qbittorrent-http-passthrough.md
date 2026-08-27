@@ -43,16 +43,16 @@
 ### Task 5: Repository Verification
 
 - [x] Run all focused tests.
-- [ ] Run the complete test suite and compare with the recorded baseline.
-- [ ] Inspect the final diff for scope, security, and compatibility.
-- [ ] Commit and publish the branch for review.
+- [x] Run the complete test suite and compare with the recorded baseline.
+- [x] Inspect the final diff for scope, security, and compatibility.
+- [x] Commit and publish the branch for review.
 
 ### Task 6: Guarded Host Rollout
 
-- [ ] Back up the live MOLE config, passthrough unit, and drop-ins.
-- [ ] Install the tested repository version without restarting qBittorrent or MOLE.
-- [ ] Set this host to `QB_PASSTHROUGH_MODE=nginx`.
-- [ ] Reconcile and validate the service unit before switching the listener.
-- [ ] Restart only `qbittorrent-passthrough.service`.
-- [ ] Verify MOLE, WireGuard, qBittorrent, Arr clients, Qui, and the external torrent port.
-- [ ] Observe logs across multiple Arr health-check cycles and roll back if regressions appear.
+- [x] Back up the live MOLE config, passthrough unit, and drop-ins.
+- [x] Install the tested repository version without restarting qBittorrent or MOLE.
+- [x] Set this host to `QB_PASSTHROUGH_MODE=nginx`.
+- [x] Reconcile and validate the service unit before switching the listener.
+- [x] Restart only `qbittorrent-passthrough.service`.
+- [x] Verify MOLE, WireGuard, qBittorrent, Arr clients, Qui, and the external torrent port.
+- [x] Observe logs across multiple Arr health-check cycles and roll back if regressions appear.
