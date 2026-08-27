@@ -9,6 +9,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -372,6 +373,183 @@ def _apply_proton_config(country: str, server: str = None) -> bool:
         return False
 
 
+def _qbittorrent_passthrough_dependency(config: Config) -> str:
+    """Return the executable required by the configured passthrough mode."""
+    dependencies = {
+        "socat": "socat",
+        "nginx": "nginx",
+    }
+    try:
+        return dependencies[config.qb_passthrough_mode]
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported QB_PASSTHROUGH_MODE: {config.qb_passthrough_mode}"
+        ) from exc
+
+
+def _qbittorrent_passthrough_executable(config: Config) -> Optional[str]:
+    """Resolve a passthrough executable, including standard sbin paths."""
+    dependency = _qbittorrent_passthrough_dependency(config)
+    search_path = os.pathsep.join(filter(None, (
+        os.environ.get("PATH"),
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+    )))
+    return shutil.which(dependency, path=search_path)
+
+
+def _qbittorrent_passthrough_wrapper_content() -> str:
+    """Render the runtime wrapper for both supported passthrough modes."""
+    return '''#!/bin/bash
+# qBittorrent passthrough wrapper - reads config at runtime
+set -euo pipefail
+
+CONFIG_FILE="${MOLE_CONFIG:-/etc/mole/config}"
+
+if [[ -r "$CONFIG_FILE" ]]; then
+    source "$CONFIG_FILE"
+fi
+
+QB_PORT_RUN="${QB_PORT:-8080}"
+VETH_VPN_IP_RUN="${VETH_VPN_IP:-10.200.200.2}"
+QB_PASSTHROUGH_BIND_RUN="${QB_PASSTHROUGH_BIND:-127.0.0.1}"
+QB_PASSTHROUGH_MODE_RUN="${QB_PASSTHROUGH_MODE:-socat}"
+QB_PASSTHROUGH_MODE_RUN="${QB_PASSTHROUGH_MODE_RUN,,}"
+
+validate_ipv4() {
+    local address="$1"
+    local octet
+    local -a octets
+
+    [[ "$address" != *[!0-9.]* && -n "$address" ]] || return 1
+    IFS=. read -r -a octets <<< "$address"
+    [[ "${#octets[@]}" -eq 4 ]] || return 1
+    for octet in "${octets[@]}"; do
+        [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+        (( 10#$octet <= 255 )) || return 1
+    done
+}
+
+if ! [[ "$QB_PORT_RUN" =~ ^[0-9]+$ ]] ||
+   (( QB_PORT_RUN < 1 || QB_PORT_RUN > 65535 )); then
+    echo "Invalid QB_PORT: $QB_PORT_RUN" >&2
+    exit 2
+fi
+
+if ! validate_ipv4 "$VETH_VPN_IP_RUN"; then
+    echo "Invalid VETH_VPN_IP: $VETH_VPN_IP_RUN" >&2
+    exit 2
+fi
+
+if ! validate_ipv4 "$QB_PASSTHROUGH_BIND_RUN"; then
+    echo "Invalid QB_PASSTHROUGH_BIND: $QB_PASSTHROUGH_BIND_RUN" >&2
+    exit 2
+fi
+
+case "$QB_PASSTHROUGH_MODE_RUN" in
+    socat)
+        SOCAT_BIN="$(command -v socat || true)"
+        if [[ -z "$SOCAT_BIN" && -x /usr/bin/socat ]]; then
+            SOCAT_BIN=/usr/bin/socat
+        fi
+        if [[ -z "$SOCAT_BIN" ]]; then
+            echo "socat is required for QB_PASSTHROUGH_MODE=socat" >&2
+            exit 127
+        fi
+
+        KEEPALIVE="keepalive,keepidle=30,keepintvl=10,keepcnt=3"
+        exec "$SOCAT_BIN" \
+          "TCP-LISTEN:${QB_PORT_RUN},bind=${QB_PASSTHROUGH_BIND_RUN},fork,reuseaddr,${KEEPALIVE}" \
+          "TCP:${VETH_VPN_IP_RUN}:${QB_PORT_RUN},${KEEPALIVE}"
+        ;;
+    nginx)
+        NGINX_BIN="$(command -v nginx || true)"
+        if [[ -z "$NGINX_BIN" && -x /usr/sbin/nginx ]]; then
+            NGINX_BIN=/usr/sbin/nginx
+        fi
+        if [[ -z "$NGINX_BIN" ]]; then
+            echo "nginx is required for QB_PASSTHROUGH_MODE=nginx" >&2
+            exit 127
+        fi
+
+        RUNTIME_DIR="${RUNTIME_DIRECTORY:-/run/qbittorrent-passthrough}"
+        NGINX_CONFIG="${RUNTIME_DIR}/nginx.conf"
+        umask 077
+        mkdir -p "${RUNTIME_DIR}/client_temp" "${RUNTIME_DIR}/proxy_temp"
+
+        cat > "$NGINX_CONFIG" <<EOF
+pid ${RUNTIME_DIR}/nginx.pid;
+error_log stderr notice;
+worker_processes 1;
+
+events {
+    worker_connections 256;
+}
+
+http {
+    access_log off;
+    client_body_temp_path ${RUNTIME_DIR}/client_temp;
+    proxy_temp_path ${RUNTIME_DIR}/proxy_temp;
+    keepalive_timeout 75s;
+
+    server {
+        listen ${QB_PASSTHROUGH_BIND_RUN}:${QB_PORT_RUN};
+        client_max_body_size 64m;
+
+        location / {
+            proxy_pass http://${VETH_VPN_IP_RUN}:${QB_PORT_RUN};
+            proxy_http_version 1.1;
+            proxy_set_header Connection close;
+            proxy_set_header Host ${VETH_VPN_IP_RUN}:${QB_PORT_RUN};
+            proxy_request_buffering off;
+            proxy_buffering off;
+            proxy_connect_timeout 5s;
+            proxy_send_timeout 100s;
+            proxy_read_timeout 100s;
+        }
+    }
+}
+EOF
+
+        exec "$NGINX_BIN" -e stderr -c "$NGINX_CONFIG" -g 'daemon off;'
+        ;;
+    *)
+        echo "Unsupported QB_PASSTHROUGH_MODE: $QB_PASSTHROUGH_MODE_RUN (use socat or nginx)" >&2
+        exit 2
+        ;;
+esac
+'''
+
+
+def _qbittorrent_passthrough_service_content() -> str:
+    """Render the systemd unit for the managed passthrough wrapper."""
+    return """[Unit]
+Description=qBittorrent passthrough (host to VPN namespace)
+After=qbittorrent-mole.service
+BindsTo=qbittorrent-mole.service
+
+[Service]
+Type=simple
+DynamicUser=yes
+Environment=QB_PORT=8080
+Environment=VETH_VPN_IP=10.200.200.2
+Environment=QB_PASSTHROUGH_BIND=127.0.0.1
+Environment=QB_PASSTHROUGH_MODE=socat
+EnvironmentFile=-/etc/mole/config
+RuntimeDirectory=qbittorrent-passthrough
+RuntimeDirectoryMode=0750
+ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def _qbittorrent_setup_services(enable_passthrough: bool = False, verbose: bool = True) -> bool:
     """Setup qBittorrent wrapper scripts and systemd service files.
 
@@ -416,31 +594,7 @@ exec /usr/bin/ip netns exec "$NETNS" sudo -u "$QB_USER_RUN" /usr/bin/qbittorrent
 
     # Create passthrough wrapper script
     pt_wrapper = lib_dir / "qbittorrent-passthrough.sh"
-    pt_wrapper_content = '''#!/bin/bash
-# qBittorrent passthrough wrapper - reads config at runtime
-set -e
-
-CONFIG_FILE="${MOLE_CONFIG:-/etc/mole/config}"
-
-if [[ -f "$CONFIG_FILE" ]]; then
-    source "$CONFIG_FILE"
-fi
-
-QB_PORT_RUN="${QB_PORT:-8080}"
-VETH_VPN_IP_RUN="${VETH_VPN_IP:-10.200.200.2}"
-QB_PASSTHROUGH_BIND_RUN="${QB_PASSTHROUGH_BIND:-127.0.0.1}"
-
-# Keepalive options: probes start after 30 s idle, retry every 10 s, give up
-# after 3 misses (60 s total).  Applied to both sides so that when qBittorrent
-# closes an idle HTTP connection the OS detects it promptly and socat propagates
-# the close to the client side — preventing clients (e.g. Sonarr/Radarr) from
-# reusing a dead pooled connection and receiving a spurious RST.
-KEEPALIVE="keepalive,keepidle=30,keepintvl=10,keepcnt=3"
-
-exec /usr/bin/socat \
-  "TCP-LISTEN:${QB_PORT_RUN},bind=${QB_PASSTHROUGH_BIND_RUN},fork,reuseaddr,${KEEPALIVE}" \
-  "TCP:${VETH_VPN_IP_RUN}:${QB_PORT_RUN},${KEEPALIVE}"
-'''
+    pt_wrapper_content = _qbittorrent_passthrough_wrapper_content()
     pt_wrapper.write_text(pt_wrapper_content)
     pt_wrapper.chmod(0o755)
     if verbose:
@@ -468,30 +622,24 @@ WantedBy=multi-user.target
 
     # Create passthrough service if requested
     if enable_passthrough:
-        result = subprocess.run(["which", "socat"], capture_output=True)
-        if result.returncode != 0:
+        config = Config()
+        try:
+            dependency = _qbittorrent_passthrough_dependency(config)
+        except ValueError as exc:
             if verbose:
-                print("  Warning: socat not installed, skipping passthrough service")
+                print(f"  Error: {exc}")
+            return False
+
+        if _qbittorrent_passthrough_executable(config) is None:
+            if verbose:
+                print(
+                    f"  Error: {dependency} is not installed "
+                    f"(required for QB_PASSTHROUGH_MODE={config.qb_passthrough_mode})"
+                )
+            return False
         else:
             pt_service = Path("/etc/systemd/system/qbittorrent-passthrough.service")
-            pt_service_content = """[Unit]
-Description=qBittorrent passthrough (host → VPN namespace)
-After=qbittorrent-mole.service
-BindsTo=qbittorrent-mole.service
-
-[Service]
-Type=simple
-# Defaults first, then config overrides — order matters in systemd.
-Environment=QB_PORT=10048
-Environment=VETH_VPN_IP=10.200.200.2
-Environment=QB_PASSTHROUGH_BIND=127.0.0.1
-EnvironmentFile=-/etc/mole/config
-ExecStart=/usr/bin/socat TCP-LISTEN:${QB_PORT},bind=${QB_PASSTHROUGH_BIND},fork,reuseaddr,keepalive,keepidle=30,keepintvl=10,keepcnt=3 TCP:${VETH_VPN_IP}:${QB_PORT},keepalive,keepidle=30,keepintvl=10,keepcnt=3
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-"""
+            pt_service_content = _qbittorrent_passthrough_service_content()
             pt_service.write_text(pt_service_content)
             if verbose:
                 print(f"  Created: {pt_service}")
@@ -890,6 +1038,7 @@ TORRENT_CLIENT={torrent_client}
     if torrent_client == "qbittorrent":
         config_content += f"""QB_PORT={qb_port}
 QB_USER={qb_user}
+QB_PASSTHROUGH_MODE=socat
 """
 
     if dot_enabled:
@@ -1020,10 +1169,13 @@ HTTP_API_ENABLED=false
 
                 passthrough_response = input(f"Also make it accessible at http://localhost:{qb_port}? [Y/n]: ").strip().lower()
                 if passthrough_response in ('', 'y', 'yes'):
-                    socat_result = subprocess.run(["which", "socat"], capture_output=True)
-                    if socat_result.returncode != 0:
-                        print("\n  socat is not installed (needed for localhost passthrough)")
-                        print("  Install with: sudo apt install socat")
+                    dependency = _qbittorrent_passthrough_dependency(config)
+                    if _qbittorrent_passthrough_executable(config) is None:
+                        print(
+                            f"\n  {dependency} is not installed "
+                            f"(needed for {config.qb_passthrough_mode} passthrough)"
+                        )
+                        print(f"  Install with: sudo apt install {dependency}")
                     else:
                         enable_passthrough = True
 
@@ -2083,13 +2235,16 @@ def _qbittorrent_status():
             capture_output=True, text=True
         )
         if pt_result.stdout.strip() == "active":
-            print(f"        http://localhost:{qb_port} (passthrough active)")
+            print(
+                f"        http://{config.qb_passthrough_bind}:{qb_port} "
+                f"(passthrough active, mode: {config.qb_passthrough_mode})"
+            )
 
     return 0
 
 
 def _qbittorrent_passthrough(args):
-    """Enable localhost passthrough for qBittorrent Web UI"""
+    """Reconcile and enable the configured qBittorrent passthrough."""
     print(f"MOLE v{__version__} - qBittorrent Passthrough")
     print("=" * 50)
 
@@ -2097,35 +2252,49 @@ def _qbittorrent_passthrough(args):
         print("Error: passthrough must be run as root")
         return 1
 
-    result = subprocess.run(["which", "socat"], capture_output=True)
-    if result.returncode != 0:
-        print("Error: socat is not installed")
-        print("Install with: sudo apt install socat")
+    config = Config()
+    try:
+        dependency = _qbittorrent_passthrough_dependency(config)
+    except ValueError as exc:
+        print(f"Error: {exc}")
         return 1
 
-    config = Config()
-    pt_path = Path("/etc/systemd/system/qbittorrent-passthrough.service")
-
-    if pt_path.exists():
-        print(f"Passthrough service already exists")
-        result = subprocess.run(
-            ["systemctl", "is-active", "qbittorrent-passthrough"],
-            capture_output=True, text=True
+    if _qbittorrent_passthrough_executable(config) is None:
+        print(
+            f"Error: {dependency} is not installed "
+            f"(required for QB_PASSTHROUGH_MODE={config.qb_passthrough_mode})"
         )
-        if result.stdout.strip() != "active":
-            response = input("Start it? [Y/n]: ").strip().lower()
-            if response in ('', 'y', 'yes'):
-                subprocess.run(["systemctl", "start", "qbittorrent-passthrough"], check=False)
-        return 0
+        print(f"Install with: sudo apt install {dependency}")
+        return 1
 
-    print(f"Creating localhost passthrough for port {config.qb_port}...")
-    _qbittorrent_setup_services(enable_passthrough=True, verbose=True)
+    was_active = subprocess.run(
+        ["systemctl", "is-active", "qbittorrent-passthrough"],
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "active"
+
+    print(
+        f"Reconciling {config.qb_passthrough_mode} passthrough at "
+        f"{config.qb_passthrough_bind}:{config.qb_port}..."
+    )
+    if not _qbittorrent_setup_services(enable_passthrough=True, verbose=True):
+        return 1
 
     subprocess.run(["systemctl", "enable", "qbittorrent-passthrough"], check=False)
-    subprocess.run(["systemctl", "start", "qbittorrent-passthrough"], check=False)
+    action = "restart" if was_active else "start"
+    result = subprocess.run(
+        ["systemctl", action, "qbittorrent-passthrough"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        print(f"Error: failed to {action} qbittorrent-passthrough")
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        return 1
 
-    print(f"\nPassthrough enabled!")
-    print(f"qBittorrent Web UI: http://localhost:{config.qb_port}")
+    print(f"\nPassthrough enabled (mode: {config.qb_passthrough_mode})")
+    print(f"qBittorrent Web UI: http://{config.qb_passthrough_bind}:{config.qb_port}")
 
     return 0
 

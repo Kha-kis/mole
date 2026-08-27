@@ -151,13 +151,15 @@ class Config:
 
     @property
     def qb_passthrough_bind(self) -> str:
-        # Address the passthrough socat listener binds on.  Default 127.0.0.1
-        # (host-only).  Set to the Docker bridge gateway (e.g. 172.24.0.1) to
-        # allow containers on that bridge to connect directly, which eliminates
-        # the stale-connection RSTs seen in Sonarr/Radarr/Lidarr when the
-        # download-monitoring poll interval exceeds qBittorrent's HTTP
-        # keep-alive timeout.
+        # Address the passthrough listener binds on. Default 127.0.0.1
+        # (host-only). Set to a Docker bridge gateway to allow containers on
+        # that bridge to connect directly.
         return self.get('QB_PASSTHROUGH_BIND', '127.0.0.1')
+
+    @property
+    def qb_passthrough_mode(self) -> str:
+        """Passthrough implementation used for qBittorrent's Web API."""
+        return self.get('QB_PASSTHROUGH_MODE', 'socat').strip().lower()
 
     @property
     def qb_api_timeout(self) -> int:
@@ -626,6 +628,13 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         qb_url = config.qb_api_url
         if not qb_url.startswith('http'):
             errors.append(f"QB_API_URL must start with http:// or https://")
+
+        supported_passthrough_modes = ['socat', 'nginx']
+        if config.qb_passthrough_mode not in supported_passthrough_modes:
+            errors.append(
+                f"QB_PASSTHROUGH_MODE '{config.qb_passthrough_mode}' is not supported. "
+                f"Use: {', '.join(supported_passthrough_modes)}"
+            )
 
     # Check provider is supported
     supported_providers = ['pia', 'proton', 'protonvpn']

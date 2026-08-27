@@ -356,13 +356,35 @@ sudo mole qbittorrent enable   # Enable on boot
 sudo mole qbittorrent disable  # Disable on boot
 ```
 
-### Localhost Access
+### Host and Container Access
 
 By default, qBittorrent is accessible at `http://10.200.200.2:8080`. To also access it at `http://localhost:8080`:
 
 ```bash
 sudo mole qbittorrent passthrough
 ```
+
+The passthrough defaults to the backward-compatible raw TCP relay:
+
+```bash
+QB_PASSTHROUGH_MODE=socat
+QB_PASSTHROUGH_BIND=127.0.0.1
+```
+
+For Sonarr, Radarr, Lidarr, or other clients that pool HTTP connections, use the HTTP-aware Nginx mode. qBittorrent has a short Web API keep-alive timeout; Nginx keeps the downstream client connection valid while closing each upstream qBittorrent connection cleanly.
+
+```bash
+# /etc/mole/config
+QB_PASSTHROUGH_MODE=nginx
+QB_PASSTHROUGH_BIND=172.24.0.1  # Example Docker bridge gateway
+
+sudo apt install nginx
+sudo mole qbittorrent passthrough
+```
+
+The command reconciles the managed wrapper and unit, then restarts only `qbittorrent-passthrough.service`. It does not restart MOLE, WireGuard, or qBittorrent. MOLE runs an isolated Nginx process and does not modify the host's normal Nginx site configuration.
+
+To roll back, set `QB_PASSTHROUGH_MODE=socat` and rerun `sudo mole qbittorrent passthrough`. The listener address and port remain unchanged.
 
 ## Running Other Applications Through VPN
 
