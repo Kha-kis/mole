@@ -3,6 +3,7 @@ MOLE qBittorrent Service - Torrent client integration
 """
 
 import asyncio
+import base64
 import json
 import socket
 import urllib.error
@@ -51,10 +52,40 @@ class TorrentClient(ABC):
 class QBittorrentClient(TorrentClient):
     """qBittorrent client integration"""
 
+    def _request(
+        self,
+        url: str,
+        data: Optional[bytes] = None,
+        method: Optional[str] = None,
+    ) -> urllib.request.Request:
+        """Build a qBittorrent request with optional file-backed Basic auth."""
+        request = urllib.request.Request(url, data=data, method=method)
+        auth_file = getattr(self.config, "qb_api_auth_file", "")
+        if not isinstance(auth_file, str) or not auth_file:
+            return request
+
+        try:
+            with open(auth_file, encoding="utf-8") as handle:
+                credential = handle.readline().rstrip("\r\n")
+        except OSError as exc:
+            raise RuntimeError(
+                "qBittorrent API credential file is not readable"
+            ) from exc
+
+        username, separator, password = credential.partition(":")
+        if not separator or not username or not password:
+            raise ValueError(
+                "qBittorrent API credential file must contain username:password"
+            )
+
+        token = base64.b64encode(credential.encode("utf-8")).decode("ascii")
+        request.add_header("Authorization", f"Basic {token}")
+        return request
+
     async def get_listen_port(self) -> Optional[int]:
         try:
             with urllib.request.urlopen(
-                f"{self.config.qb_api_url}/preferences",
+                self._request(f"{self.config.qb_api_url}/preferences"),
                 timeout=self.config.qb_api_timeout,
             ) as resp:
                 prefs = json.loads(resp.read().decode())
@@ -87,7 +118,9 @@ class QBittorrentClient(TorrentClient):
 
         for attempt in (1, 2):
             try:
-                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                with urllib.request.urlopen(
+                    self._request(url), timeout=timeout
+                ) as resp:
                     info = json.loads(resp.read().decode())
                     return info.get("connection_status")
             except Exception as e:
@@ -109,7 +142,7 @@ class QBittorrentClient(TorrentClient):
             data = urllib.parse.urlencode({
                 "json": json.dumps({"listen_port": port - 1})
             }).encode()
-            req = urllib.request.Request(
+            req = self._request(
                 f"{self.config.qb_api_url}/setPreferences",
                 data=data, method="POST"
             )
@@ -121,7 +154,7 @@ class QBittorrentClient(TorrentClient):
             data = urllib.parse.urlencode({
                 "json": json.dumps({"listen_port": port})
             }).encode()
-            req = urllib.request.Request(
+            req = self._request(
                 f"{self.config.qb_api_url}/setPreferences",
                 data=data, method="POST"
             )
@@ -155,7 +188,7 @@ class QBittorrentClient(TorrentClient):
                 "json": json.dumps({"listen_port": port})
             }).encode()
 
-            req = urllib.request.Request(
+            req = self._request(
                 f"{self.config.qb_api_url}/setPreferences",
                 data=data, method="POST"
             )
@@ -188,7 +221,8 @@ class QBittorrentClient(TorrentClient):
         try:
             # Get current settings
             with urllib.request.urlopen(
-                f"{self.config.qb_api_url}/preferences", timeout=self.config.qb_api_timeout
+                self._request(f"{self.config.qb_api_url}/preferences"),
+                timeout=self.config.qb_api_timeout,
             ) as resp:
                 prefs = json.loads(resp.read().decode())
 
@@ -209,7 +243,7 @@ class QBittorrentClient(TorrentClient):
                 })
             }).encode()
 
-            req = urllib.request.Request(
+            req = self._request(
                 f"{self.config.qb_api_url}/setPreferences",
                 data=data, method="POST"
             )

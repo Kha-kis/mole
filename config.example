@@ -124,6 +124,11 @@ QB_PORT=8080
 # Legacy option: qBittorrent Web API URL (QB_PORT is preferred)
 # QB_API_URL=http://localhost:8080/api/v2/app
 
+# Optional file containing one username:password line for MOLE's own
+# qBittorrent API requests. If omitted, MOLE falls back to
+# QB_PASSTHROUGH_UPSTREAM_AUTH_FILE when that setting is present.
+# QB_API_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
+
 # qBittorrent WebUI request timeout in seconds (default: 15).
 # The WebUI is single-threaded for some operations and at high torrent
 # counts (10k+) can pause for several seconds during internal sweeps.
@@ -148,10 +153,20 @@ QB_PORT=8080
 #                    machines to reach the API
 #   0.0.0.0          All interfaces (Docker + LAN + host)
 #
-# Security note: qBittorrent's AuthSubnetWhitelist bypasses the WebUI
-# login for subnets you list there. Binding to a LAN or all-interfaces
-# address is safe only if that whitelist matches your trust boundary.
+# Security note: binding on a Docker or LAN address makes this listener
+# reachable by every host on that network unless an allowlist is configured.
 # QB_PASSTHROUGH_BIND=127.0.0.1
+
+# Optional comma- or space-separated IPv4 source allowlist for Nginx mode.
+# Nginx emits "deny all" after these entries. Prefer a dedicated Docker
+# network whose only members are authorized qBittorrent API clients.
+# QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24
+
+# Optional file containing one username:password line. In Nginx mode, MOLE
+# converts it to an upstream Basic Authorization header so qBittorrent's broad
+# subnet authentication bypass can remain disabled. Keep the file mode 0640 or
+# stricter and readable only by the passthrough service account.
+# QB_PASSTHROUGH_UPSTREAM_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
 
 # ═══════════════════════════════════════════════════════════════════
 # Timing Settings (in seconds)
