@@ -51,6 +51,75 @@ class TestPassthroughConfig(unittest.TestCase):
             issues,
         )
 
+    def test_security_options_default_to_disabled(self):
+        config = self._config("")
+        self.assertEqual(config.qb_passthrough_allowed_cidrs, "")
+        self.assertEqual(config.qb_passthrough_upstream_auth_file, "")
+
+    def test_security_options_are_loaded(self):
+        config = self._config(
+            "QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24, 172.26.0.10/32\n"
+            "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth\n"
+        )
+        self.assertEqual(
+            config.qb_passthrough_allowed_cidrs,
+            "172.26.0.0/24, 172.26.0.10/32",
+        )
+        self.assertEqual(
+            config.qb_passthrough_upstream_auth_file,
+            "/etc/mole/qbittorrent-upstream.auth",
+        )
+        self.assertEqual(
+            config.qb_api_auth_file,
+            "/etc/mole/qbittorrent-upstream.auth",
+        )
+
+    def test_malformed_api_auth_file_fails_validation(self):
+        auth_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        auth_file.write("missing-password-separator\n")
+        auth_file.close()
+        self.addCleanup(os.unlink, auth_file.name)
+
+        config_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        config_file.write(
+            "VPN_PROVIDER=pia\n"
+            "PIA_USER=test\n"
+            "PIA_PASS=test\n"
+            f"QB_API_AUTH_FILE={auth_file.name}\n"
+        )
+        config_file.close()
+        self.addCleanup(os.unlink, config_file.name)
+
+        _, issues = validate_config(config_file.name)
+
+        self.assertTrue(
+            any("QB_API_AUTH_FILE" in issue and "username:password" in issue for issue in issues),
+            issues,
+        )
+
+    def test_invalid_allowed_cidr_fails_validation(self):
+        handle = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        handle.write(
+            "VPN_PROVIDER=pia\n"
+            "PIA_USER=test\n"
+            "PIA_PASS=test\n"
+            "QB_PASSTHROUGH_MODE=nginx\n"
+            "QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24,not-a-subnet\n"
+        )
+        handle.close()
+        self.addCleanup(os.unlink, handle.name)
+
+        _, issues = validate_config(handle.name)
+
+        self.assertTrue(
+            any(
+                "QB_PASSTHROUGH_ALLOWED_CIDRS" in issue
+                and "not-a-subnet" in issue
+                for issue in issues
+            ),
+            issues,
+        )
+
 
 class TestPassthroughArtifacts(unittest.TestCase):
     def test_dependency_matches_mode(self):
@@ -101,6 +170,84 @@ class TestPassthroughArtifacts(unittest.TestCase):
         self.assertIn("daemon off;", wrapper)
         self.assertIn("error_log stderr notice;", wrapper)
         self.assertIn("access_log off;", wrapper)
+
+    def test_nginx_mode_renders_allowlist_and_upstream_basic_auth(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            wrapper = root / "passthrough.sh"
+            config = root / "mole.conf"
+            auth_file = root / "qbit.auth"
+            bin_dir = root / "bin"
+            runtime_dir = root / "run"
+            bin_dir.mkdir()
+            runtime_dir.mkdir()
+
+            wrapper.write_text(_qbittorrent_passthrough_wrapper_content())
+            wrapper.chmod(0o755)
+            auth_file.write_text("service-user:correct horse battery staple\n")
+            config.write_text(
+                "QB_PORT=10048\n"
+                "VETH_VPN_IP=10.200.200.2\n"
+                "QB_PASSTHROUGH_BIND=172.26.0.1\n"
+                "QB_PASSTHROUGH_MODE=nginx\n"
+                "QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24,172.26.1.10/32\n"
+                f"QB_PASSTHROUGH_UPSTREAM_AUTH_FILE={auth_file}\n"
+            )
+
+            fake_nginx = bin_dir / "nginx"
+            fake_nginx.write_text(
+                "#!/bin/bash\n"
+                "while [[ $# -gt 0 ]]; do\n"
+                "  if [[ $1 == -c ]]; then cat \"$2\"; exit 0; fi\n"
+                "  shift\n"
+                "done\n"
+                "exit 1\n"
+            )
+            fake_nginx.chmod(0o755)
+
+            result = subprocess.run(
+                [str(wrapper)],
+                capture_output=True,
+                text=True,
+                env={
+                    "MOLE_CONFIG": str(config),
+                    "RUNTIME_DIRECTORY": str(runtime_dir),
+                    "PATH": f"{bin_dir}:/usr/bin:/bin",
+                },
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("allow 172.26.0.0/24;", result.stdout)
+            self.assertIn("allow 172.26.1.10/32;", result.stdout)
+            self.assertIn("deny all;", result.stdout)
+            self.assertIn("proxy_set_header Authorization \"Basic ", result.stdout)
+            self.assertNotIn("correct horse battery staple", result.stdout)
+
+    def test_nginx_mode_rejects_invalid_runtime_cidr(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            wrapper = root / "passthrough.sh"
+            config = root / "mole.conf"
+            wrapper.write_text(_qbittorrent_passthrough_wrapper_content())
+            wrapper.chmod(0o755)
+            config.write_text(
+                "QB_PASSTHROUGH_MODE=nginx\n"
+                "QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/99\n"
+            )
+
+            result = subprocess.run(
+                [str(wrapper)],
+                capture_output=True,
+                text=True,
+                env={
+                    "MOLE_CONFIG": str(config),
+                    "RUNTIME_DIRECTORY": str(root / "run"),
+                    "PATH": "/usr/bin:/bin",
+                },
+            )
+
+            self.assertEqual(result.returncode, 2)
+            self.assertIn("Invalid QB_PASSTHROUGH_ALLOWED_CIDRS", result.stderr)
 
     def test_nginx_mode_renders_runtime_config_with_selected_addresses(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -155,6 +302,32 @@ class TestPassthroughArtifacts(unittest.TestCase):
         self.assertIn("RuntimeDirectory=qbittorrent-passthrough", service)
         self.assertIn("ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh", service)
         self.assertNotIn("ExecStart=/usr/bin/socat", service)
+
+    def test_service_applies_security_sandbox(self):
+        service = _qbittorrent_passthrough_service_content()
+        required_directives = (
+            "NoNewPrivileges=yes",
+            "PrivateDevices=yes",
+            "ProtectSystem=strict",
+            "ProtectHome=yes",
+            "ProtectKernelTunables=yes",
+            "ProtectKernelModules=yes",
+            "ProtectControlGroups=yes",
+            "ProtectKernelLogs=yes",
+            "ProtectClock=yes",
+            "ProtectHostname=yes",
+            "RestrictSUIDSGID=yes",
+            "LockPersonality=yes",
+            "MemoryDenyWriteExecute=yes",
+            "RestrictRealtime=yes",
+            "RestrictNamespaces=yes",
+            "SystemCallArchitectures=native",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
+            "CapabilityBoundingSet=",
+            "UMask=0077",
+        )
+        for directive in required_directives:
+            self.assertIn(directive, service)
 
 
 class TestPassthroughReconciliation(unittest.TestCase):

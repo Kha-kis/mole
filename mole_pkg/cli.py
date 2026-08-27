@@ -419,6 +419,8 @@ VETH_VPN_IP_RUN="${VETH_VPN_IP:-10.200.200.2}"
 QB_PASSTHROUGH_BIND_RUN="${QB_PASSTHROUGH_BIND:-127.0.0.1}"
 QB_PASSTHROUGH_MODE_RUN="${QB_PASSTHROUGH_MODE:-socat}"
 QB_PASSTHROUGH_MODE_RUN="${QB_PASSTHROUGH_MODE_RUN,,}"
+QB_PASSTHROUGH_ALLOWED_CIDRS_RUN="${QB_PASSTHROUGH_ALLOWED_CIDRS:-}"
+QB_PASSTHROUGH_UPSTREAM_AUTH_FILE_RUN="${QB_PASSTHROUGH_UPSTREAM_AUTH_FILE:-}"
 
 validate_ipv4() {
     local address="$1"
@@ -432,6 +434,18 @@ validate_ipv4() {
         [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
         (( 10#$octet <= 255 )) || return 1
     done
+}
+
+validate_ipv4_cidr() {
+    local cidr="$1"
+    local address="${cidr%%/*}"
+    local prefix
+
+    [[ "$cidr" == */* ]] || return 1
+    prefix="${cidr##*/}"
+    validate_ipv4 "$address" || return 1
+    [[ "$prefix" =~ ^[0-9]{1,2}$ ]] || return 1
+    (( 10#$prefix <= 32 )) || return 1
 }
 
 if ! [[ "$QB_PORT_RUN" =~ ^[0-9]+$ ]] ||
@@ -478,8 +492,39 @@ case "$QB_PASSTHROUGH_MODE_RUN" in
 
         RUNTIME_DIR="${RUNTIME_DIRECTORY:-/run/qbittorrent-passthrough}"
         NGINX_CONFIG="${RUNTIME_DIR}/nginx.conf"
+        NGINX_ALLOW_DIRECTIVES=""
+        NGINX_AUTH_DIRECTIVE=""
         umask 077
         mkdir -p "${RUNTIME_DIR}/client_temp" "${RUNTIME_DIR}/proxy_temp"
+
+        if [[ -n "$QB_PASSTHROUGH_ALLOWED_CIDRS_RUN" ]]; then
+            NORMALIZED_ALLOWED_CIDRS="${QB_PASSTHROUGH_ALLOWED_CIDRS_RUN//,/ }"
+            read -r -a ALLOWED_CIDRS <<< "$NORMALIZED_ALLOWED_CIDRS"
+            for cidr in "${ALLOWED_CIDRS[@]}"; do
+                if ! validate_ipv4_cidr "$cidr"; then
+                    echo "Invalid QB_PASSTHROUGH_ALLOWED_CIDRS entry: $cidr" >&2
+                    exit 2
+                fi
+                NGINX_ALLOW_DIRECTIVES+="            allow ${cidr};"$'\n'
+            done
+            NGINX_ALLOW_DIRECTIVES+="            deny all;"$'\n'
+        fi
+
+        if [[ -n "$QB_PASSTHROUGH_UPSTREAM_AUTH_FILE_RUN" ]]; then
+            if [[ ! -r "$QB_PASSTHROUGH_UPSTREAM_AUTH_FILE_RUN" ]]; then
+                echo "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE is not readable" >&2
+                exit 2
+            fi
+            IFS= read -r UPSTREAM_AUTH < "$QB_PASSTHROUGH_UPSTREAM_AUTH_FILE_RUN" || true
+            if [[ "$UPSTREAM_AUTH" != *:* || -z "${UPSTREAM_AUTH%%:*}" || -z "${UPSTREAM_AUTH#*:}" ]]; then
+                echo "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE must contain username:password" >&2
+                exit 2
+            fi
+            UPSTREAM_AUTH_B64="$(printf '%s' "$UPSTREAM_AUTH" | base64 -w 0)"
+            unset UPSTREAM_AUTH
+            NGINX_AUTH_DIRECTIVE="            proxy_set_header Authorization \\"Basic ${UPSTREAM_AUTH_B64}\\";"
+            unset UPSTREAM_AUTH_B64
+        fi
 
         cat > "$NGINX_CONFIG" <<EOF
 pid ${RUNTIME_DIR}/nginx.pid;
@@ -501,6 +546,7 @@ http {
         client_max_body_size 64m;
 
         location / {
+${NGINX_ALLOW_DIRECTIVES}${NGINX_AUTH_DIRECTIVE}
             proxy_pass http://${VETH_VPN_IP_RUN}:${QB_PORT_RUN};
             proxy_http_version 1.1;
             proxy_set_header Connection close;
@@ -544,6 +590,28 @@ RuntimeDirectory=qbittorrent-passthrough
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh
 Restart=on-failure
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+CapabilityBoundingSet=
+ProtectProc=invisible
+ProcSubset=pid
 
 [Install]
 WantedBy=multi-user.target

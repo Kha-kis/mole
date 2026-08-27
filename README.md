@@ -192,6 +192,8 @@ HOST_INTERFACE=eth0
 TORRENT_CLIENT=qbittorrent
 QB_PORT=8080
 QB_USER=youruser
+# File-backed Basic auth for MOLE's qBittorrent API updates
+# QB_API_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
 
 # qBittorrent WebUI request timeout in seconds (default: 15)
 # Raise this if you have many torrents (10k+) and see repeated
@@ -381,6 +383,33 @@ QB_PASSTHROUGH_BIND=172.24.0.1  # Example Docker bridge gateway
 sudo apt install nginx
 sudo mole qbittorrent passthrough
 ```
+
+For a production bridge listener, restrict sources and authenticate every
+upstream request. The strongest layout uses a dedicated Docker network that
+contains only qBittorrent API clients:
+
+```bash
+# /etc/mole/config
+QB_PASSTHROUGH_MODE=nginx
+QB_PASSTHROUGH_BIND=172.26.0.1
+QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24
+QB_PASSTHROUGH_UPSTREAM_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
+QB_API_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
+
+# One username:password line; do not commit this file.
+sudo install -o root -g qbit-pt -m 0640 /dev/null /etc/mole/qbittorrent-upstream.auth
+sudoedit /etc/mole/qbittorrent-upstream.auth
+
+sudo mole qbittorrent passthrough
+```
+
+The allowlist ends with `deny all`. The credential is encoded only in the
+private runtime Nginx configuration and is never written to the repository or
+service environment. `QB_API_AUTH_FILE` also authenticates MOLE's direct API
+calls that maintain qBittorrent's interface and forwarded port. Once clients
+use this proxy, disable qBittorrent's local and subnet authentication bypasses.
+TLS is optional for a host-local Docker bridge; authentication and network
+membership remain mandatory.
 
 The command reconciles the managed wrapper and unit, then restarts only `qbittorrent-passthrough.service`. It does not restart MOLE, WireGuard, or qBittorrent. MOLE runs an isolated Nginx process and does not modify the host's normal Nginx site configuration.
 
