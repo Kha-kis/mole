@@ -71,6 +71,7 @@ PORT_FORWARD=true
 TORRENT_CLIENT=qbittorrent
 QB_PORT=9000
 QB_USER=testqb
+QB_API_AUTH_FILE=/etc/mole/qbittorrent.auth
 RENEWAL_INTERVAL=3600
 KEEPALIVE_INTERVAL=300
 WATCHDOG_INTERVAL=30
@@ -112,6 +113,12 @@ HTTP_API_KEY=testapikey
 
     def test_qb_user(self):
         self.assertEqual(self.config.qb_user, 'testqb')
+
+    def test_qb_api_auth_file(self):
+        self.assertEqual(
+            self.config.qb_api_auth_file,
+            '/etc/mole/qbittorrent.auth',
+        )
 
     def test_renewal_interval(self):
         self.assertEqual(self.config.renewal_interval, 3600)

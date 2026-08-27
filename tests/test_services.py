@@ -3,6 +3,9 @@ Tests for mole_pkg.services module
 """
 
 import unittest
+import base64
+import os
+import tempfile
 from unittest.mock import Mock, patch, MagicMock
 
 
@@ -42,6 +45,41 @@ class TestQBittorrentClient(unittest.TestCase):
 
         client = QBittorrentClient(mock_config)
         self.assertEqual(client.config, mock_config)
+
+    def test_request_uses_basic_auth_file(self):
+        from mole_pkg.services import QBittorrentClient
+
+        with tempfile.NamedTemporaryFile(mode="w", delete=False) as auth_file:
+            auth_file.write("mole-user:mole-password\n")
+            auth_path = auth_file.name
+
+        try:
+            config = Mock()
+            config.qb_api_auth_file = auth_path
+            client = QBittorrentClient(config)
+
+            request = client._request("http://qbit.test/api/v2/app/version")
+
+            expected = base64.b64encode(
+                b"mole-user:mole-password"
+            ).decode("ascii")
+            self.assertEqual(
+                request.get_header("Authorization"),
+                f"Basic {expected}",
+            )
+        finally:
+            os.unlink(auth_path)
+
+    def test_request_without_auth_file_has_no_authorization_header(self):
+        from mole_pkg.services import QBittorrentClient
+
+        config = Mock()
+        config.qb_api_auth_file = ""
+        request = QBittorrentClient(config)._request(
+            "http://qbit.test/api/v2/app/version"
+        )
+
+        self.assertIsNone(request.get_header("Authorization"))
 
 
 class TestQBittorrentConnectionStatusRetry(unittest.IsolatedAsyncioTestCase):

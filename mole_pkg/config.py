@@ -2,6 +2,7 @@
 MOLE Configuration Management
 """
 
+import ipaddress
 import os
 import re
 import subprocess
@@ -150,6 +151,14 @@ class Config:
         return self.get('QB_USER', '')
 
     @property
+    def qb_api_auth_file(self) -> str:
+        """File containing Basic credentials for Mole's qBittorrent API calls."""
+        return self.get(
+            'QB_API_AUTH_FILE',
+            self.qb_passthrough_upstream_auth_file,
+        ).strip()
+
+    @property
     def qb_passthrough_bind(self) -> str:
         # Address the passthrough listener binds on. Default 127.0.0.1
         # (host-only). Set to a Docker bridge gateway to allow containers on
@@ -160,6 +169,16 @@ class Config:
     def qb_passthrough_mode(self) -> str:
         """Passthrough implementation used for qBittorrent's Web API."""
         return self.get('QB_PASSTHROUGH_MODE', 'socat').strip().lower()
+
+    @property
+    def qb_passthrough_allowed_cidrs(self) -> str:
+        """Source networks allowed to use the Nginx passthrough."""
+        return self.get('QB_PASSTHROUGH_ALLOWED_CIDRS', '').strip()
+
+    @property
+    def qb_passthrough_upstream_auth_file(self) -> str:
+        """File containing the qBittorrent username and password."""
+        return self.get('QB_PASSTHROUGH_UPSTREAM_AUTH_FILE', '').strip()
 
     @property
     def qb_api_timeout(self) -> int:
@@ -635,6 +654,38 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
                 f"QB_PASSTHROUGH_MODE '{config.qb_passthrough_mode}' is not supported. "
                 f"Use: {', '.join(supported_passthrough_modes)}"
             )
+
+        allowed_cidrs = re.split(
+            r'[,\s]+', config.qb_passthrough_allowed_cidrs
+        )
+        for cidr in filter(None, allowed_cidrs):
+            try:
+                network = ipaddress.ip_network(cidr, strict=False)
+            except ValueError:
+                errors.append(
+                    f"QB_PASSTHROUGH_ALLOWED_CIDRS contains an invalid subnet: {cidr}"
+                )
+                continue
+            if network.version != 4:
+                errors.append(
+                    f"QB_PASSTHROUGH_ALLOWED_CIDRS supports IPv4 subnets only: {cidr}"
+                )
+
+        auth_file = config.qb_api_auth_file
+        if auth_file:
+            try:
+                with open(auth_file, encoding='utf-8') as handle:
+                    credential = handle.readline().rstrip('\r\n')
+            except OSError:
+                errors.append(
+                    f"QB_API_AUTH_FILE is not readable: {auth_file}"
+                )
+            else:
+                username, separator, password = credential.partition(':')
+                if not separator or not username or not password:
+                    errors.append(
+                        "QB_API_AUTH_FILE must contain username:password"
+                    )
 
     # Check provider is supported
     supported_providers = ['pia', 'proton', 'protonvpn']
