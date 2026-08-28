@@ -9,11 +9,13 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from mole_pkg.cli import (
+    _ensure_qbittorrent_passthrough_account,
     _qbittorrent_passthrough,
     _qbittorrent_passthrough_dependency,
     _qbittorrent_passthrough_executable,
     _qbittorrent_passthrough_service_content,
     _qbittorrent_passthrough_wrapper_content,
+    _qbittorrent_setup_services,
 )
 from mole_pkg.config import Config, validate_config
 
@@ -95,6 +97,99 @@ class TestPassthroughConfig(unittest.TestCase):
         self.assertTrue(
             any("QB_API_AUTH_FILE" in issue and "username:password" in issue for issue in issues),
             issues,
+        )
+
+    def test_malformed_distinct_passthrough_auth_file_fails_validation(self):
+        api_auth = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        api_auth.write("api-user:api-password\n")
+        api_auth.close()
+        self.addCleanup(os.unlink, api_auth.name)
+
+        passthrough_auth = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        passthrough_auth.write("missing-password-separator\n")
+        passthrough_auth.close()
+        self.addCleanup(os.unlink, passthrough_auth.name)
+
+        config_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        config_file.write(
+            "VPN_PROVIDER=pia\n"
+            "PIA_USER=test\n"
+            "PIA_PASS=test\n"
+            f"QB_API_AUTH_FILE={api_auth.name}\n"
+            f"QB_PASSTHROUGH_UPSTREAM_AUTH_FILE={passthrough_auth.name}\n"
+        )
+        config_file.close()
+        self.addCleanup(os.unlink, config_file.name)
+
+        _, issues = validate_config(config_file.name)
+
+        self.assertTrue(
+            any(
+                "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE" in issue
+                and "username:password" in issue
+                for issue in issues
+            ),
+            issues,
+        )
+
+    def test_malformed_passthrough_auth_file_names_configured_setting(self):
+        auth_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        auth_file.write("missing-password-separator\n")
+        auth_file.close()
+        self.addCleanup(os.unlink, auth_file.name)
+
+        config_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        config_file.write(
+            "VPN_PROVIDER=pia\n"
+            "PIA_USER=test\n"
+            "PIA_PASS=test\n"
+            f"QB_PASSTHROUGH_UPSTREAM_AUTH_FILE={auth_file.name}\n"
+        )
+        config_file.close()
+        self.addCleanup(os.unlink, config_file.name)
+
+        _, issues = validate_config(config_file.name)
+
+        credential_issues = [
+            issue for issue in issues if "username:password" in issue
+        ]
+        self.assertEqual(
+            credential_issues,
+            [
+                "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE must contain "
+                "username:password"
+            ],
+        )
+
+    def test_explicit_auth_settings_are_validated_independently(self):
+        auth_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        auth_file.write("missing-password-separator\n")
+        auth_file.close()
+        self.addCleanup(os.unlink, auth_file.name)
+
+        config_file = tempfile.NamedTemporaryFile(mode="w", delete=False)
+        config_file.write(
+            "VPN_PROVIDER=pia\n"
+            "PIA_USER=test\n"
+            "PIA_PASS=test\n"
+            f"QB_API_AUTH_FILE={auth_file.name}\n"
+            f"QB_PASSTHROUGH_UPSTREAM_AUTH_FILE={auth_file.name}\n"
+        )
+        config_file.close()
+        self.addCleanup(os.unlink, config_file.name)
+
+        _, issues = validate_config(config_file.name)
+
+        credential_issues = [
+            issue for issue in issues if "username:password" in issue
+        ]
+        self.assertEqual(
+            credential_issues,
+            [
+                "QB_API_AUTH_FILE must contain username:password",
+                "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE must contain "
+                "username:password",
+            ],
         )
 
     def test_invalid_allowed_cidr_fails_validation(self):
@@ -297,8 +392,14 @@ class TestPassthroughArtifacts(unittest.TestCase):
 
     def test_service_executes_wrapper_with_private_runtime_directory(self):
         service = _qbittorrent_passthrough_service_content()
-        self.assertIn("DynamicUser=yes", service)
-        self.assertIn("EnvironmentFile=-/etc/mole/config", service)
+        self.assertIn("User=qbit-pt", service)
+        self.assertIn("Group=qbit-pt", service)
+        self.assertNotIn("DynamicUser=yes", service)
+        self.assertIn(
+            "EnvironmentFile=/etc/mole/qbittorrent-passthrough.env",
+            service,
+        )
+        self.assertNotIn("EnvironmentFile=-/etc/mole/config", service)
         self.assertIn("RuntimeDirectory=qbittorrent-passthrough", service)
         self.assertIn("ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh", service)
         self.assertNotIn("ExecStart=/usr/bin/socat", service)
@@ -328,6 +429,190 @@ class TestPassthroughArtifacts(unittest.TestCase):
         )
         for directive in required_directives:
             self.assertIn(directive, service)
+
+    @patch("mole_pkg.cli.subprocess.run")
+    def test_qbittorrent_service_preserves_shared_download_permissions(
+        self,
+        _mock_run,
+    ):
+        real_path = Path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = real_path(tmpdir)
+            (root / "etc/systemd/system").mkdir(parents=True)
+
+            def redirected_path(path):
+                return root / str(path).lstrip("/")
+
+            with patch("mole_pkg.cli.Path", side_effect=redirected_path):
+                result = _qbittorrent_setup_services(
+                    enable_passthrough=False,
+                    verbose=False,
+                )
+
+            service = (
+                root / "etc/systemd/system/qbittorrent-mole.service"
+            ).read_text()
+
+        self.assertTrue(result)
+        self.assertNotIn("UMask=0077", service)
+
+    @patch("mole_pkg.cli.shutil.chown")
+    @patch("mole_pkg.cli.Config")
+    @patch("mole_pkg.cli.shutil.which", return_value="/usr/sbin/nginx")
+    @patch("mole_pkg.cli.subprocess.run")
+    def test_passthrough_setup_creates_missing_service_account(
+        self,
+        mock_run,
+        _mock_which,
+        mock_config,
+        _mock_chown,
+    ):
+        mock_config.return_value.qb_passthrough_mode = "nginx"
+        mock_config.return_value.qb_port = 10048
+        mock_config.return_value.veth_vpn_ip = "10.200.200.2"
+        mock_config.return_value.qb_passthrough_bind = "172.26.0.1"
+        mock_config.return_value.qb_passthrough_allowed_cidrs = "172.26.0.0/24"
+        mock_config.return_value.qb_passthrough_upstream_auth_file = (
+            "/etc/mole/qbittorrent-upstream.auth"
+        )
+        state = {"group": False, "passwd": False}
+
+        def run_command(command, **_kwargs):
+            if command[:2] == ["getent", "group"]:
+                if state["group"]:
+                    return MagicMock(returncode=0, stdout="qbit-pt:x:986:\n")
+                return MagicMock(returncode=2, stdout="")
+            if command[:2] == ["getent", "passwd"]:
+                if state["passwd"]:
+                    return MagicMock(
+                        returncode=0,
+                        stdout=(
+                            "qbit-pt:x:987:986::/nonexistent:"
+                            "/usr/sbin/nologin\n"
+                        ),
+                    )
+                return MagicMock(returncode=2, stdout="")
+            if command[0] == "groupadd":
+                state["group"] = True
+            if command[0] == "useradd":
+                state["passwd"] = True
+            return MagicMock(returncode=0, stdout="")
+
+        mock_run.side_effect = run_command
+
+        real_path = Path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = real_path(tmpdir)
+            (root / "etc/systemd/system").mkdir(parents=True)
+
+            def redirected_path(path):
+                return root / str(path).lstrip("/")
+
+            with patch("mole_pkg.cli.Path", side_effect=redirected_path):
+                result = _qbittorrent_setup_services(
+                    enable_passthrough=True,
+                    verbose=False,
+                )
+
+            environment_file = root / "etc/mole/qbittorrent-passthrough.env"
+            self.assertTrue(environment_file.exists())
+            environment = environment_file.read_text()
+            environment_mode = environment_file.stat().st_mode & 0o777
+
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        self.assertTrue(result)
+        self.assertEqual(environment_mode, 0o640)
+        self.assertIn("QB_PASSTHROUGH_MODE=nginx", environment)
+        self.assertIn("QB_PASSTHROUGH_ALLOWED_CIDRS=172.26.0.0/24", environment)
+        self.assertIn(
+            "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE="
+            "/etc/mole/qbittorrent-upstream.auth",
+            environment,
+        )
+        self.assertNotIn("PIA_PASS", environment)
+        self.assertNotIn("HTTP_API_KEY", environment)
+        self.assertIn(["groupadd", "--system", "qbit-pt"], commands)
+        self.assertIn(
+            [
+                "useradd",
+                "--system",
+                "--gid",
+                "qbit-pt",
+                "--home-dir",
+                "/nonexistent",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                "qbit-pt",
+            ],
+            commands,
+        )
+
+    @patch("mole_pkg.cli.subprocess.run")
+    def test_existing_service_account_must_be_dedicated(self, mock_run):
+        incompatible_records = (
+            (
+                "qbit-pt:x:986:interactive-user\n",
+                "qbit-pt:x:987:986::/home/qbit-pt:/usr/sbin/nologin\n",
+            ),
+            (
+                "qbit-pt:x:986:\n",
+                "qbit-pt:x:987:986::/home/qbit-pt:/bin/bash\n",
+            ),
+            (
+                "qbit-pt:x:986:\n",
+                "qbit-pt:x:987:999::/home/qbit-pt:/usr/sbin/nologin\n",
+            ),
+        )
+
+        for group_record, user_record in incompatible_records:
+            with self.subTest(
+                group_record=group_record,
+                user_record=user_record,
+            ):
+                mock_run.reset_mock()
+                def run_command(command, **_kwargs):
+                    if command == ["getent", "group", "qbit-pt"]:
+                        return MagicMock(returncode=0, stdout=group_record)
+                    if command == ["getent", "passwd", "qbit-pt"]:
+                        return MagicMock(returncode=0, stdout=user_record)
+                    if command == ["getent", "passwd"]:
+                        return MagicMock(returncode=0, stdout=user_record)
+                    return MagicMock(returncode=1, stdout="")
+
+                mock_run.side_effect = run_command
+
+                self.assertFalse(
+                    _ensure_qbittorrent_passthrough_account(verbose=False)
+                )
+
+    @patch("mole_pkg.cli.subprocess.run")
+    def test_service_group_rejects_other_primary_gid_users(self, mock_run):
+        group_record = "qbit-pt:x:986:\n"
+        user_record = (
+            "qbit-pt:x:987:986::/home/qbit-pt:/usr/sbin/nologin\n"
+        )
+
+        def run_command(command, **_kwargs):
+            if command == ["getent", "group", "qbit-pt"]:
+                return MagicMock(returncode=0, stdout=group_record)
+            if command == ["getent", "passwd", "qbit-pt"]:
+                return MagicMock(returncode=0, stdout=user_record)
+            if command == ["getent", "passwd"]:
+                return MagicMock(
+                    returncode=0,
+                    stdout=(
+                        user_record
+                        + "other-user:x:1501:986::/home/other:/bin/bash\n"
+                    ),
+                )
+            return MagicMock(returncode=1, stdout="")
+
+        mock_run.side_effect = run_command
+
+        self.assertFalse(
+            _ensure_qbittorrent_passthrough_account(verbose=False)
+        )
 
 
 class TestPassthroughReconciliation(unittest.TestCase):

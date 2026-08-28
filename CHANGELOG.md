@@ -10,7 +10,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`QB_PASSTHROUGH_MODE`**: Select `socat` (backward-compatible default) or an isolated, HTTP-aware `nginx` relay for qBittorrent Web API access. Nginx mode prevents Arr clients from reusing connections beyond qBittorrent's upstream HTTP keep-alive lifetime.
 - **`QB_PASSTHROUGH_BIND`**: Configurable bind address for the qBittorrent passthrough listener (default: `127.0.0.1`). Set to your Docker bridge gateway (e.g. `172.24.0.1`) to allow containers on that bridge to connect directly.
+- **`QB_PASSTHROUGH_ALLOWED_CIDRS`**: Optional IPv4 source allowlist for Nginx mode, followed by a default deny rule.
+- **`QB_PASSTHROUGH_UPSTREAM_AUTH_FILE`**: Optional `username:password` file used by Nginx to authenticate upstream requests to qBittorrent 5.2.0 or newer.
+- **`QB_API_AUTH_FILE`**: Optional credential file for MOLE's direct qBittorrent API calls; defaults to the passthrough credential when omitted.
 - **TCP keepalive on socat passthrough**: Both sides of the raw TCP relay set `keepalive,keepidle=30,keepintvl=10,keepcnt=3` to detect dead peers. TCP keepalive does not resolve qBittorrent's shorter HTTP connection lifetime; use `QB_PASSTHROUGH_MODE=nginx` for that case.
+
+### Changed
+- The installer and qBittorrent passthrough setup create a persistent, non-login `qbit-pt` service account so the proxy can read a root-owned credential file without exposing it in the unit environment.
+- The passthrough unit uses `UMask=0077`, applies a restrictive systemd sandbox, and reads runtime settings in its wrapper instead of exporting the full MOLE configuration into the proxy process.
+
+### Security
+- Nginx passthrough mode can combine a dedicated Docker network, source CIDR allowlisting, and upstream qBittorrent Basic authentication so qBittorrent's broad local/subnet authentication bypasses can remain disabled.
 
 ## [0.4.0] - 2026-01-16
 
