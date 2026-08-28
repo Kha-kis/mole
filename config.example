@@ -164,8 +164,9 @@ QB_PORT=8080
 
 # Optional file containing one username:password line. In Nginx mode, MOLE
 # converts it to an upstream Basic Authorization header so qBittorrent's broad
-# subnet authentication bypass can remain disabled. Keep the file mode 0640 or
-# stricter and readable only by the passthrough service account.
+# subnet authentication bypass can remain disabled. This requires qBittorrent
+# 5.2.0 or newer. Keep the file mode 0640 or stricter and readable only by the
+# qbit-pt service account created by install.sh.
 # QB_PASSTHROUGH_UPSTREAM_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
 
 # ═══════════════════════════════════════════════════════════════════

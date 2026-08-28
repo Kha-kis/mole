@@ -162,6 +162,17 @@ fi  # end: dependency check skipped in --upgrade mode
 echo ""
 echo "Installing MOLE..."
 
+# Create and validate the persistent account used by the qBittorrent
+# passthrough. Unlike a systemd DynamicUser, this account can be granted read
+# access to a credential file before the service starts.
+echo -n "  Ensuring qBittorrent passthrough service account... "
+if ! PYTHONPATH="$SCRIPT_DIR" python3 -c \
+    'from mole_pkg.cli import _ensure_qbittorrent_passthrough_account as ensure; raise SystemExit(0 if ensure() else 1)'; then
+    echo -e "${RED}failed${NC}"
+    exit 1
+fi
+echo -e "${GREEN}done${NC}"
+
 # Install Python package — mirror, don't merge.
 # `cp -r src/ dest/` merges into dest, so files removed from the repo
 # stay on disk forever. Use rsync --delete when available; otherwise

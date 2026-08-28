@@ -9,6 +9,7 @@ import concurrent.futures
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -580,12 +581,13 @@ BindsTo=qbittorrent-mole.service
 
 [Service]
 Type=simple
-DynamicUser=yes
+User=qbit-pt
+Group=qbit-pt
 Environment=QB_PORT=8080
 Environment=VETH_VPN_IP=10.200.200.2
 Environment=QB_PASSTHROUGH_BIND=127.0.0.1
 Environment=QB_PASSTHROUGH_MODE=socat
-EnvironmentFile=-/etc/mole/config
+EnvironmentFile=/etc/mole/qbittorrent-passthrough.env
 RuntimeDirectory=qbittorrent-passthrough
 RuntimeDirectoryMode=0750
 ExecStart=/usr/local/lib/mole/qbittorrent-passthrough.sh
@@ -616,6 +618,133 @@ ProcSubset=pid
 [Install]
 WantedBy=multi-user.target
 """
+
+
+def _qbittorrent_passthrough_environment_content(config: Config) -> str:
+    """Render the non-secret settings consumed by the passthrough service."""
+    settings = (
+        ("QB_PORT", config.qb_port),
+        ("VETH_VPN_IP", config.veth_vpn_ip),
+        ("QB_PASSTHROUGH_BIND", config.qb_passthrough_bind),
+        ("QB_PASSTHROUGH_MODE", config.qb_passthrough_mode),
+        (
+            "QB_PASSTHROUGH_ALLOWED_CIDRS",
+            config.qb_passthrough_allowed_cidrs,
+        ),
+        (
+            "QB_PASSTHROUGH_UPSTREAM_AUTH_FILE",
+            config.qb_passthrough_upstream_auth_file,
+        ),
+    )
+    return "".join(
+        f"{key}={shlex.quote(str(value))}\n" for key, value in settings
+    )
+
+
+def _ensure_qbittorrent_passthrough_account(verbose: bool = True) -> bool:
+    """Create the persistent account used to read passthrough credentials."""
+    def lookup(database: str) -> Optional[str]:
+        result = subprocess.run(
+            ["getent", database, "qbit-pt"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if result.returncode != 0:
+            return None
+        return result.stdout.strip()
+
+    def fail(reason: str) -> bool:
+        if verbose:
+            print(f"  Error: incompatible qbit-pt service account: {reason}")
+        return False
+
+    try:
+        group_record = lookup("group")
+        if group_record is None:
+            subprocess.run(
+                ["groupadd", "--system", "qbit-pt"],
+                check=True,
+            )
+            group_record = lookup("group")
+            if group_record is None:
+                return fail("group was not found after groupadd")
+
+        group_fields = group_record.split(":")
+        if len(group_fields) != 4 or group_fields[0] != "qbit-pt":
+            return fail("group record is malformed")
+        try:
+            group_id = int(group_fields[2])
+        except ValueError:
+            return fail("group ID is not numeric")
+        group_members = set(filter(None, group_fields[3].split(",")))
+        if group_members - {"qbit-pt"}:
+            return fail("group contains other users")
+
+        user_record = lookup("passwd")
+        if user_record is None:
+            subprocess.run(
+                [
+                    "useradd",
+                    "--system",
+                    "--gid",
+                    "qbit-pt",
+                    "--home-dir",
+                    "/nonexistent",
+                    "--no-create-home",
+                    "--shell",
+                    "/usr/sbin/nologin",
+                    "qbit-pt",
+                ],
+                check=True,
+            )
+            user_record = lookup("passwd")
+            if user_record is None:
+                return fail("user was not found after useradd")
+
+        user_fields = user_record.split(":")
+        if len(user_fields) != 7 or user_fields[0] != "qbit-pt":
+            return fail("passwd record is malformed")
+        try:
+            user_id = int(user_fields[2])
+            primary_group_id = int(user_fields[3])
+        except ValueError:
+            return fail("user or primary group ID is not numeric")
+        if user_id <= 0:
+            return fail("user ID must be non-root")
+        if primary_group_id != group_id:
+            return fail("user primary group does not match qbit-pt")
+        if user_fields[6] not in {
+            "/usr/sbin/nologin",
+            "/sbin/nologin",
+            "/bin/false",
+        }:
+            return fail("user has an interactive login shell")
+
+        all_users = subprocess.run(
+            ["getent", "passwd"],
+            capture_output=True,
+            check=False,
+            text=True,
+        )
+        if all_users.returncode != 0:
+            return fail("could not enumerate passwd records")
+        for record in all_users.stdout.splitlines():
+            fields = record.split(":")
+            if len(fields) != 7:
+                continue
+            try:
+                record_group_id = int(fields[3])
+            except ValueError:
+                continue
+            if record_group_id == group_id and fields[0] != "qbit-pt":
+                return fail("another user has qbit-pt as its primary group")
+    except (OSError, subprocess.CalledProcessError) as exc:
+        if verbose:
+            print(f"  Error: could not create qbit-pt service account: {exc}")
+        return False
+
+    return True
 
 
 def _qbittorrent_setup_services(enable_passthrough: bool = False, verbose: bool = True) -> bool:
@@ -706,6 +835,17 @@ WantedBy=multi-user.target
                 )
             return False
         else:
+            if not _ensure_qbittorrent_passthrough_account(verbose=verbose):
+                return False
+            environment_file = Path(
+                "/etc/mole/qbittorrent-passthrough.env"
+            )
+            environment_file.parent.mkdir(parents=True, exist_ok=True)
+            environment_file.write_text(
+                _qbittorrent_passthrough_environment_content(config)
+            )
+            environment_file.chmod(0o640)
+            shutil.chown(environment_file, user="root", group="qbit-pt")
             pt_service = Path("/etc/systemd/system/qbittorrent-passthrough.service")
             pt_service_content = _qbittorrent_passthrough_service_content()
             pt_service.write_text(pt_service_content)

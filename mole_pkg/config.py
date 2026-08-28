@@ -671,20 +671,31 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
                     f"QB_PASSTHROUGH_ALLOWED_CIDRS supports IPv4 subnets only: {cidr}"
                 )
 
-        auth_file = config.qb_api_auth_file
-        if auth_file:
+        auth_files = (
+            (
+                'QB_API_AUTH_FILE',
+                config.get('QB_API_AUTH_FILE', '').strip(),
+            ),
+            (
+                'QB_PASSTHROUGH_UPSTREAM_AUTH_FILE',
+                config.qb_passthrough_upstream_auth_file,
+            ),
+        )
+        for setting, auth_file in auth_files:
+            if not auth_file:
+                continue
             try:
                 with open(auth_file, encoding='utf-8') as handle:
                     credential = handle.readline().rstrip('\r\n')
             except OSError:
                 errors.append(
-                    f"QB_API_AUTH_FILE is not readable: {auth_file}"
+                    f"{setting} is not readable: {auth_file}"
                 )
             else:
                 username, separator, password = credential.partition(':')
                 if not separator or not username or not password:
                     errors.append(
-                        "QB_API_AUTH_FILE must contain username:password"
+                        f"{setting} must contain username:password"
                     )
 
     # Check provider is supported

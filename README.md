@@ -386,7 +386,11 @@ sudo mole qbittorrent passthrough
 
 For a production bridge listener, restrict sources and authenticate every
 upstream request. The strongest layout uses a dedicated Docker network that
-contains only qBittorrent API clients:
+contains only qBittorrent API clients. Upstream Basic authentication requires
+[qBittorrent 5.2.0 or newer](https://github.com/qbittorrent/qBittorrent/blob/master/WebAPI_Changelog.md#2150)
+(WebAPI 2.15.0 or newer). Run the current installer or
+`sudo ./install.sh --upgrade` first so the persistent `qbit-pt` service account
+exists:
 
 ```bash
 # /etc/mole/config
@@ -408,12 +412,21 @@ private runtime Nginx configuration and is never written to the repository or
 service environment. `QB_API_AUTH_FILE` also authenticates MOLE's direct API
 calls that maintain qBittorrent's interface and forwarded port. Once clients
 use this proxy, disable qBittorrent's local and subnet authentication bypasses.
+Set qBittorrent's allowed host/domain to the configured `VETH_VPN_IP`; the
+proxy sends that address and `QB_PORT` in the upstream `Host` header. Remove
+legacy DNAT or redirect rules that expose the qBittorrent namespace directly,
+because those paths bypass the proxy's source allowlist and authentication.
 TLS is optional for a host-local Docker bridge; authentication and network
 membership remain mandatory.
 
 The command reconciles the managed wrapper and unit, then restarts only `qbittorrent-passthrough.service`. It does not restart MOLE, WireGuard, or qBittorrent. MOLE runs an isolated Nginx process and does not modify the host's normal Nginx site configuration.
 
-To roll back, set `QB_PASSTHROUGH_MODE=socat` and rerun `sudo mole qbittorrent passthrough`. The listener address and port remain unchanged.
+To roll back, first configure every API client to send qBittorrent credentials,
+then set `QB_PASSTHROUGH_MODE=socat` and rerun
+`sudo mole qbittorrent passthrough`. Socat is a raw TCP relay and cannot inject
+the upstream Basic Authorization header. The listener address and port remain
+unchanged. Restoring a qBittorrent subnet authentication bypass also restores
+access, but weakens the security boundary and is not recommended.
 
 ## Running Other Applications Through VPN
 
