@@ -749,7 +749,12 @@ def _ensure_qbittorrent_passthrough_account(verbose: bool = True) -> bool:
 
 def _qbittorrent_service_content(config: Config) -> str:
     resolver = config.qb_dns_resolv_conf
-    binding = f'BindReadOnlyPaths={resolver}:/etc/resolv.conf\n' if resolver else ''
+    binding = (
+        f'BindReadOnlyPaths={resolver}:/etc/resolv.conf\n'
+        f'Environment=MOLE_QBIT_SERVICE_RESOLVER={resolver}\n'
+        f'Environment=MOLE_QBIT_SERVICE_NETNS={config.netns}\n'
+        if resolver else 'Environment=MOLE_QBIT_SERVICE_RESOLVER=\n'
+    )
     return f"""[Unit]
 Description=qBittorrent-nox in MOLE VPN namespace
 After=network.target mole.service
@@ -794,7 +799,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 fi
 
-NETNS="${NETNS_NAME:-vpn}"
+NETNS="${MOLE_QBIT_SERVICE_NETNS:-${NETNS_NAME:-vpn}}"
 QB_USER_RUN="${QB_USER:-nobody}"
 QB_PORT_RUN="${QB_PORT:-8080}"
 
@@ -807,7 +812,11 @@ for i in {1..30}; do
 done
 
 # Run qBittorrent in the VPN namespace
-RESOLVER="${QB_DNS_RESOLV_CONF:-}"
+RESOLVER="${MOLE_QBIT_SERVICE_RESOLVER-${MOLE_QB_DNS_RESOLV_CONF:-${QB_DNS_RESOLV_CONF:-}}}"
+if [[ ${MOLE_QBIT_SERVICE_RESOLVER+x} && -z "$MOLE_QBIT_SERVICE_RESOLVER" && -n "${MOLE_QB_DNS_RESOLV_CONF:-${QB_DNS_RESOLV_CONF:-}}" ]]; then
+    echo "qBittorrent resolver binding missing or stale; rerun mole qbittorrent setup and restart the service" >&2
+    exit 1
+fi
 if [[ -n "$RESOLVER" ]]; then
     if [[ "$RESOLVER" == auto ]]; then
         RESOLVER="/etc/netns/${NETNS}/resolv.conf"

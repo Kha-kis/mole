@@ -20,11 +20,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Proton NAT-PMP renewals validate both TCP and UDP results, adopt changed ports, and use the shorter returned lease. Failed initial mappings and qBittorrent synchronization are retried without requiring a VPN reconnect.
 - qBittorrent HTTP requests run off the event loop while forwarding synchronization and watchdog writes are serialized. The executor path retains Python 3.8 compatibility.
 - Slow qBittorrent synchronization is supervised separately from lease renewal. Cancellation drains in-flight writes, restores temporary port toggles, and completes background cleanup before tunnel teardown.
+- Synchronization reconciles any port/address change that occurs while HTTP is in flight. Lease metrics track the provider's renewal result independently of client-update latency; completed client jobs are observed separately instead of causing false lease-failure alerts.
+- Keepalive starts before initial client synchronization so startup retries do not postpone the first lease refresh.
 - qBittorrent setup reports service-generation failures instead of announcing success or starting a stale service.
 - The installer and qBittorrent passthrough setup create a persistent, non-login `qbit-pt` service account so the proxy can read a root-owned credential file without exposing it in the unit environment.
 - The passthrough unit uses `UMask=0077`, applies a restrictive systemd sandbox, and reads runtime settings in its wrapper instead of exporting the full MOLE configuration into the proxy process.
 
 ### Security
+- Generated qBittorrent units pass their effective resolver and namespace to the wrapper, preserving environment-selected DNS bindings instead of silently falling back to legacy namespace DNS.
 - Nginx passthrough mode can combine a dedicated Docker network, source CIDR allowlisting, and upstream qBittorrent Basic authentication so qBittorrent's broad local/subnet authentication bypasses can remain disabled.
 
 ## [0.4.0] - 2026-01-16

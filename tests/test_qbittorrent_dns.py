@@ -28,7 +28,7 @@ class TestQbittorrentDns(unittest.TestCase):
                 self.assertTrue(cli._qbittorrent_setup_services(verbose=False))
             return (root / 'usr/local/lib/mole/qbittorrent-wrapper.sh').read_text()
 
-    def run_wrapper(self, resolver):
+    def run_wrapper(self, resolver, environment=None):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in ('ip', 'nsenter'):
@@ -42,7 +42,34 @@ class TestQbittorrentDns(unittest.TestCase):
                 '/usr/bin/nsenter', str(root / 'nsenter')))
             return subprocess.run(['bash', str(wrapper)], text=True, capture_output=True,
                                   env={**os.environ, 'MOLE_CONFIG': str(settings),
-                                       'PATH': str(root) + ':/usr/bin:/bin'}, timeout=5)
+                                       'PATH': str(root) + ':/usr/bin:/bin',
+                                       **(environment or {})}, timeout=5)
+
+    def test_prefixed_environment_selection_is_compiled_for_wrapper(self):
+        with patch.dict(os.environ, {'MOLE_QB_DNS_RESOLV_CONF': '/etc/example/custom.conf',
+                                     'MOLE_NETNS_NAME': 'custom-vpn'}):
+            value = Config('/nonexistent/mole-unit-test-config')
+        unit = cli._qbittorrent_service_content(value)
+        self.assertIn('Environment=MOLE_QBIT_SERVICE_RESOLVER=/etc/example/custom.conf', unit)
+        self.assertIn('Environment=MOLE_QBIT_SERVICE_NETNS=custom-vpn', unit)
+
+    def test_wrapper_uses_compiled_selection_even_if_config_setting_is_absent(self):
+        result = self.run_wrapper('', {'MOLE_QB_DNS_RESOLV_CONF': '/etc/resolv.conf',
+                                      'MOLE_QBIT_SERVICE_RESOLVER': '/etc/resolv.conf',
+                                      'MOLE_QBIT_SERVICE_NETNS': 'custom-vpn'})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('nsenter:--net=/run/netns/custom-vpn', result.stdout)
+
+    def test_wrapper_rejects_new_request_when_unit_has_no_binding(self):
+        result = self.run_wrapper('/etc/resolv.conf', {'MOLE_QBIT_SERVICE_RESOLVER': ''})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('resolver binding', result.stderr)
+
+    def test_explicit_binding_rejects_namespace_unit_injection(self):
+        for name in ['bad name', 'bad\nname', 'bad%n', '../other']:
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                cli._qbittorrent_service_content(config(QB_DNS_RESOLV_CONF='/etc/example/custom.conf',
+                                                      NETNS_NAME=name))
 
     def test_selected_resolver_does_not_get_overlaid_by_ip_netns_exec(self):
         result = self.run_wrapper('/etc/resolv.conf')

@@ -371,6 +371,10 @@ With a selected binding, the wrapper enters only the network namespace using
 `nsenter` (from `util-linux`) so `ip netns exec` cannot overlay a different
 resolver. It also refuses to launch if the effective binding does not match
 the selected file. Without this setting, legacy namespace entry is unchanged.
+The unit carries the resolved DNS source and namespace explicitly, including
+values selected through `MOLE_QB_DNS_RESOLV_CONF` or `MOLE_NETNS_NAME` environment
+overrides at setup time. The wrapper uses that compiled selection rather than
+trying to reinterpret it independently. Regenerate the service to change it.
 
 Run `sudo mole qbittorrent setup` to regenerate the service, then restart
 `qbittorrent-mole` during a suitable interruption window. Repeat those steps

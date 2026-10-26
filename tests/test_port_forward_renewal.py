@@ -136,14 +136,12 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
         with patch("mole_pkg.mole.increment_counter") as counter, patch(
             "mole_pkg.mole.increment_dict_counter"
         ), patch("mole_pkg.mole.atomic_write_state"):
+            started = time.monotonic()
             await asyncio.wait_for(mole._keepalive_loop(), timeout=2)
+            mole._test_keepalive_duration = time.monotonic() - started
             task = mole._torrent_sync_task
-            if task is not None and not task.done():
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
+            if task is not None:
+                await asyncio.gather(task, return_exceptions=True)
         return mole, [call.args[1] for call in counter.call_args_list]
 
     async def test_changed_port_is_sent_to_torrent_client(self):
@@ -154,11 +152,11 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
     async def test_torrent_sync_failure_is_retried_next_keepalive(self):
         mole, counters = await self.run_iterations([False, True])
         self.assertEqual(mole.torrent.set_listen_port.await_count, 2)
-        self.assertEqual(counters, ["port_forward_renewals_failure_total", "port_forward_renewals_success_total"])
+        self.assertEqual(counters, ["port_forward_renewals_success_total"] * 2)
 
-    async def test_torrent_sync_exception_counts_as_failure(self):
+    async def test_torrent_sync_exception_does_not_mislabel_valid_lease(self):
         _, counters = await self.run_iterations([RuntimeError("unavailable")])
-        self.assertEqual(counters, ["port_forward_renewals_failure_total"])
+        self.assertEqual(counters, ["port_forward_renewals_success_total"])
 
     async def test_failed_renewal_does_not_update_torrent_port(self):
         mole, counters = await self.run_iterations([True], refresh_ok=False)
@@ -173,12 +171,10 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
         mole.torrent.set_interface.assert_awaited_once_with("mole", "192.0.2.2")
         self.assertEqual(counters, ["port_forward_renewals_success_total"])
 
-    async def test_slow_torrent_sync_has_a_bounded_deadline(self):
-        start = time.monotonic()
-        with patch("mole_pkg.mole.TORRENT_SYNC_TIMEOUT", 0.01, create=True):
-            _, counters = await self.run_iterations([True], sync_delay=0.2)
-        self.assertLess(time.monotonic() - start, 0.15)
-        self.assertEqual(counters, ["port_forward_renewals_failure_total"])
+    async def test_slow_torrent_sync_does_not_delay_keepalive_loop(self):
+        mole, counters = await self.run_iterations([True], sync_delay=0.2)
+        self.assertLess(mole._test_keepalive_duration, 0.15)
+        self.assertEqual(counters, ["port_forward_renewals_success_total"])
 
     async def test_interface_binding_succeeds_without_forwarded_port(self):
         mole = Mole.__new__(Mole)
@@ -305,8 +301,8 @@ class TestTorrentApiDoesNotBlockRenewal(unittest.IsolatedAsyncioTestCase):
 
             mole.provider = Mock(refresh_port_forward=AsyncMock(side_effect=refresh))
             with patch('mole_pkg.services.qbittorrent.urllib.request.urlopen', side_effect=slow_request), patch(
-                'mole_pkg.mole.TORRENT_SYNC_TIMEOUT', 0.005
-            ), patch('mole_pkg.mole.increment_counter'), patch('mole_pkg.mole.increment_dict_counter'), patch(
+                'mole_pkg.mole.increment_counter'
+            ), patch('mole_pkg.mole.increment_dict_counter'), patch(
                 'mole_pkg.mole.atomic_write_state'
             ):
                 try:

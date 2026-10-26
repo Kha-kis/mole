@@ -154,11 +154,12 @@ class Config:
     def qb_dns_resolv_conf(self) -> str:
         """Optional mandatory resolver bind for the generated qBittorrent unit."""
         value = self.get('QB_DNS_RESOLV_CONF', '').strip()
-        if value == 'auto':
+        if value:
             namespace = self.netns
             if (not re.fullmatch(r'[A-Za-z0-9_.-]+', namespace)
                     or namespace in ('.', '..')):
-                raise ValueError('QB_DNS_RESOLV_CONF=auto requires a valid NETNS_NAME')
+                raise ValueError('QB_DNS_RESOLV_CONF requires a valid NETNS_NAME')
+        if value == 'auto':
             value = f'/etc/netns/{namespace}/resolv.conf'
         if value and (not value.startswith('/') or any(
                 char.isspace() or ord(char) < 32 or ord(char) == 127
