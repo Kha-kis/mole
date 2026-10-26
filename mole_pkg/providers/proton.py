@@ -6,6 +6,7 @@ Port forwarding uses NAT-PMP protocol.
 """
 
 import json
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -694,64 +695,53 @@ class ProtonProvider(VPNProvider):
             log.error("natpmpc not installed. Install with: apt install natpmpc")
             return False
 
-        # Load previous port for comparison
-        previous_port = self._load_saved_port()
+        return self._renew_port_mappings()
 
+    def _request_port_mapping(self, protocol: str):
+        result = run_in_netns([
+            "natpmpc", "-a", "1", "0", protocol, "60", "-g", self._natpmp_gateway
+        ], self.config.netns, check=False)
+        if result.returncode != 0:
+            log.warning(f"NAT-PMP {protocol.upper()} request failed")
+            return None
+
+        match = re.search(
+            r"^Mapped public port (\d+) protocol " + protocol.upper()
+            + r" to local port \d+ lifetime (\d+)\s*$",
+            result.stdout, re.MULTILINE,
+        )
+        if not match:
+            log.warning(f"Invalid NAT-PMP {protocol.upper()} mapping response")
+            return None
+        port, lifetime = map(int, match.groups())
+        if not 1 <= port <= 65535 or lifetime <= 0:
+            log.warning(f"Invalid NAT-PMP {protocol.upper()} port or lifetime")
+            return None
+        return port, datetime.now() + timedelta(seconds=lifetime)
+
+    def _renew_port_mappings(self) -> bool:
         try:
-            gateway = self._natpmp_gateway
-
-            # Request UDP port
-            result = run_in_netns([
-                "natpmpc", "-a", "1", "0", "udp", "60", "-g", gateway
-            ], self.config.netns, check=False)
-
-            if result.returncode != 0:
-                log.error(f"NAT-PMP UDP request failed: {result.stderr}")
+            udp = self._request_port_mapping("udp")
+            if udp is None:
+                return False
+            tcp = self._request_port_mapping("tcp")
+            if tcp is None:
+                return False
+            if udp[0] != tcp[0]:
+                log.warning(f"NAT-PMP protocol port mismatch: UDP={udp[0]}, TCP={tcp[0]}")
                 return False
 
-            # Parse port from output
-            port = None
-            for line in result.stdout.split('\n'):
-                if "Mapped public port" in line:
-                    parts = line.split()
-                    for i, part in enumerate(parts):
-                        if part == "port" and i + 1 < len(parts):
-                            try:
-                                port = int(parts[i + 1])
-                                break
-                            except ValueError:
-                                continue
-
-            if not port:
-                log.error("Could not parse port from NAT-PMP response")
-                log.debug(f"NAT-PMP output: {result.stdout}")
-                return False
-
-            # Request TCP port (same port)
-            result = run_in_netns([
-                "natpmpc", "-a", "1", "0", "tcp", "60", "-g", gateway
-            ], self.config.netns, check=False)
-
-            if result.returncode != 0:
-                log.warning(f"NAT-PMP TCP request failed (UDP port still valid)")
-
+            # Proton may assign a new port after a lease expires, even without reconnecting.
+            port = udp[0]
+            previous_port = self.state.port or self._load_saved_port()
+            secure_write_file(Path(self.config.state_dir) / "port", str(port))
             self.state.port = port
-            self.state.port_expires = datetime.now() + timedelta(seconds=60)
-
-            # Save port to state
-            state_dir = Path(self.config.state_dir)
-            secure_write_file(state_dir / "port", str(port))
-
-            # Notify user if port changed
-            if previous_port and previous_port != port:
-                log.warning(f"Port changed: {previous_port} -> {port} (update your applications)")
-            else:
-                log.info(f"Port {port} forwarded via NAT-PMP")
-
+            self.state.port_expires = min(udp[1], tcp[1])
+            if previous_port != port:
+                log.info(f"NAT-PMP forwarded port changed: {previous_port} -> {port}")
             return True
-
         except Exception as e:
-            log.error(f"Port forwarding error: {sanitize_for_log(str(e))}")
+            log.error(f"Port mapping renewal error: {sanitize_for_log(str(e))}")
             return False
 
     async def refresh_port_forward(self) -> bool:
@@ -759,26 +749,4 @@ class ProtonProvider(VPNProvider):
         if not self.config.port_forward or not self.state.port:
             return True
 
-        try:
-            gateway = self._natpmp_gateway
-
-            # Refresh UDP mapping
-            result = run_in_netns([
-                "natpmpc", "-a", "1", "0", "udp", "60", "-g", gateway
-            ], self.config.netns, check=False)
-
-            if result.returncode != 0:
-                log.warning(f"NAT-PMP UDP refresh failed")
-                return False
-
-            # Refresh TCP mapping
-            run_in_netns([
-                "natpmpc", "-a", "1", "0", "tcp", "60", "-g", gateway
-            ], self.config.netns, check=False)
-
-            self.state.port_expires = datetime.now() + timedelta(seconds=60)
-            return True
-
-        except Exception as e:
-            log.error(f"Port refresh error: {sanitize_for_log(str(e))}")
-            return False
+        return self._renew_port_mappings()

@@ -431,10 +431,13 @@ class TestPassthroughArtifacts(unittest.TestCase):
             self.assertIn(directive, service)
 
     @patch("mole_pkg.cli.subprocess.run")
+    @patch("mole_pkg.cli.Config")
     def test_qbittorrent_service_preserves_shared_download_permissions(
         self,
+        mock_config,
         _mock_run,
     ):
+        mock_config.return_value = Config('/nonexistent/mole-unit-test-config')
         real_path = Path
         with tempfile.TemporaryDirectory() as tmpdir:
             root = real_path(tmpdir)

@@ -77,6 +77,8 @@ class Mole:
         self.provider = get_vpn_provider(self.config, self.state)
         self.torrent = get_torrent_client(self.config)
         self.shutdown_event = asyncio.Event()
+        self._torrent_update_lock = None
+        self._torrent_sync_task = None
         self._keepalive_task = None
         self._watchdog_task = None
         self._restart_watcher_task = None
@@ -117,12 +119,14 @@ class Mole:
             self._start_dns_server()
             await asyncio.sleep(0.5)
 
+        # Lease maintenance must already run while initial client updates retry.
+        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
+
         # Initial VPN setup
         if not await self._full_renewal():
             log.error("Initial setup failed, will retry...")
 
         # Start background tasks
-        self._keepalive_task = asyncio.create_task(self._keepalive_loop())
         self._watchdog_task = asyncio.create_task(self._watchdog_loop())
         self._restart_watcher_task = asyncio.create_task(self._restart_watcher_loop())
 
@@ -294,12 +298,18 @@ class Mole:
 
     async def _cleanup(self):
         """Cleanup all resources"""
-        if self._keepalive_task:
-            self._keepalive_task.cancel()
-        if self._watchdog_task:
-            self._watchdog_task.cancel()
-        if self._restart_watcher_task:
-            self._restart_watcher_task.cancel()
+        tasks = [task for task in (
+            self._keepalive_task, self._watchdog_task, self._restart_watcher_task,
+            getattr(self, '_torrent_sync_task', None),
+        ) if task is not None]
+        for task in tasks:
+            task.cancel()
+        # In-flight HTTP writes and temporary port restoration must finish
+        # before stopping the tunnel they depend on.
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for result in results:
+            if isinstance(result, Exception):
+                log.warning(f"Background task cleanup failed: {sanitize_for_log(str(result))}")
 
         # Stop service subprocesses
         self._stop_subprocess(self._api_proc, "API")
@@ -472,20 +482,30 @@ class Mole:
         log.info("Keepalive loop started")
 
         state_dir = Path(self.config.state_dir)
+        loop = asyncio.get_running_loop()
+        next_refresh = loop.time() + self.config.keepalive_interval
 
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(self.config.keepalive_interval)
+                await asyncio.sleep(max(0, next_refresh - loop.time()))
+                next_refresh = loop.time() + self.config.keepalive_interval
 
-                # Gate: VPN must be up and a port must currently be forwarded.
-                # Don't gate on `port_payload` -- that's PIA-specific state.
-                # Proton uses NAT-PMP and never sets port_payload, so the
-                # previous gate skipped its keepalive entirely; the mapping
-                # only re-established at full renewal. Each provider's
-                # refresh_port_forward() does its own no-op short-circuit
-                # when there's nothing to do, so the loop just delegates.
-                if self.state.connected and self.state.port:
-                    refresh_ok = await self.provider.refresh_port_forward()
+                # Retry initial mapping failures without requiring a tunnel reconnect.
+                # port_payload is PIA-specific and must not gate Proton renewals.
+                if self.state.connected:
+                    if self.state.port:
+                        refresh_ok = await self.provider.refresh_port_forward()
+                    else:
+                        refresh_ok = await self.provider.setup_port_forward()
+                    next_refresh = loop.time() + self.config.keepalive_interval
+                    if refresh_ok and self.torrent:
+                        # Client synchronization is supervised separately; a slow
+                        # or failed API update does not mean the lease failed.
+                        task = self._torrent_sync_task
+                        if task is None or task.done():
+                            task = asyncio.create_task(self._sync_torrent_binding())
+                            self._torrent_sync_task = task
+                            task.add_done_callback(self._torrent_sync_finished)
                     try:
                         country = (self.state.server_country or "").upper() or "unknown"
                         if refresh_ok:
@@ -506,6 +526,39 @@ class Mole:
                 break
             except Exception as e:
                 log.error(f"Keepalive error: {e}")
+
+    def _torrent_sync_finished(self, task):
+        if task.cancelled():
+            return
+        try:
+            if task.result():
+                log.debug("qBittorrent synchronization completed")
+            else:
+                log.warning("qBittorrent synchronization failed; will retry on next keepalive")
+        except Exception as exc:
+            log.warning(f"qBittorrent synchronization failed: {sanitize_for_log(str(exc))}")
+
+    def _torrent_lock(self):
+        # Python 3.8 locks capture their loop eagerly; construct only on use.
+        if self._torrent_update_lock is None:
+            self._torrent_update_lock = asyncio.Lock()
+        return self._torrent_update_lock
+
+    async def _sync_torrent_binding(self) -> bool:
+        async with self._torrent_lock():
+            while True:
+                address, port = self.state.peer_ip, self.state.port
+                if not address:
+                    log.warning("Cannot synchronize torrent binding without a tunnel address")
+                    return False
+                success = await self.torrent.set_interface("mole", address)
+                if success and port:
+                    success = await self.torrent.set_listen_port(port)
+                if (address, port) == (self.state.peer_ip, self.state.port):
+                    return success
+                # A renewal can change either target while HTTP is in flight.
+                # Keep the writer lock and reconcile before reporting completion.
+                log.debug("Torrent binding changed during synchronization; reconciling latest target")
 
     async def _watchdog_loop(self):
         """VPN health monitoring loop"""
@@ -603,10 +656,11 @@ class Mole:
     async def _check_torrent_listener(self):
         """Check if torrent client listener is bound; fix via port toggle if not."""
         try:
-            status = await self.torrent.get_connection_status()
-            if status == "disconnected":
-                log.warning("Torrent listener is disconnected, attempting port toggle fix")
-                await self.torrent._toggle_port(self.state.port)
+            async with self._torrent_lock():
+                status = await self.torrent.get_connection_status()
+                if status == "disconnected":
+                    log.warning("Torrent listener is disconnected, attempting port toggle fix")
+                    await self.torrent._toggle_port(self.state.port)
         except Exception as e:
             log.error(f"Torrent listener check error: {e}")
 
@@ -634,11 +688,7 @@ class Mole:
 
         for attempt in range(1, max_retries + 1):
             try:
-                # Try to update interface binding
-                if await self.torrent.set_interface(interface_name, interface_address):
-                    # Interface updated, now set port
-                    if self.state.port:
-                        await self.torrent.set_listen_port(self.state.port)
+                if await self._sync_torrent_binding():
                     log.info(f"Torrent client updated: interface={interface_name}, port={self.state.port}")
                     return
                 else:

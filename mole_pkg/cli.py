@@ -747,12 +747,42 @@ def _ensure_qbittorrent_passthrough_account(verbose: bool = True) -> bool:
     return True
 
 
+def _qbittorrent_service_content(config: Config) -> str:
+    resolver = config.qb_dns_resolv_conf
+    binding = (
+        f'BindReadOnlyPaths={resolver}:/etc/resolv.conf\n'
+        f'Environment=MOLE_QBIT_SERVICE_RESOLVER={resolver}\n'
+        f'Environment=MOLE_QBIT_SERVICE_NETNS={config.netns}\n'
+        if resolver else 'Environment=MOLE_QBIT_SERVICE_RESOLVER=\n'
+    )
+    return f"""[Unit]
+Description=qBittorrent-nox in MOLE VPN namespace
+After=network.target mole.service
+Wants=mole.service
+
+[Service]
+Type=simple
+{binding}ExecStart=/usr/local/lib/mole/qbittorrent-wrapper.sh
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+"""
+
+
 def _qbittorrent_setup_services(enable_passthrough: bool = False, verbose: bool = True) -> bool:
     """Setup qBittorrent wrapper scripts and systemd service files.
 
-    Creates wrapper scripts that read config at runtime, so service files
-    never need to be regenerated when config changes.
+    Wrappers read config at runtime. Changes to the optional service-level
+    resolver binding require regenerating the service with this command.
     """
+    config = Config()
+    try:
+        qb_service_content = _qbittorrent_service_content(config)
+    except ValueError as exc:
+        if verbose:
+            print(f"  Error: {exc}")
+        return False
     lib_dir = Path("/usr/local/lib/mole")
     lib_dir.mkdir(parents=True, exist_ok=True)
 
@@ -769,7 +799,7 @@ if [[ -f "$CONFIG_FILE" ]]; then
     source "$CONFIG_FILE"
 fi
 
-NETNS="${NETNS_NAME:-vpn}"
+NETNS="${MOLE_QBIT_SERVICE_NETNS:-${NETNS_NAME:-vpn}}"
 QB_USER_RUN="${QB_USER:-nobody}"
 QB_PORT_RUN="${QB_PORT:-8080}"
 
@@ -782,6 +812,22 @@ for i in {1..30}; do
 done
 
 # Run qBittorrent in the VPN namespace
+RESOLVER="${MOLE_QBIT_SERVICE_RESOLVER-${MOLE_QB_DNS_RESOLV_CONF:-${QB_DNS_RESOLV_CONF:-}}}"
+if [[ ${MOLE_QBIT_SERVICE_RESOLVER+x} && -z "$MOLE_QBIT_SERVICE_RESOLVER" && -n "${MOLE_QB_DNS_RESOLV_CONF:-${QB_DNS_RESOLV_CONF:-}}" ]]; then
+    echo "qBittorrent resolver binding missing or stale; rerun mole qbittorrent setup and restart the service" >&2
+    exit 1
+fi
+if [[ -n "$RESOLVER" ]]; then
+    if [[ "$RESOLVER" == auto ]]; then
+        RESOLVER="/etc/netns/${NETNS}/resolv.conf"
+    fi
+    if ! [[ /etc/resolv.conf -ef "$RESOLVER" ]]; then
+        echo "qBittorrent resolver binding missing or stale; rerun mole qbittorrent setup and restart the service" >&2
+        exit 1
+    fi
+    # Preserve systemd's selected resolver instead of overlaying netns files.
+    exec /usr/bin/nsenter --net="/run/netns/${NETNS}" sudo -u "$QB_USER_RUN" /usr/bin/qbittorrent-nox --webui-port="$QB_PORT_RUN"
+fi
 exec /usr/bin/ip netns exec "$NETNS" sudo -u "$QB_USER_RUN" /usr/bin/qbittorrent-nox --webui-port="$QB_PORT_RUN"
 '''
     qb_wrapper.write_text(qb_wrapper_content)
@@ -797,29 +843,14 @@ exec /usr/bin/ip netns exec "$NETNS" sudo -u "$QB_USER_RUN" /usr/bin/qbittorrent
     if verbose:
         print(f"  Created: {pt_wrapper}")
 
-    # Create static systemd service for qBittorrent
-    # This never needs to change - wrapper reads config at runtime
+    # Bind selected DNS independently of the host's mutable resolver settings.
     qb_service = Path("/etc/systemd/system/qbittorrent-mole.service")
-    qb_service_content = """[Unit]
-Description=qBittorrent-nox in MOLE VPN namespace
-After=network.target mole.service
-Wants=mole.service
-
-[Service]
-Type=simple
-ExecStart=/usr/local/lib/mole/qbittorrent-wrapper.sh
-Restart=on-failure
-
-[Install]
-WantedBy=multi-user.target
-"""
     qb_service.write_text(qb_service_content)
     if verbose:
         print(f"  Created: {qb_service}")
 
     # Create passthrough service if requested
     if enable_passthrough:
-        config = Config()
         try:
             dependency = _qbittorrent_passthrough_dependency(config)
         except ValueError as exc:
@@ -1388,7 +1419,9 @@ HTTP_API_ENABLED=false
                         enable_passthrough = True
 
                 print("\nSetting up qBittorrent service...")
-                _qbittorrent_setup_services(enable_passthrough=enable_passthrough, verbose=False)
+                if not _qbittorrent_setup_services(enable_passthrough=enable_passthrough, verbose=False):
+                    print("  qBittorrent service setup failed; no services started")
+                    return 1
 
                 subprocess.run(["systemctl", "enable", "qbittorrent-mole"], check=False)
                 subprocess.run(["systemctl", "start", "qbittorrent-mole"], check=False)
@@ -2375,7 +2408,8 @@ def _qbittorrent_setup(args):
             config_file.write_text(content)
 
     print("\nCreating wrapper scripts and service files...")
-    _qbittorrent_setup_services(enable_passthrough=False, verbose=True)
+    if not _qbittorrent_setup_services(enable_passthrough=False, verbose=True):
+        return 1
 
     print("\nService created successfully!")
     print(f"\nAccess Web UI at: http://{config.veth_vpn_ip}:{port}")
