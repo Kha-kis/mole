@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-10-26
+
 ### Added
 - **`QB_DNS_RESOLV_CONF`**: Optional required, read-only resolver binding for the generated qBittorrent unit. Select `auto` for the configured namespace's resolver file or an absolute path; unset preserves previous behavior. Regenerate and restart the qBittorrent service after changes.
 - **`QB_PASSTHROUGH_MODE`**: Select `socat` (backward-compatible default) or an isolated, HTTP-aware `nginx` relay for qBittorrent Web API access. Nginx mode prevents Arr clients from reusing connections beyond qBittorrent's upstream HTTP keep-alive lifetime.
