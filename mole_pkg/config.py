@@ -151,6 +151,25 @@ class Config:
         return self.get('QB_USER', '')
 
     @property
+    def qb_dns_resolv_conf(self) -> str:
+        """Optional mandatory resolver bind for the generated qBittorrent unit."""
+        value = self.get('QB_DNS_RESOLV_CONF', '').strip()
+        if value == 'auto':
+            namespace = self.netns
+            if (not re.fullmatch(r'[A-Za-z0-9_.-]+', namespace)
+                    or namespace in ('.', '..')):
+                raise ValueError('QB_DNS_RESOLV_CONF=auto requires a valid NETNS_NAME')
+            value = f'/etc/netns/{namespace}/resolv.conf'
+        if value and (not value.startswith('/') or any(
+                char.isspace() or ord(char) < 32 or ord(char) == 127
+                or char in ":%\\\"'" for char in value)):
+            raise ValueError(
+                'QB_DNS_RESOLV_CONF must be auto or an absolute path without '
+                'whitespace, control characters, colons, percent signs, quotes or backslashes'
+            )
+        return value
+
+    @property
     def qb_api_auth_file(self) -> str:
         """File containing Basic credentials for Mole's qBittorrent API calls."""
         return self.get(
@@ -644,6 +663,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
 
     # Validate torrent client settings
     if config.torrent_client.lower() == 'qbittorrent':
+        try:
+            config.qb_dns_resolv_conf
+        except ValueError as exc:
+            errors.append(str(exc))
+
         qb_url = config.qb_api_url
         if not qb_url.startswith('http'):
             errors.append(f"QB_API_URL must start with http:// or https://")

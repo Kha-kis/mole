@@ -344,17 +344,15 @@ class TestMoleAsync(unittest.TestCase):
 
         mole = Mole()
 
-        # Create mock tasks
-        mock_task = MagicMock()
-        mole._keepalive_task = mock_task
-        mole._watchdog_task = mock_task
-        mole._restart_watcher_task = mock_task
-
         with patch('mole_pkg.mole.disconnect_vpn') as mock_disconnect:
-            asyncio.run(mole._cleanup())
+            async def check_cleanup():
+                tasks = [asyncio.create_task(asyncio.sleep(3600)) for _ in range(3)]
+                mole._keepalive_task, mole._watchdog_task, mole._restart_watcher_task = tasks
+                await mole._cleanup()
+                self.assertTrue(all(task.cancelled() for task in tasks))
 
-            # Verify tasks were cancelled
-            self.assertEqual(mock_task.cancel.call_count, 3)
+            asyncio.run(check_cleanup())
+
             mock_disconnect.assert_called_once()
 
 

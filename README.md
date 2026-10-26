@@ -192,6 +192,9 @@ HOST_INTERFACE=eth0
 TORRENT_CLIENT=qbittorrent
 QB_PORT=8080
 QB_USER=youruser
+# Optional: pin qBittorrent to an existing namespace resolver file.
+# 'auto' means /etc/netns/<NETNS_NAME>/resolv.conf; absolute paths also work.
+# QB_DNS_RESOLV_CONF=auto
 # File-backed Basic auth for MOLE's qBittorrent API updates
 # QB_API_AUTH_FILE=/etc/mole/qbittorrent-upstream.auth
 
@@ -347,6 +350,37 @@ sudo mole qbittorrent setup
 # - Create a new systemd service that runs qBittorrent in the VPN namespace
 # - Optionally start and enable the service
 ```
+
+### Pinning qBittorrent DNS
+
+Network and mount namespaces are separate. A newly launched `ip netns exec`
+lookup can work while an older qBittorrent process still sees a different
+resolver file. To make the generated service's DNS source explicit, set:
+
+```ini
+QB_DNS_RESOLV_CONF=auto
+```
+
+`auto` selects `/etc/netns/<NETNS_NAME>/resolv.conf` (default namespace: `vpn`).
+An absolute resolver-file path is also accepted. Prepare that file before
+starting qBittorrent. If Mole's local DoT listener is enabled on loopback, the
+file should contain `nameserver 127.0.0.1`; otherwise select a resolver reachable
+through your VPN. This option pins the file; it does not enable DoT, create a
+resolver, change upstream providers, or make household DNS reachable from the VPN.
+With a selected binding, the wrapper enters only the network namespace using
+`nsenter` (from `util-linux`) so `ip netns exec` cannot overlay a different
+resolver. It also refuses to launch if the effective binding does not match
+the selected file. Without this setting, legacy namespace entry is unchanged.
+
+Run `sudo mole qbittorrent setup` to regenerate the service, then restart
+`qbittorrent-mole` during a suitable interruption window. Repeat those steps
+after changing the binding or namespace name. The service uses
+`BindReadOnlyPaths` and will fail to start if the selected source is missing,
+rather than silently using host DNS. Empty/unset retains the prior behavior.
+Use an absolute path without whitespace, colons, percent signs, quotes,
+backslashes or control characters; these are rejected to avoid systemd parsing
+or specifier expansion. Never point the source back at the host's mutable
+`/etc/resolv.conf` if VPN DNS isolation is the goal.
 
 ### Managing qBittorrent
 

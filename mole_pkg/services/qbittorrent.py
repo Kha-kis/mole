@@ -82,14 +82,34 @@ class QBittorrentClient(TorrentClient):
         request.add_header("Authorization", f"Basic {token}")
         return request
 
+    async def _fetch(self, request: urllib.request.Request, timeout: Optional[float] = None) -> bytes:
+        def read_response():
+            with urllib.request.urlopen(
+                request, timeout=self.config.qb_api_timeout if timeout is None else timeout
+            ) as response:
+                return response.read()
+
+        # urllib is blocking; it must not stall the VPN's short NAT-PMP lease renewals.
+        task = asyncio.get_running_loop().run_in_executor(None, read_response)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # A running urllib request cannot be cancelled. Finish it before releasing a writer lock.
+            while not task.done():
+                try:
+                    await asyncio.shield(task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if not task.cancelled():
+                task.exception()
+            raise
+
     async def get_listen_port(self) -> Optional[int]:
         try:
-            with urllib.request.urlopen(
-                self._request(f"{self.config.qb_api_url}/preferences"),
-                timeout=self.config.qb_api_timeout,
-            ) as resp:
-                prefs = json.loads(resp.read().decode())
-                return prefs.get("listen_port")
+            payload = await self._fetch(self._request(f"{self.config.qb_api_url}/preferences"))
+            return json.loads(payload.decode()).get("listen_port")
         except Exception as e:
             log.error(f"Failed to get qBittorrent port: {e}")
             return None
@@ -118,11 +138,8 @@ class QBittorrentClient(TorrentClient):
 
         for attempt in (1, 2):
             try:
-                with urllib.request.urlopen(
-                    self._request(url), timeout=timeout
-                ) as resp:
-                    info = json.loads(resp.read().decode())
-                    return info.get("connection_status")
+                payload = await self._fetch(self._request(url), timeout=timeout)
+                return json.loads(payload.decode()).get("connection_status")
             except Exception as e:
                 if attempt == 1 and _is_timeout(e):
                     log.warning(
@@ -146,20 +163,19 @@ class QBittorrentClient(TorrentClient):
                 f"{self.config.qb_api_url}/setPreferences",
                 data=data, method="POST"
             )
-            with urllib.request.urlopen(req, timeout=self.config.qb_api_timeout):
-                pass
-
-            await asyncio.sleep(2)
-
-            data = urllib.parse.urlencode({
-                "json": json.dumps({"listen_port": port})
-            }).encode()
-            req = self._request(
-                f"{self.config.qb_api_url}/setPreferences",
-                data=data, method="POST"
-            )
-            with urllib.request.urlopen(req, timeout=self.config.qb_api_timeout):
-                pass
+            try:
+                await self._fetch(req)
+                await asyncio.sleep(2)
+            finally:
+                # Restore even if cancellation interrupts the temporary port.
+                data = urllib.parse.urlencode({
+                    "json": json.dumps({"listen_port": port})
+                }).encode()
+                req = self._request(
+                    f"{self.config.qb_api_url}/setPreferences",
+                    data=data, method="POST"
+                )
+                await self._fetch(req)
 
             await asyncio.sleep(3)
 
@@ -193,8 +209,7 @@ class QBittorrentClient(TorrentClient):
                 data=data, method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=self.config.qb_api_timeout):
-                pass
+            await self._fetch(req)
 
             await asyncio.sleep(3)
 
@@ -220,11 +235,8 @@ class QBittorrentClient(TorrentClient):
         """Set qBittorrent network interface binding"""
         try:
             # Get current settings
-            with urllib.request.urlopen(
-                self._request(f"{self.config.qb_api_url}/preferences"),
-                timeout=self.config.qb_api_timeout,
-            ) as resp:
-                prefs = json.loads(resp.read().decode())
+            payload = await self._fetch(self._request(f"{self.config.qb_api_url}/preferences"))
+            prefs = json.loads(payload.decode())
 
             current_iface = prefs.get("current_network_interface", "")
             current_addr = prefs.get("current_interface_address", "")
@@ -248,8 +260,7 @@ class QBittorrentClient(TorrentClient):
                 data=data, method="POST"
             )
 
-            with urllib.request.urlopen(req, timeout=self.config.qb_api_timeout):
-                pass
+            await self._fetch(req)
 
             log.info(f"qBittorrent interface updated to {interface_name} ({interface_address})")
             return True

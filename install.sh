@@ -116,6 +116,7 @@ fi
 install_package "wg" "wireguard-tools"
 install_package "curl" "curl"
 install_package "ip" "iproute2"
+install_package "nsenter" "util-linux"
 install_package "iptables" "iptables"
 install_package "python3" "python3"
 install_package "pip3" "python3-pip"
