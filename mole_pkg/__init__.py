@@ -3,7 +3,7 @@ MOLE - Managed Obfuscated Link Environment
 A VPN tunnel manager with port forwarding and torrent client integration
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 __author__ = "MOLE Contributors"
 
 # Defer imports to avoid circular dependencies
