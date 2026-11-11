@@ -33,7 +33,7 @@ import struct
 # Version
 # ═══════════════════════════════════════════════════════════════════════════
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Default Paths (FHS compliant)
@@ -2255,69 +2255,10 @@ class Mole:
         self._setup_killswitch()
 
     def _setup_killswitch(self):
-        """Setup kill switch iptables rules inside the namespace"""
-        netns = self.config.netns
-        log.info("Setting up kill switch...")
+        """Use the same fail-closed firewall as the installed entrypoint."""
+        from mole_pkg.network import setup_killswitch
 
-        # Check if already set up (check for our marker rule)
-        result = run_in_netns([
-            "iptables", "-C", "OUTPUT", "-m", "comment",
-            "--comment", "mole-killswitch", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        if result.returncode == 0:
-            log.debug("Kill switch already configured")
-            return
-
-        # Flush existing rules in namespace (start clean)
-        run_in_netns(["iptables", "-F", "OUTPUT"], netns, check=False)
-        run_in_netns(["iptables", "-F", "INPUT"], netns, check=False)
-
-        # Allow loopback
-        run_in_netns([
-            "iptables", "-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"
-        ], netns, check=False)
-        run_in_netns([
-            "iptables", "-A", "INPUT", "-i", "lo", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        # Allow traffic on veth-vpn (communication with host)
-        run_in_netns([
-            "iptables", "-A", "OUTPUT", "-o", "veth-vpn", "-j", "ACCEPT"
-        ], netns, check=False)
-        run_in_netns([
-            "iptables", "-A", "INPUT", "-i", "veth-vpn", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        # Allow traffic on mole (WireGuard) interface
-        run_in_netns([
-            "iptables", "-A", "OUTPUT", "-o", "mole", "-j", "ACCEPT"
-        ], netns, check=False)
-        run_in_netns([
-            "iptables", "-A", "INPUT", "-i", "mole", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        # Allow established/related connections
-        run_in_netns([
-            "iptables", "-A", "INPUT", "-m", "state",
-            "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        # Add marker rule
-        run_in_netns([
-            "iptables", "-A", "OUTPUT", "-m", "comment",
-            "--comment", "mole-killswitch", "-j", "ACCEPT"
-        ], netns, check=False)
-
-        # Drop everything else (kill switch)
-        run_in_netns([
-            "iptables", "-A", "OUTPUT", "-j", "DROP"
-        ], netns, check=False)
-        run_in_netns([
-            "iptables", "-A", "INPUT", "-j", "DROP"
-        ], netns, check=False)
-
-        log.info("Kill switch enabled - traffic blocked if VPN drops")
+        setup_killswitch(self.config)
 
     async def _full_renewal(self) -> bool:
         """Full VPN renewal process"""
@@ -2376,6 +2317,10 @@ class Mole:
             "ip", "route", "add", self.state.server_ip,
             "via", self.config.veth_host_ip, "dev", "veth-vpn"
         ], netns, check=False)
+
+        from mole_pkg.network import allow_vpn_server_ip
+
+        allow_vpn_server_ip(self.config, self.state.server_ip, old_server_ip)
 
         # Bring up WireGuard
         result = run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, check=False)

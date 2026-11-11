@@ -27,7 +27,9 @@ from ..utils import (
 
 # Proton API configuration
 PROTON_API_URL = "https://account.protonvpn.com/api"
-PROTON_APP_VERSION = "LinuxVPN_4.4.2"
+PROTON_CLIENT_VERSION = "4.19.0"
+PROTON_APP_VERSION = f"linux-vpn@{PROTON_CLIENT_VERSION}"
+PROTON_USER_AGENT = f"ProtonVPN/{PROTON_CLIENT_VERSION} (Linux)"
 
 
 class ProtonSessionWrapper:
@@ -42,7 +44,7 @@ class ProtonSessionWrapper:
         return ProtonAPISession(
             api_url=PROTON_API_URL,
             appversion=PROTON_APP_VERSION,
-            user_agent="ProtonVPN/4.4.2 (Linux; Ubuntu 22.04)",
+            user_agent=PROTON_USER_AGENT,
             TLSPinning=False,  # Disable to avoid urllib3 compatibility issues
             timeout=30
         )
@@ -51,7 +53,9 @@ class ProtonSessionWrapper:
         """Load session from disk"""
         try:
             if self.session_file.exists():
-                dump = self.session_file.read_text()
+                dump = json.loads(self.session_file.read_text())
+                dump["appversion"] = PROTON_APP_VERSION
+                dump["User-Agent"] = PROTON_USER_AGENT
                 self._session = ProtonAPISession.load(
                     dump,
                     TLSPinning=False,

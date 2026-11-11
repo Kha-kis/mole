@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-11
+
+### Fixed
+- Update Proton client identification for current API compatibility.
+- Decode saved Proton sessions before loading and refresh their client identity
+  without replacing saved authentication data.
+
+### Security
+- Enforce fail-closed namespace egress and keep INPUT/OUTPUT policies closed
+  while rebuilding kill-switch rules.
+- Use the shared strict firewall and VPN-endpoint reconciliation in both
+  entrypoints.
+- Add regression coverage for Proton session loading and firewall policy.
+
+Restart MOLE after upgrading to load the fixes. Torrent-client data and
+configuration do not require migration.
+
 ## [0.5.0] - 2026-10-26
 
 ### Added

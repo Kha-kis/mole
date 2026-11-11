@@ -90,6 +90,10 @@ def setup_killswitch(config: "Config") -> None:
     netns = config.netns
     log.info("Setting up kill switch...")
 
+    # Keep rule rebuilds fail-closed, including the interval after flushing.
+    run_in_netns(["iptables", "-P", "OUTPUT", "DROP"], netns)
+    run_in_netns(["iptables", "-P", "INPUT", "DROP"], netns)
+
     # Always flush and reapply rules (idempotent)
     # This ensures rules are always correct even after upgrades
     run_in_netns(["iptables", "-F", "OUTPUT"], netns, check=False)
@@ -129,10 +133,10 @@ def setup_killswitch(config: "Config") -> None:
         "--state", "ESTABLISHED,RELATED", "-j", "ACCEPT"
     ], netns, check=False)
 
-    # Add marker rule
+    # The marker must drop, never unconditionally accept before the final drop.
     run_in_netns([
         "iptables", "-A", "OUTPUT", "-m", "comment",
-        "--comment", "mole-killswitch", "-j", "ACCEPT"
+        "--comment", "mole-killswitch", "-j", "DROP"
     ], netns, check=False)
 
     # Drop everything else (kill switch)
