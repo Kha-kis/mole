@@ -5,6 +5,7 @@ Uses proton.Session with TLS pinning disabled for compatibility.
 Port forwarding uses NAT-PMP protocol.
 """
 
+import asyncio
 import json
 import re
 import time
@@ -21,6 +22,7 @@ from ..utils import (
     log,
     run_cmd,
     run_in_netns,
+    async_run_in_netns,
     sanitize_for_log,
     secure_write_file,
 )
@@ -170,6 +172,7 @@ class ProtonProvider(VPNProvider):
         self._session_file = Path(self.config.state_dir) / "proton_session.json"
         self._proton_session: Optional[ProtonSessionWrapper] = None
         self._selected_server: Optional[Dict] = None
+        self._mapping_lock = None
 
     @property
     def name(self) -> str:
@@ -716,12 +719,13 @@ class ProtonProvider(VPNProvider):
             log.error("natpmpc not installed. Install with: apt install natpmpc")
             return False
 
-        return self._renew_port_mappings()
+        return await self._renew_port_mappings()
 
-    def _request_port_mapping(self, protocol: str):
-        result = run_in_netns([
+    async def _request_port_mapping(self, protocol: str):
+        started = time.monotonic()
+        result = await async_run_in_netns([
             "natpmpc", "-a", "1", "0", protocol, "60", "-g", self._natpmp_gateway
-        ], self.config.netns, check=False)
+        ], self.config.netns, timeout=10)
         if result.returncode != 0:
             log.warning(f"NAT-PMP {protocol.upper()} request failed")
             return None
@@ -738,15 +742,40 @@ class ProtonProvider(VPNProvider):
         if not 1 <= port <= 65535 or lifetime <= 0:
             log.warning(f"Invalid NAT-PMP {protocol.upper()} port or lifetime")
             return None
-        return port, datetime.now() + timedelta(seconds=lifetime)
+        return port, started + lifetime
 
-    def _renew_port_mappings(self) -> bool:
+    def forwarding_valid(self) -> bool:
+        valid = bool(self.state.port and self.state.port_deadline > time.monotonic())
+        self.state.forwarding_ready = valid
+        return valid
+
+    def port_refresh_delay(self, configured: float) -> float:
+        remaining = self.state.port_deadline - time.monotonic()
+        if remaining <= 0:
+            self.state.forwarding_ready = False
+            return min(configured, 5)
+        return min(configured, 45, max(.1, remaining / 2))
+
+    async def _renew_port_mappings(self) -> bool:
+        generation = self.state.generation
+        if self._mapping_lock is None:
+            self._mapping_lock = asyncio.Lock()
+        async with self._mapping_lock:
+            if generation != self.state.generation:
+                return False
+            return await self._renew_locked(generation)
+
+    async def _renew_locked(self, generation: int) -> bool:
         try:
-            udp = self._request_port_mapping("udp")
+            udp = await self._request_port_mapping("udp")
             if udp is None:
                 return False
-            tcp = self._request_port_mapping("tcp")
+            tcp = await self._request_port_mapping("tcp")
             if tcp is None:
+                return False
+
+            deadline = min(udp[1], tcp[1])
+            if generation != self.state.generation or deadline <= time.monotonic():
                 return False
             if udp[0] != tcp[0]:
                 log.warning(f"NAT-PMP protocol port mismatch: UDP={udp[0]}, TCP={tcp[0]}")
@@ -757,17 +786,21 @@ class ProtonProvider(VPNProvider):
             previous_port = self.state.port or self._load_saved_port()
             secure_write_file(Path(self.config.state_dir) / "port", str(port))
             self.state.port = port
-            self.state.port_expires = min(udp[1], tcp[1])
+            self.state.port_deadline = deadline
+            self.state.port_expires = datetime.now() + timedelta(seconds=deadline - time.monotonic())
+            self.state.forwarding_ready = True
             if previous_port != port:
                 log.info(f"NAT-PMP forwarded port changed: {previous_port} -> {port}")
             return True
-        except Exception as e:
-            log.error(f"Port mapping renewal error: {sanitize_for_log(str(e))}")
+        except Exception:
+            self.forwarding_valid()
+            log.warning("NAT-PMP mapping renewal failed or timed out")
             return False
 
     async def refresh_port_forward(self) -> bool:
         """Refresh NAT-PMP port mapping (must be called every ~45 seconds)"""
-        if not self.config.port_forward or not self.state.port:
+        if not self.config.port_forward:
             return True
 
-        return self._renew_port_mappings()
+        self.forwarding_valid()
+        return await self._renew_port_mappings()

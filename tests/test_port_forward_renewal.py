@@ -36,7 +36,7 @@ class TestProtonMappingRenewal(unittest.IsolatedAsyncioTestCase):
         self.provider = ProtonProvider(self.config, self.state)
 
     async def test_refresh_adopts_and_persists_changed_port(self):
-        with patch("mole_pkg.providers.proton.run_in_netns", side_effect=[mapping("UDP"), mapping("TCP")]):
+        with patch("mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP"), mapping("TCP")]):
             self.assertTrue(await self.provider.refresh_port_forward())
         self.assertEqual(self.state.port, 23456)
         self.assertEqual((Path(self.directory.name) / "port").read_text().strip(), "23456")
@@ -56,7 +56,7 @@ class TestProtonMappingRenewal(unittest.IsolatedAsyncioTestCase):
         ]
         for responses in cases:
             with self.subTest(responses=responses), patch(
-                "mole_pkg.providers.proton.run_in_netns", side_effect=responses
+                "mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=responses
             ):
                 self.assertFalse(await self.provider.refresh_port_forward())
                 self.assertEqual(self.state.port, 12345)
@@ -64,30 +64,120 @@ class TestProtonMappingRenewal(unittest.IsolatedAsyncioTestCase):
 
     async def test_setup_requires_both_protocols_to_agree(self):
         with patch("mole_pkg.providers.proton.run_cmd", return_value=Mock(returncode=0)), patch(
-            "mole_pkg.providers.proton.run_in_netns", side_effect=[mapping("UDP"), mapping("TCP", port=34567)]
+            "mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP"), mapping("TCP", port=34567)]
         ):
             self.assertFalse(await self.provider.setup_port_forward())
         self.assertEqual(self.state.port, 12345)
 
     async def test_setup_persists_valid_mapping(self):
         with patch("mole_pkg.providers.proton.run_cmd", return_value=Mock(returncode=0)), patch(
-            "mole_pkg.providers.proton.run_in_netns", side_effect=[mapping("UDP"), mapping("TCP")]
+            "mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP"), mapping("TCP")]
         ):
             self.assertTrue(await self.provider.setup_port_forward())
         self.assertEqual(self.state.port, 23456)
 
     async def test_expiry_uses_shorter_protocol_lease(self):
         before = datetime.now()
-        with patch("mole_pkg.providers.proton.run_in_netns", side_effect=[mapping("UDP", lifetime=50), mapping("TCP", lifetime=40)]):
+        with patch("mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP", lifetime=50), mapping("TCP", lifetime=40)]):
             self.assertTrue(await self.provider.refresh_port_forward())
         self.assertLessEqual(self.state.port_expires, datetime.now() + timedelta(seconds=40))
-        self.assertGreaterEqual(self.state.port_expires, before + timedelta(seconds=40))
+        self.assertGreater(self.state.port_expires, before + timedelta(seconds=39))
 
     async def test_disabled_forwarding_does_not_request_mapping(self):
         self.config.port_forward = False
-        with patch("mole_pkg.providers.proton.run_in_netns") as run:
+        with patch("mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock) as run:
             self.assertTrue(await self.provider.refresh_port_forward())
         run.assert_not_called()
+
+    async def test_old_generation_cannot_publish_mapping(self):
+        self.state.generation = 1
+
+        def response(*args, **kwargs):
+            self.state.generation = 2
+            protocol = args[0][4].upper()
+            return mapping(protocol)
+
+        with patch('mole_pkg.providers.proton.run_in_netns', side_effect=response), patch(
+            'mole_pkg.providers.proton.async_run_in_netns', create=True, new_callable=AsyncMock, side_effect=response
+        ):
+            self.assertFalse(await self.provider.refresh_port_forward())
+        self.assertEqual(self.state.port, 12345)
+        self.assertFalse((Path(self.directory.name) / 'port').exists())
+
+    async def test_short_lease_uses_monotonic_deadline(self):
+        with patch('mole_pkg.providers.proton.run_in_netns', side_effect=[mapping('UDP', lifetime=2), mapping('TCP', lifetime=2)]), patch('mole_pkg.providers.proton.async_run_in_netns', create=True, new_callable=AsyncMock) as run:
+            run.side_effect = [mapping('UDP', lifetime=2), mapping('TCP', lifetime=2)]
+            self.assertTrue(await self.provider.refresh_port_forward())
+        self.assertLessEqual(self.provider.port_refresh_delay(45), 1)
+        with patch('mole_pkg.providers.proton.time.monotonic', return_value=time.monotonic() + 3):
+            self.assertFalse(self.provider.forwarding_valid())
+            self.assertFalse(self.state.forwarding_ready)
+
+    async def test_mapping_timeout_does_not_publish(self):
+        with patch('mole_pkg.providers.proton.async_run_in_netns', create=True, new_callable=AsyncMock) as run:
+            run.side_effect = asyncio.TimeoutError
+            self.assertFalse(await self.provider.refresh_port_forward())
+        self.assertEqual(self.state.port, 12345)
+
+    async def test_lease_expiring_during_second_reply_is_rejected(self):
+        clock = time.monotonic()
+
+        async def reply(cmd, *args, **kwargs):
+            nonlocal clock
+            protocol = cmd[4].upper()
+            if protocol == 'TCP':
+                clock += 3
+            return mapping(protocol, lifetime=2)
+
+        with patch('mole_pkg.providers.proton.time.monotonic', side_effect=lambda: clock), patch(
+            'mole_pkg.providers.proton.async_run_in_netns', new_callable=AsyncMock, side_effect=reply
+        ):
+            self.assertFalse(await self.provider.refresh_port_forward())
+        self.assertEqual(self.state.port, 12345)
+
+    async def test_wall_clock_jump_cannot_extend_lease(self):
+        with patch('mole_pkg.providers.proton.async_run_in_netns', new_callable=AsyncMock,
+                   side_effect=[mapping('UDP'), mapping('TCP')]):
+            self.assertTrue(await self.provider.refresh_port_forward())
+        deadline = self.state.port_deadline
+        self.state.port_expires = datetime.now() + timedelta(days=10)
+        with patch('mole_pkg.providers.proton.time.monotonic', return_value=deadline + 1):
+            self.assertFalse(self.provider.forwarding_valid())
+
+    async def test_mapping_writers_are_serialized(self):
+        active, peak = 0, 0
+
+        async def reply(cmd, *args, **kwargs):
+            nonlocal active, peak
+            active += 1
+            peak = max(active, peak)
+            await asyncio.sleep(.01)
+            active -= 1
+            return mapping(cmd[4].upper())
+
+        with patch('mole_pkg.providers.proton.async_run_in_netns', new_callable=AsyncMock, side_effect=reply):
+            results = await asyncio.gather(self.provider.refresh_port_forward(), self.provider.refresh_port_forward())
+        self.assertEqual(results, [True, True])
+        self.assertEqual(peak, 1)
+
+    async def test_initial_short_lease_is_refreshed_before_expiry(self):
+        mole = Mole.__new__(Mole)
+        mole.config = self.config
+        self.config.keepalive_interval = 45
+        mole.state = self.state
+        mole.state.connected = True
+        mole.state.port_deadline = time.monotonic() + .15
+        mole.provider = self.provider
+        mole.shutdown_event = asyncio.Event()
+        mole.torrent = None
+
+        async def refresh():
+            mole.shutdown_event.set()
+            return True
+
+        with patch.object(self.provider, 'refresh_port_forward', side_effect=refresh) as renew:
+            await asyncio.wait_for(mole._keepalive_loop(), timeout=.3)
+            renew.assert_awaited_once()
 
 
 class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):

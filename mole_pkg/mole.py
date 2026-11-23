@@ -487,7 +487,14 @@ class Mole:
 
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(max(0, next_refresh - loop.time()))
+                if self.state.connected and isinstance(self.provider, ProtonProvider):
+                    next_refresh = min(next_refresh, loop.time() +
+                                       self.provider.port_refresh_delay(self.config.keepalive_interval))
+                # Notice a newly established short lease while initial client
+                # synchronization is still running in another task.
+                await asyncio.sleep(min(1, max(0, next_refresh - loop.time())))
+                if loop.time() < next_refresh:
+                    continue
                 next_refresh = loop.time() + self.config.keepalive_interval
 
                 # Retry initial mapping failures without requiring a tunnel reconnect.
@@ -497,7 +504,10 @@ class Mole:
                         refresh_ok = await self.provider.refresh_port_forward()
                     else:
                         refresh_ok = await self.provider.setup_port_forward()
-                    next_refresh = loop.time() + self.config.keepalive_interval
+                    delay = self.config.keepalive_interval
+                    if isinstance(self.provider, ProtonProvider):
+                        delay = self.provider.port_refresh_delay(delay)
+                    next_refresh = loop.time() + delay
                     if refresh_ok and self.torrent:
                         # Client synchronization is supervised separately; a slow
                         # or failed API update does not mean the lease failed.

@@ -2,9 +2,11 @@
 MOLE Utilities - Logging, state management, and helper functions
 """
 
+import asyncio
 import logging
 import os
 import re
+import signal
 import subprocess
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -46,6 +48,50 @@ class VPNState:
     port_signature: Optional[str] = None
     port_expires: Optional[datetime] = None
     connected: bool = False
+    generation: int = 0
+    forwarding_ready: bool = False
+    port_deadline: float = 0.0
+
+
+async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subprocess.CompletedProcess:
+    """Own the command's process group until completion, timeout or cancellation."""
+    argv = ['ip', 'netns', 'exec', netns] + cmd
+
+    async def drain(task):
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+        return task.result()
+
+    spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True))
+    try:
+        process = await asyncio.shield(spawn)
+    except asyncio.CancelledError:
+        process = await drain(spawn)
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await drain(asyncio.create_task(process.communicate()))
+        raise
+
+    output = asyncio.create_task(process.communicate())
+    try:
+        stdout, stderr = await asyncio.wait_for(asyncio.shield(output), timeout=timeout)
+        return subprocess.CompletedProcess(argv, process.returncode,
+                                           stdout.decode(errors='replace'),
+                                           stderr.decode(errors='replace'))
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        await drain(output)
+        raise
 
 
 def run_cmd(cmd: list, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
