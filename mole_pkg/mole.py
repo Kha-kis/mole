@@ -397,10 +397,12 @@ class Mole:
                 remaining = (expiry - datetime.now(expiry.tzinfo)).total_seconds()
                 self.state.port_deadline = time.monotonic() + max(0, min(remaining, self.config.keepalive_interval * 2))
                 self.state.forwarding_ready = remaining > 0
-            self.state.last_error = ''
+            if self.state.connected:
+                self.state.last_error = ''
             return False
         self._mapping_failures = getattr(self, '_mapping_failures', 0) + 1
-        self.state.last_error = 'forwarding_unavailable'
+        if self.state.connected or not self.state.last_error:
+            self.state.last_error = 'forwarding_unavailable'
         return self._mapping_failures >= 3 and not getattr(self, '_mapping_recovered', False)
 
     async def _attempt_selected_server(self, old_server_ip):
@@ -673,6 +675,20 @@ class Mole:
         self._publish_readiness()
         return False
 
+    def _installed_tunnel_current(self) -> bool:
+        return bool(getattr(self, '_installed_peer_key', None)
+                    and self.state.server_ip
+                    and getattr(self, '_installed_generation', None) == self.state.generation
+                    and getattr(self, '_installed_server_ip', None) == self.state.server_ip)
+
+    def _can_maintain_forwarding(self) -> bool:
+        if getattr(self, '_connecting', False):
+            return False
+        if isinstance(self.provider, ProtonProvider):
+            # A failed HTTPS probe must not starve the installed peer's short lease.
+            return self._installed_tunnel_current()
+        return self.state.connected
+
     async def _keepalive_loop(self):
         """Port forwarding keepalive loop.
 
@@ -695,7 +711,7 @@ class Mole:
 
         while not self.shutdown_event.is_set():
             try:
-                if self.state.connected and isinstance(self.provider, ProtonProvider):
+                if self._can_maintain_forwarding() and isinstance(self.provider, ProtonProvider):
                     next_refresh = min(next_refresh, loop.time() +
                                        self.provider.port_refresh_delay(self.config.keepalive_interval))
                 # Notice a newly established short lease while initial client
@@ -707,7 +723,7 @@ class Mole:
 
                 # Retry initial mapping failures without requiring a tunnel reconnect.
                 # port_payload is PIA-specific and must not gate Proton renewals.
-                if self.state.connected and not getattr(self, '_connecting', False):
+                if self._can_maintain_forwarding():
                     generation = self.state.generation
                     if self.state.port:
                         refresh_ok = await self.provider.refresh_port_forward()
@@ -720,7 +736,7 @@ class Mole:
                     if isinstance(self.provider, ProtonProvider):
                         delay = self.provider.port_refresh_delay(delay)
                     next_refresh = loop.time() + delay
-                    if refresh_ok and self.torrent:
+                    if refresh_ok and self.torrent and self.state.connected:
                         # Client synchronization is supervised separately; a slow
                         # or failed API update does not mean the lease failed.
                         task = self._torrent_sync_task
@@ -876,8 +892,7 @@ class Mole:
         """Check VPN connection health"""
         try:
             peer_key = getattr(self, '_installed_peer_key', None)
-            if (not peer_key or getattr(self, '_installed_generation', None) != self.state.generation or
-                    getattr(self, '_installed_server_ip', None) != self.state.server_ip):
+            if not self._installed_tunnel_current():
                 return False
             generation = self.state.generation
             ready = await self._verify_transport(peer_key, time.monotonic() + min(10, self.config.vpn_ready_timeout),

@@ -328,6 +328,7 @@ class TestMoleCheckHealth(unittest.TestCase):
 
         mole = Mole()
         mole.state.server_vip = '10.0.0.1'
+        mole.state.server_ip = '192.0.2.1'
         mole._installed_peer_key = 'peer'
         mole._installed_server_ip = mole.state.server_ip
         mole._installed_generation = mole.state.generation
