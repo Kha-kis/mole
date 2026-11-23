@@ -17,6 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Isolate Proton SDK calls in stoppable helpers with serialized, generation-checked session adoption.
 - Bound namespace bootstrap, WireGuard, endpoint-policy, hook and client-service commands; make latency probes asynchronous.
 - Preserve installed-tunnel monitoring and forwarding leases while preparing an alternative server.
+- Continue installed-peer lease maintenance after a failed HTTPS health probe without claiming transport readiness.
 
 ### Validation Boundary
 - Synthetic regression coverage and Spec Kit assessment/fix/test records are included.

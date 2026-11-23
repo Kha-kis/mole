@@ -167,6 +167,10 @@ class TestProtonMappingRenewal(unittest.IsolatedAsyncioTestCase):
         mole.state = self.state
         mole.state.connected = True
         mole.state.port_deadline = time.monotonic() + .15
+        mole.state.server_ip = '192.0.2.1'
+        mole._installed_peer_key = 'synthetic-peer'
+        mole._installed_generation = mole.state.generation
+        mole._installed_server_ip = mole.state.server_ip
         mole.provider = self.provider
         mole.shutdown_event = asyncio.Event()
         mole.torrent = None
