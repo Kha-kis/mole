@@ -141,12 +141,15 @@ async def async_run_command(cmd: list, timeout: float, env=None,
     if timeout <= 0:
         raise ValueError('command timeout must be positive')
     deadline = asyncio.get_running_loop().time() + timeout
+    cancelled_during_cleanup = False
 
     async def drain(task):
+        nonlocal cancelled_during_cleanup
         while not task.done():
             try:
                 await asyncio.shield(task)
             except asyncio.CancelledError:
+                cancelled_during_cleanup = True
                 continue
         return task.result()
 
@@ -163,6 +166,8 @@ async def async_run_command(cmd: list, timeout: float, env=None,
         except ProcessLookupError:
             pass
         await drain(asyncio.create_task(process.communicate()))
+        if cancelled_during_cleanup:
+            raise asyncio.CancelledError
         raise
 
     output = asyncio.create_task(process.communicate(input_data))
@@ -178,6 +183,8 @@ async def async_run_command(cmd: list, timeout: float, env=None,
         except ProcessLookupError:
             pass
         await drain(output)
+        if cancelled_during_cleanup:
+            raise asyncio.CancelledError
         raise
 
 

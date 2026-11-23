@@ -196,8 +196,10 @@ class ProtonProvider(VPNProvider):
             raise ValueError('unsupported Proton operation')
         if self._sdk_lock is None:
             self._sdk_lock = asyncio.Lock()
+        generation = self.state.generation
         async with self._sdk_lock:
-            generation = self.state.generation
+            if generation != self.state.generation:
+                raise RuntimeError('stale queued Proton operation rejected')
             original = self._session_file.read_bytes() if self._session_file.exists() else None
             self._session_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
             staging = Path(tempfile.mkdtemp(prefix='.proton-job-', dir=str(self._session_file.parent)))

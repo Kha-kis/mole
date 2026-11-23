@@ -21,3 +21,10 @@ blocking was audited and is in an approved follow-up scope. Orphan zombies are
 reaped by the operating system, not by this process's child-wait interface.
 
 Recommendation: synthetic repair holds; complete the follow-up and live gates.
+
+## Bounded-Operations Addendum - 2026-11-23
+
+The SDK/lifecycle extension is implemented in isolated source and independently
+reviewed, with failure-first corrections. The full suite passes 494 tests. See
+`../blocking-provider-operations/test.md` for current evidence and limits.
+Live acceptance remains separate; no deployment was performed.

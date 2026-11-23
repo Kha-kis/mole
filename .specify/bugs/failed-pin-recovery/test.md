@@ -24,3 +24,10 @@ not exercised. Synchronous provider/setup work remains an approved follow-up.
 
 Recommendation: retain the reviewed source; do not deploy until that extension
 and the separate live-network gates pass.
+
+## Bounded-Operations Addendum - 2026-11-23
+
+The SDK/lifecycle extension is implemented in isolated source and independently
+reviewed, with failure-first corrections. The full suite passes 494 tests. See
+`../blocking-provider-operations/test.md` for current evidence and limits.
+Live acceptance remains separate; no deployment was performed.

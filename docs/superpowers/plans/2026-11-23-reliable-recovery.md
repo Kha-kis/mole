@@ -182,21 +182,21 @@ escape it. Disabled mode retains existing pinned/unpinned selection.
 **Files:** four `.specify/bugs/*/test.md` reports, `README.md`, `CHANGELOG.md`,
 generic test fixtures as needed. No deployment configuration belongs in this repo.
 
-- [ ] Run the actual original reproductions against the repaired code, targeted
+- [x] Run the actual original reproductions against the repaired code, targeted
       regressions and `python3 -m unittest discover -s tests -v`. Record exact
       exit status/counts and every baseline/new warning. Install no broad dev
       dependencies merely to replace the established suite.
-- [ ] Run entrypoint/version, Python 3.8 syntax compatibility, firewall and PIA
+- [x] Run entrypoint/version, Python 3.8 syntax compatibility, firewall and PIA
       checks. Keep generated QA files in the operator's approved disposable area.
-- [ ] Read-only Spec Kit test stage writes `verified`, `partial` or `failed` per
+- [x] Read-only Spec Kit test stage writes `verified`, `partial` or `failed` per
       slug; skipped real-network acceptance cannot be called live-verified.
-- [ ] Fresh independent branch review checks source, both entrypoints, policy
+- [x] Fresh independent branch review checks source, both entrypoints, policy
       bypasses, process cleanup, races, tests and privacy. Resolve findings through
       fix then test stages; never change source from the verification-only stage.
-- [ ] Remove constitution's temporary sync-review note before commit; inspect
+- [x] Remove constitution's temporary sync-review note before commit; inspect
       all generated `.specify`/`.agents` files for host data and unnecessary runtime
       state. Commit only intentional generic artifacts, no tool cache or fixtures.
-- [ ] Provide a private rollout checklist with package/config before-images,
+- [x] Provide a private rollout checklist with package/config before-images,
       current server/ASN checks, exact reviewed file set, one controlled restart,
       tunnel/DNS/lease/client/MaM acceptance and rollback. Deployment requires a
       separate gate; no auto merge, release or production restart in these tasks.

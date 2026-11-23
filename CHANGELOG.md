@@ -14,10 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serialize renewal requests; add explicit approved-server failover, physical cooldowns and bounded recovery.
 - Preserve a verified private tunnel during forwarding degradation; expose separate readiness fields and metrics.
 - Route the legacy run command through the shared runtime and configuration validation.
+- Isolate Proton SDK calls in stoppable helpers with serialized, generation-checked session adoption.
+- Bound namespace bootstrap, WireGuard, endpoint-policy, hook and client-service commands; make latency probes asynchronous.
+- Preserve installed-tunnel monitoring and forwarding leases while preparing an alternative server.
 
 ### Validation Boundary
 - Synthetic regression coverage and Spec Kit assessment/fix/test records are included.
-- Live rollout remains separate. Synchronous provider SDK/setup/hook paths remain an audited limitation.
+- Live rollout remains separate; PIA's provider API internals are outside this Proton-focused repair.
 
 ## [0.5.1] - 2026-11-11
 

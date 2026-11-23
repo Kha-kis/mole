@@ -53,13 +53,13 @@ input_data=None) -> subprocess.CompletedProcess`; input is optional bytes.
 `async_run_in_netns(cmd, netns, timeout, env=None)` delegates with the existing
 namespace prefix. Nonzero returns normally; timeout/cancellation reaps and raises.
 
-- [ ] Write failure-first tests for host-child heartbeat, private stdin/env,
+- [x] Write failure-first tests for host-child heartbeat, private stdin/env,
   timeout during blocked input, repeated cancellation and cancellation during
   spawn. Assert actual child cleanup and bounded elapsed time.
-- [ ] Run targeted tests; expected failure: missing generic interface.
-- [ ] Refactor the existing owner without weakening its namespace tests. Include
+- [x] Run targeted tests; expected failure: missing generic interface.
+- [x] Refactor the existing owner without weakening its namespace tests. Include
   launch/input time in the same deadline and safely drain creation before kill.
-- [ ] Run `python3 -m unittest discover -s tests -v`; expected: all pass with
+- [x] Run `python3 -m unittest discover -s tests -v`; expected: all pass with
   disclosed baseline warnings. Commit with verified GitHub noreply identity.
 
 ## Task 2: Isolated Proton SDK Jobs
@@ -75,20 +75,20 @@ operations are authenticate and the three existing API endpoints only.
 `_api_request` is async. Public authenticate/fetch/register signatures stay async.
 Key conversion stays the existing algorithm, but API key retrieval is awaited.
 
-- [ ] Add failure-first real-helper/fake-SDK tests: heartbeat during a delayed
+- [x] Add failure-first real-helper/fake-SDK tests: heartbeat during a delayed
   request, stuck timeout, cancellation after a staged write, generation change,
   serialization, saved-session preservation and secret-safe output/errors.
-- [ ] Run targeted tests; expected: current SDK path blocks or interfaces absent.
-- [ ] Implement a private per-job directory under provider state, copying only
+- [x] Run targeted tests; expected: current SDK path blocks or interfaces absent.
+- [x] Implement a private per-job directory under provider state, copying only
   the saved session. Worker credentials use stdin, not argv/environment. Adopt
   session by atomic replace only on successful current-generation completion.
   Kill/reap before retiring the job directory; never let a worker write live state.
-- [ ] Restrict operation/method/endpoint dispatch and return fixed error classes.
+- [x] Restrict operation/method/endpoint dispatch and return fixed error classes.
   Adapt old injected-SDK tests to the new boundary, preserving all assertions.
-- [ ] Replace synchronous latency joins in async server selection with bounded
+- [x] Replace synchronous latency joins in async server selection with bounded
   async ping commands (three seconds each, concurrency at most ten); preserve
   existing load fallback and configured latency behavior.
-- [ ] Run the full unittest suite; expected: all pass. Write fix evidence and
+- [x] Run the full unittest suite; expected: all pass. Write fix evidence and
   commit only intentional files with the verified noreply identity.
 
 ## Task 3: Bounded Setup, Switching And Hooks
@@ -102,34 +102,34 @@ reconciliation (10 seconds per command), async disconnect (30 seconds), async
 `Mole._run_hook(...) -> bool` (30 seconds). Existing synchronous network helpers
 remain for legacy callers; runtime uses the bounded variants.
 
-- [ ] Write failure-first tests for slow setup/hooks/service commands without
+- [x] Write failure-first tests for slow setup/hooks/service commands without
   heartbeat stalls, deadline/cancellation cleanup and secret-safe hook logs.
-- [ ] Add fail-closed ordering tests: DROP before bringing up external veth/NAT;
+- [x] Add fail-closed ordering tests: DROP before bringing up external veth/NAT;
   a failed policy command aborts before enabling that path. No real networking.
-- [ ] Add preparation tests: candidate SDK/certificate work cannot relabel or
+- [x] Add preparation tests: candidate SDK/certificate work cannot relabel or
   suppress healthy installed tunnel checks/lease maintenance. Invalidate and
   advance generation at the actual switch, rejecting old mapping/client results.
-- [ ] Implement bounded namespace/setup helpers and async hooks/disconnect/client
+- [x] Implement bounded namespace/setup helpers and async hooks/disconnect/client
   restart. Check endpoint-rule reconciliation before success. Preserve existing
   rules, DNS, routes and service ownership; no direct fallback.
-- [ ] Update only fixtures whose old sync mocks no longer match the boundary;
+- [x] Update only fixtures whose old sync mocks no longer match the boundary;
   retain assertions and forbid accidental live namespace/provider calls.
-- [ ] Run full unittest, firewall and PIA regressions; expected: all pass. Commit.
+- [x] Run full unittest, firewall and PIA regressions; expected: all pass. Commit.
 
 ## Task 4: Verification And Independent Extension Review
 
 **Files:** the new bug's `fix.md`/`test.md`, generic README/CHANGELOG updates;
 private operator evidence stays outside the repository.
 
-- [ ] Re-run the original 161 ms SDK heartbeat reproduction using the repaired
+- [x] Re-run the original 161 ms SDK heartbeat reproduction using the repaired
   path and offline SDK. Run real-child, worker, lifecycle and complete suites.
-- [ ] Run both entrypoint smoke checks and Python 3.8 syntax checks. Disclose
+- [x] Run both entrypoint smoke checks and Python 3.8 syntax checks. Disclose
   actual-interpreter/live-network checks not exercised and all remaining warnings.
-- [ ] Obtain one fresh independent review of the extension from `089d14c` onward.
+- [x] Obtain one fresh independent review of the extension from `089d14c` onward.
   Fix important findings through failure-first regressions and a green full suite.
-- [ ] Read-only Spec Kit verification records partial if live acceptance remains
+- [x] Read-only Spec Kit verification records partial if live acceptance remains
   unperformed. Reconcile earlier phase reports by dated addenda, not erasure.
-- [ ] Preserve source/evidence/lifecycle metadata; no implicit QA cleanup, live
+- [x] Preserve source/evidence/lifecycle metadata; no implicit QA cleanup, live
   installation, public push or release. Hand off the separate rollout gate.
 
 ## Self-Review And Execution

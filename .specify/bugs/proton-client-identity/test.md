@@ -20,3 +20,10 @@ Baseline warnings remain: three unclosed test files and one unawaited
 
 Recommendation: retain source fixes; do not claim live provider acceptance.
 Complete the approved blocking-operation extension and separate rollout gates.
+
+## Bounded-Operations Addendum - 2026-11-23
+
+The SDK/lifecycle extension is implemented in isolated source and independently
+reviewed, with failure-first corrections. The full suite passes 494 tests. See
+`../blocking-provider-operations/test.md` for current evidence and limits.
+Live acceptance remains separate; no deployment was performed.

@@ -22,3 +22,10 @@ not exercised; version smoke checks are not live runtime acceptance.
 
 Recommendation: retain the stricter semantics; hold deployment pending the
 approved blocking-operation extension and live-network acceptance.
+
+## Bounded-Operations Addendum - 2026-11-23
+
+The SDK/lifecycle extension is implemented in isolated source and independently
+reviewed, with failure-first corrections. The full suite passes 494 tests. See
+`../blocking-provider-operations/test.md` for current evidence and limits.
+Live acceptance remains separate; no deployment was performed.

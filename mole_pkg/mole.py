@@ -424,6 +424,8 @@ class Mole:
         self._start_torrent_sync(retry=True)
         if isinstance(self.provider, ProtonProvider):
             self._installed_server = dict(self.provider._selected_server)
+            atomic_write_state(Path(self.config.state_dir), 'server_name',
+                               self._installed_server['name'])
         return True
 
     async def _recover_candidates(self, reason):
@@ -437,8 +439,8 @@ class Mole:
             if getattr(self, '_mapping_recovered', False):
                 return self.state.connected
             self._mapping_recovered = True
-            if previous:
-                attempted.add(previous['entry_ip'])
+            if previous and await self.provider.restore_server(previous):
+                attempted.add(self.provider._selected_server['entry_ip'])
                 if await self._attempt_selected_server(self.state.server_ip):
                     if self.state.forwarding_ready:
                         self.provider.record_server_success()

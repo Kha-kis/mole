@@ -321,10 +321,23 @@ explicit numeric major.minor.patch override, applied equally to new and loaded
 sessions. A structured compatibility rejection stops password-login fallback.
 Do not guess versions or disable TLS verification to work around rejection.
 
-Current validation is synthetic. The provider SDK, certificate and legacy
-latency paths still contain synchronous work; NAT-PMP responsiveness tests do
-not prove those paths nonblocking. Live tunnel, DNS, port forwarding, client and
-tracker acceptance remain deployment gates.
+Proton SDK work runs in owned helper processes: authentication has a 120-second
+budget and API jobs 45 seconds. Jobs serialize saved-session updates through
+private staging files; only a successful, current-generation result is adopted.
+Timeout and cancellation stop the owned process group before retiring staging.
+Credentials travel through private pipes, not command arguments or diagnostic logs.
+
+Namespace initialization has a 120-second outer budget and installs blocking
+policies before enabling its external link. Ordinary runtime network/service
+commands have 10 seconds, WireGuard and hooks 30 seconds, and asynchronous latency
+probes three seconds each (at most ten concurrent). Preparing an alternative
+does not relabel the installed tunnel or stop its monitoring and lease renewal.
+
+Current validation is synthetic. Live tunnel, DNS, port forwarding, client and
+tracker acceptance remain deployment gates. PIA's provider API internals were
+not rewritten by this Proton-focused change. Python 3.8 syntax is checked, not
+an actual Python 3.8 interpreter run. Kernel-level process creation/reaping may
+delay cancellation cleanup beyond the configured operation budget.
 
 #### Server Stickiness
 By default, MOLE remembers the last working server and reconnects to it:
