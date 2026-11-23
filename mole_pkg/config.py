@@ -6,6 +6,8 @@ import ipaddress
 import os
 import re
 import subprocess
+import math
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -15,6 +17,13 @@ from .constants import (
     DEFAULT_STATE_DIR,
     DEFAULT_WG_CONF,
 )
+
+
+def validate_proton_client_version(value: str) -> str:
+    """Only a plain numeric release may enter the fixed provider identity."""
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}', value):
+        raise ValueError('PROTON_CLIENT_VERSION must be a numeric major.minor.patch release')
+    return value
 
 
 def load_config(config_path: str = DEFAULT_CONFIG_FILE) -> Dict[str, str]:
@@ -61,6 +70,82 @@ class Config:
     @property
     def vpn_provider(self) -> str:
         return self.get('VPN_PROVIDER', 'pia')
+
+    @property
+    def proton_client_version(self) -> str:
+        return validate_proton_client_version(self.get('PROTON_CLIENT_VERSION', '4.19.1'))
+
+    @property
+    def proton_failover_enabled(self) -> bool:
+        value = self.get('PROTON_FAILOVER_ENABLED', 'false').lower()
+        if value not in ('true', 'false', '1', '0', 'yes', 'no', 'on', 'off'):
+            raise ValueError('PROTON_FAILOVER_ENABLED must be a boolean')
+        return value in ('true', '1', 'yes', 'on')
+
+    @property
+    def proton_failover_servers(self) -> List[str]:
+        return [name.strip() for name in self.get('PROTON_FAILOVER_SERVERS', '').split(',') if name.strip()]
+
+    @property
+    def proton_failover_cooldown(self) -> float:
+        try:
+            value = float(self.get('PROTON_FAILOVER_COOLDOWN', '900'))
+            if not math.isfinite(value) or not 900 <= value <= 86400:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('PROTON_FAILOVER_COOLDOWN must be between 900 and 86400 seconds') from None
+
+    @property
+    def proton_failover_max_attempts(self) -> int:
+        try:
+            value = int(self.get('PROTON_FAILOVER_MAX_ATTEMPTS', '3'))
+            if not 1 <= value <= 3:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('PROTON_FAILOVER_MAX_ATTEMPTS must be between 1 and 3') from None
+
+    def validate_proton_failover(self):
+        if self.proton_failover_enabled:
+            from .recovery import ApprovedServerPolicy
+            self.proton_failover_max_attempts
+            ApprovedServerPolicy(self.proton_failover_servers, self.get('PROTON_SERVER', '').strip(),
+                                 self.proton_failover_cooldown)
+
+    @property
+    def vpn_ready_timeout(self) -> float:
+        try:
+            value = float(self.get('VPN_READY_TIMEOUT', '30'))
+            if not math.isfinite(value) or not 1 <= value <= 120:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('VPN_READY_TIMEOUT must be between 1 and 120 seconds') from None
+
+    @property
+    def vpn_ready_probes(self) -> List[str]:
+        urls = self.get('VPN_READY_PROBES', 'https://www.cloudflare.com/,https://www.wikipedia.org/').split(',')
+        if len(urls) != 2 or len(set(urls)) != 2:
+            raise ValueError('VPN_READY_PROBES requires two distinct public HTTPS URLs')
+        try:
+            for url in urls:
+                parsed = urlsplit(url)
+                host = parsed.hostname or ''
+                if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.query or
+                        parsed.fragment or not host or '.' not in host or host.endswith(('.local', '.localhost', '.internal')) or
+                        parsed.port not in (None, 443) or any(c.isspace() or ord(c) < 32 for c in url)):
+                    raise ValueError
+                try:
+                    address = ipaddress.ip_address(host)
+                except ValueError:
+                    pass
+                else:
+                    if not address.is_global:
+                        raise ValueError
+            return urls
+        except ValueError:
+            raise ValueError('VPN_READY_PROBES requires public HTTPS URLs without credentials, query or fragment') from None
 
     @property
     def netns(self) -> str:
@@ -479,6 +564,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         return False, errors
 
     # Required fields for PIA
+    for setting in ('vpn_ready_timeout', 'vpn_ready_probes'):
+        try:
+            getattr(config, setting)
+        except ValueError as exc:
+            errors.append(str(exc))
     if config.vpn_provider.lower() == 'pia':
         if not config.get('PIA_USER') or config.get('PIA_USER') == 'your_username':
             errors.append("PIA_USER is not set or still has default value")
@@ -539,7 +629,12 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
             errors.append(f"PIA CA certificate not found: {ca_cert}")
 
     # Required fields for ProtonVPN
-    elif config.vpn_provider.lower() in ('proton', 'protonvpn'):
+    if config.vpn_provider.lower() in ('proton', 'protonvpn'):
+        try:
+            config.proton_client_version
+            config.validate_proton_failover()
+        except ValueError as exc:
+            errors.append(str(exc))
         if not config.get('PROTON_USER'):
             errors.append("PROTON_USER is not set")
         if not config.get('PROTON_PASS'):

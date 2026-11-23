@@ -290,7 +290,8 @@ class TestMoleCheckHealth(unittest.TestCase):
         mock_run.return_value = MagicMock(returncode=1)  # Interface not found
 
         mole = Mole()
-        result = asyncio.run(mole._check_health())
+        with patch('mole_pkg.mole.read_wg_peer_key', side_effect=ValueError('no interface')):
+            result = asyncio.run(mole._check_health())
         self.assertFalse(result)
 
     @patch('mole_pkg.mole.Config')
@@ -301,6 +302,9 @@ class TestMoleCheckHealth(unittest.TestCase):
         """_check_health returns True when healthy"""
         mock_config_instance = MagicMock()
         mock_config_instance.netns = 'vpn'
+        mock_config_instance.vpn_ready_timeout = 1
+        mock_config_instance.watchdog_interval = 60
+        mock_config_instance.vpn_ready_probes = ['https://example.org/', 'https://example.com/']
         mock_config.return_value = mock_config_instance
         mock_provider.return_value = MagicMock()
         mock_torrent.return_value = None
@@ -324,8 +328,17 @@ class TestMoleCheckHealth(unittest.TestCase):
 
         mole = Mole()
         mole.state.server_vip = '10.0.0.1'
+        mole._installed_peer_key = 'peer'
+        mole._installed_server_ip = mole.state.server_ip
+        mole._installed_generation = mole.state.generation
 
-        result = asyncio.run(mole._check_health())
+        async def verify(cmd, *args, **kwargs):
+            return MagicMock(returncode=0, stdout=f'peer {int(datetime.now().timestamp())}' if cmd[0] == 'wg' else '200')
+
+        with patch('mole_pkg.mole.read_wg_peer_key', return_value='peer'), patch(
+            'mole_pkg.mole.async_run_in_netns', side_effect=verify
+        ), patch.object(mole, '_publish_readiness'):
+            result = asyncio.run(mole._check_health())
         self.assertTrue(result)
 
 
@@ -344,7 +357,7 @@ class TestMoleAsync(unittest.TestCase):
 
         mole = Mole()
 
-        with patch('mole_pkg.mole.disconnect_vpn') as mock_disconnect:
+        with patch('mole_pkg.mole.async_disconnect_vpn') as mock_disconnect:
             async def check_cleanup():
                 tasks = [asyncio.create_task(asyncio.sleep(3600)) for _ in range(3)]
                 mole._keepalive_task, mole._watchdog_task, mole._restart_watcher_task = tasks

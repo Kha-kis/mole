@@ -284,6 +284,61 @@ MOLE automatically persists your forwarded port for up to 60 days. The port sign
 
 ### ProtonVPN Features
 
+#### Verified Recovery
+
+A connection is ready only after a recent handshake with the intended peer and
+successful HTTPS transport through WireGuard. `VPN_READY_TIMEOUT` defaults to
+30 seconds. `VPN_READY_PROBES` takes two distinct public HTTPS URLs; either may
+succeed. HTTP denial still proves transport. Endpoint ping is not required.
+
+Automatic server failover is off by default. To enable it, set
+`PROTON_FAILOVER_ENABLED=true` and `PROTON_FAILOVER_SERVERS` to an ordered,
+comma-separated list of approved Proton names. A `PROTON_SERVER` pin must belong
+to that list and starts the ordering. Saved-server and new-server requests cannot
+escape it. Without failover, an unavailable explicit pin fails closed rather
+than silently selecting a different server.
+
+Recovery tries at most three distinct physical endpoints per cycle, skips failed
+addresses for at least 900 seconds, and backs off from 30 to 300 seconds after
+exhaustion. Overlapping renewal requests share one owner. Logical names can move
+between providers/ASNs; approve tracker authorization separately.
+
+NAT-PMP commands are asynchronous, limited to 10 seconds each and cleaned up on
+cancellation. Only matching UDP/TCP mappings are adopted. Short leases shorten
+the refresh interval. After three forwarding failures, one coordinated recovery
+may reconnect the same endpoint and then try approved alternatives. A verified
+VPN with unavailable forwarding remains private but degraded; failure of every
+tunnel remains blocked. No automatic tracker authorization changes are made.
+
+The API retains its existing fields and adds `tunnel_ready`, `forwarding_ready`,
+`client_ready`, `hook_ready`, `generation` and `last_error`. `connected` now means
+current verified tunnel evidence, not merely an existing interface. Saved ports
+are historical unless `forwarding_ready` is true. Runtime evidence is bound to
+the current process/boot and expires. Prometheus exposes separate readiness gauges.
+
+The default Proton client identity is 4.19.1. `PROTON_CLIENT_VERSION` accepts an
+explicit numeric major.minor.patch override, applied equally to new and loaded
+sessions. A structured compatibility rejection stops password-login fallback.
+Do not guess versions or disable TLS verification to work around rejection.
+
+Proton SDK work runs in owned helper processes: authentication has a 120-second
+budget and API jobs 45 seconds. Jobs serialize saved-session updates through
+private staging files; only a successful, current-generation result is adopted.
+Timeout and cancellation stop the owned process group before retiring staging.
+Credentials travel through private pipes, not command arguments or diagnostic logs.
+
+Namespace initialization has a 120-second outer budget and installs blocking
+policies before enabling its external link. Ordinary runtime network/service
+commands have 10 seconds, WireGuard and hooks 30 seconds, and asynchronous latency
+probes three seconds each (at most ten concurrent). Preparing an alternative
+does not relabel the installed tunnel or stop its monitoring and lease renewal.
+
+Current validation is synthetic. Live tunnel, DNS, port forwarding, client and
+tracker acceptance remain deployment gates. PIA's provider API internals were
+not rewritten by this Proton-focused change. Python 3.8 syntax is checked, not
+an actual Python 3.8 interpreter run. Kernel-level process creation/reaping may
+delay cancellation cleanup beyond the configured operation budget.
+
 #### Server Stickiness
 By default, MOLE remembers the last working server and reconnects to it:
 ```ini

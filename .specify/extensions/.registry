@@ -1,0 +1,21 @@
+{
+  "schema_version": "1.0",
+  "extensions": {
+    "bug": {
+      "version": "1.0.2",
+      "source": "local",
+      "manifest_hash": "sha256:00ec851a8e57713e9d65401e4c7fa5b4fa4a689decacb0b654ba5411c653b647",
+      "enabled": true,
+      "priority": 10,
+      "registered_commands": {
+        "codex": [
+          "speckit.bug.assess",
+          "speckit.bug.fix",
+          "speckit.bug.test"
+        ]
+      },
+      "registered_skills": [],
+      "installed_at": "2026-11-23T18:18:58.257600+00:00"
+    }
+  }
+}

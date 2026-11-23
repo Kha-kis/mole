@@ -5,46 +5,73 @@ Uses proton.Session with TLS pinning disabled for compatibility.
 Port forwarding uses NAT-PMP protocol.
 """
 
+import asyncio
 import json
+import os
 import re
+import shutil
+import sys
+import tempfile
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from proton import Session as ProtonAPISession
+try:
+    from proton import Session as ProtonAPISession
+except ImportError:
+    ProtonAPISession = None
 
-from ..config import Config
+from ..config import Config, validate_proton_client_version
+from ..recovery import ApprovedServerPolicy
 from ..utils import (
     VPNProvider,
     VPNState,
     log,
     run_cmd,
     run_in_netns,
+    async_run_in_netns,
+    async_run_command,
     sanitize_for_log,
     secure_write_file,
 )
 
 # Proton API configuration
 PROTON_API_URL = "https://account.protonvpn.com/api"
-PROTON_CLIENT_VERSION = "4.19.0"
+PROTON_CLIENT_VERSION = "4.19.1"
 PROTON_APP_VERSION = f"linux-vpn@{PROTON_CLIENT_VERSION}"
 PROTON_USER_AGENT = f"ProtonVPN/{PROTON_CLIENT_VERSION} (Linux)"
+SDK_API_OPERATIONS = {('/vpn/logicals', 'GET'),
+                      ('/vpn/v1/certificate/key/EC', 'GET'),
+                      ('/vpn/v1/certificate', 'POST')}
 
 
 class ProtonSessionWrapper:
     """Wrapper around proton.Session with persistence support"""
 
-    def __init__(self, session_file: Path):
+    def __init__(self, session_file: Path, client_version: str = PROTON_CLIENT_VERSION):
         self.session_file = session_file
         self._session: Optional[ProtonAPISession] = None
+        version = validate_proton_client_version(client_version)
+        self.app_version = f'linux-vpn@{version}'
+        self.user_agent = f'ProtonVPN/{version} (Linux)'
+        self.compatibility_rejected = False
+
+    def _classify_rejection(self, error: Exception) -> bool:
+        if getattr(error, 'code', None) in (5003, '5003'):
+            self.compatibility_rejected = True
+            log.error('Proton rejected the configured client version; review PROTON_CLIENT_VERSION')
+            return True
+        return False
 
     def _create_session(self) -> ProtonAPISession:
         """Create a new Proton API session"""
+        if ProtonAPISession is None:
+            raise RuntimeError('Proton support requires the optional proton-client package')
         return ProtonAPISession(
             api_url=PROTON_API_URL,
-            appversion=PROTON_APP_VERSION,
-            user_agent=PROTON_USER_AGENT,
+            appversion=self.app_version,
+            user_agent=self.user_agent,
             TLSPinning=False,  # Disable to avoid urllib3 compatibility issues
             timeout=30
         )
@@ -54,8 +81,8 @@ class ProtonSessionWrapper:
         try:
             if self.session_file.exists():
                 dump = json.loads(self.session_file.read_text())
-                dump["appversion"] = PROTON_APP_VERSION
-                dump["User-Agent"] = PROTON_USER_AGENT
+                dump["appversion"] = self.app_version
+                dump["User-Agent"] = self.user_agent
                 self._session = ProtonAPISession.load(
                     dump,
                     TLSPinning=False,
@@ -63,8 +90,8 @@ class ProtonSessionWrapper:
                 )
                 log.debug("Loaded saved Proton session")
                 return True
-        except Exception as e:
-            log.debug(f"Could not load session: {e}")
+        except Exception:
+            log.debug("Could not load saved Proton session")
         return False
 
     def save(self) -> None:
@@ -78,8 +105,8 @@ class ProtonSessionWrapper:
                 dump = json.dumps(dump)
             secure_write_file(self.session_file, dump)
             log.debug("Saved Proton session")
-        except Exception as e:
-            log.warning(f"Could not save session: {e}")
+        except Exception:
+            log.warning("Could not save Proton session")
 
     def refresh(self) -> bool:
         """Refresh access token"""
@@ -93,7 +120,8 @@ class ProtonSessionWrapper:
             log.info("Session refreshed successfully")
             return True
         except Exception as e:
-            log.warning(f"Session refresh failed: {e}")
+            if not self._classify_rejection(e):
+                log.warning("Proton session refresh failed")
             return False
 
     def authenticate(self, username: str, password: str, max_retries: int = 3) -> bool:
@@ -126,6 +154,8 @@ class ProtonSessionWrapper:
                 return True
 
             except Exception as e:
+                if self._classify_rejection(e):
+                    return False
                 error_str = str(e).lower()
                 # Check for rate limit indicators
                 if "too many" in error_str or "rate" in error_str or "429" in error_str:
@@ -136,7 +166,7 @@ class ProtonSessionWrapper:
                         log.error(f"Rate limited after {max_retries} retries. Wait before trying again.")
                         return False
 
-                log.error(f"Authentication failed: {sanitize_for_log(str(e))}")
+                log.error("Proton authentication failed")
                 return False
 
         return False
@@ -156,6 +186,107 @@ class ProtonProvider(VPNProvider):
         self._session_file = Path(self.config.state_dir) / "proton_session.json"
         self._proton_session: Optional[ProtonSessionWrapper] = None
         self._selected_server: Optional[Dict] = None
+        self._mapping_lock = None
+        self._recovery_policy = None
+        self._sdk_lock = None
+
+    async def _run_sdk_job(self, operation, endpoint='', method='GET', data=None) -> dict:
+        if not ((operation == 'authenticate' and not endpoint and method == 'GET') or
+                (operation == 'api' and (endpoint, method) in SDK_API_OPERATIONS)):
+            raise ValueError('unsupported Proton operation')
+        if self._sdk_lock is None:
+            self._sdk_lock = asyncio.Lock()
+        generation = self.state.generation
+        async with self._sdk_lock:
+            if generation != self.state.generation:
+                raise RuntimeError('stale queued Proton operation rejected')
+            original = self._session_file.read_bytes() if self._session_file.exists() else None
+            self._session_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            staging = Path(tempfile.mkdtemp(prefix='.proton-job-', dir=str(self._session_file.parent)))
+            staged_session = staging / 'session.json'
+            try:
+                if original is not None:
+                    secure_write_file(staged_session, original.decode())
+                request = dict(operation=operation, endpoint=endpoint, method=method, data=data,
+                               session_file=str(staged_session), username=self._user, password=self._pass,
+                               client_version=self.config.get('PROTON_CLIENT_VERSION', PROTON_CLIENT_VERSION))
+                env = dict(os.environ)
+                package_root = str(Path(__file__).resolve().parents[2])
+                env['PYTHONPATH'] = package_root + os.pathsep + env.get('PYTHONPATH', '')
+                result = await async_run_command(
+                    [sys.executable, '-m', 'mole_pkg.providers.proton_worker'],
+                    120 if operation == 'authenticate' else 45, env=env,
+                    input_data=json.dumps(request).encode())
+                if result.returncode != 0:
+                    raise RuntimeError('Proton helper failed')
+                reply = json.loads(result.stdout)
+                if not isinstance(reply, dict):
+                    raise RuntimeError('invalid Proton helper response')
+                if reply.get('error'):
+                    raise RuntimeError('Proton ' + ('client version rejected' if reply['error'] == 'compatibility' else 'operation failed'))
+                if not isinstance(reply.get('result'), dict):
+                    raise RuntimeError('invalid Proton helper response')
+                current = self._session_file.read_bytes() if self._session_file.exists() else None
+                if generation != self.state.generation or current != original:
+                    raise RuntimeError('stale Proton operation rejected')
+                session_data = json.loads(staged_session.read_text())
+                if not isinstance(session_data, dict):
+                    raise RuntimeError('invalid staged Proton session')
+                os.chmod(staged_session, 0o600)
+                os.replace(staged_session, self._session_file)
+                return reply['result']
+            except (asyncio.TimeoutError, OSError, ValueError, TypeError, KeyError):
+                raise RuntimeError('Proton operation failed') from None
+            finally:
+                shutil.rmtree(staging)
+
+    async def _api_request(self, endpoint, method='GET', data=None):
+        return await self._run_sdk_job('api', endpoint, method, data)
+
+    @property
+    def failover_enabled(self):
+        return self.config.get('PROTON_FAILOVER_ENABLED', 'false').lower() in ('true', '1', 'yes', 'on')
+
+    def _policy(self):
+        if self._recovery_policy is None:
+            # Reuse Config validation even when embedded callers provide only get().
+            settings = Config('/nonexistent')
+            settings._data = {key: self.config.get(key, default) for key, default in (
+                ('PROTON_FAILOVER_ENABLED', 'false'), ('PROTON_FAILOVER_SERVERS', ''),
+                ('PROTON_SERVER', ''), ('PROTON_FAILOVER_COOLDOWN', '900'),
+                ('PROTON_FAILOVER_MAX_ATTEMPTS', '3'))}
+            settings.validate_proton_failover()
+            self._recovery_policy = ApprovedServerPolicy(settings.proton_failover_servers,
+                self._server_name or '', settings.proton_failover_cooldown)
+        return self._recovery_policy
+
+    def record_server_failure(self, reason: str) -> None:
+        if self.failover_enabled and self._selected_server:
+            self._policy().failed(self._selected_server['entry_ip'], time.monotonic())
+
+    def record_server_success(self) -> None:
+        if self.failover_enabled and self._selected_server:
+            self._policy().succeeded(self._selected_server['entry_ip'])
+
+    def _select(self, server):
+        self._selected_server = server
+        if self.state.connected and self.state.tunnel_ready:
+            return
+        self.state.server_ip = server['entry_ip']
+        self.state.server_hostname = server['hostname']
+        self.state.server_country = server.get('country')
+
+    async def restore_server(self, previous):
+        servers = await self._fetch_servers()
+        if not servers:
+            return False
+        for candidate in self._filter_servers(servers):
+            if candidate['name'] == previous['name'] and candidate['entry_ip'] == previous['entry_ip']:
+                if self.failover_enabled and candidate['name'] not in self._policy().names:
+                    return False
+                self._select(candidate)
+                return True
+        return False
 
     @property
     def name(self) -> str:
@@ -239,42 +370,37 @@ class ProtonProvider(VPNProvider):
     async def authenticate(self) -> bool:
         """Authenticate with ProtonVPN"""
         log.info("Authenticating with ProtonVPN...")
-
-        self._proton_session = ProtonSessionWrapper(self._session_file)
-
-        # Try to load and refresh existing session
-        if self._proton_session.load():
-            if self._proton_session.refresh():
-                return True
-            log.warning("Session refresh failed, re-authenticating...")
-
-        # Fresh authentication
-        if not self._user or not self._pass:
-            log.error("PROTON_USER and PROTON_PASS must be set in config")
+        try:
+            result = await self._run_sdk_job('authenticate')
+            if result.get('authenticated') is not True:
+                return False
+            self._proton_session = ProtonSessionWrapper(
+                self._session_file, self.config.get('PROTON_CLIENT_VERSION', PROTON_CLIENT_VERSION))
+            return True
+        except RuntimeError:
+            log.warning('Proton authentication failed; check session and client compatibility')
             return False
-
-        return self._proton_session.authenticate(self._user, self._pass)
 
     async def _fetch_servers(self) -> Optional[List[Dict]]:
         """Fetch server list from ProtonVPN API"""
-        if not self._proton_session:
+        if not self._proton_session and not self._session_file.exists():
             log.error("Not authenticated")
             return None
 
         try:
             log.info("Fetching server list...")
-            response = self._proton_session.api_request("/vpn/logicals")
+            response = await self._api_request("/vpn/logicals")
 
             if response.get("Code") != 1000:
-                log.error(f"Failed to fetch servers: {response.get('Error')}")
+                log.error('Failed to fetch Proton servers')
                 return None
 
             servers = response.get("LogicalServers", [])
             log.info(f"Found {len(servers)} servers")
             return servers
 
-        except Exception as e:
-            log.error(f"Failed to fetch servers: {sanitize_for_log(str(e))}")
+        except Exception:
+            log.error('Failed to fetch Proton servers')
             return None
 
     def _filter_servers(self, servers: List[Dict], country: Optional[str] = None) -> List[Dict]:
@@ -308,6 +434,8 @@ class ProtonProvider(VPNProvider):
             # Get WireGuard server info
             servers_list = server.get("Servers", [])
             for s in servers_list:
+                if s.get('Status') == 0:
+                    continue
                 if s.get("X25519PublicKey"):
                     filtered.append({
                         "name": server.get("Name"),
@@ -326,12 +454,12 @@ class ProtonProvider(VPNProvider):
 
         return filtered
 
-    def _ping_server(self, server: Dict) -> Optional[float]:
+    async def _ping_server(self, server: Dict) -> Optional[float]:
         """Ping a server and return latency in ms, or None if unreachable"""
         try:
-            result = run_cmd(
+            result = await async_run_command(
                 ["ping", "-c", "1", "-W", "2", server["entry_ip"]],
-                check=False
+                timeout=3
             )
             if result.returncode == 0:
                 for part in result.stdout.split():
@@ -341,10 +469,8 @@ class ProtonProvider(VPNProvider):
             pass
         return None
 
-    def _filter_by_latency(self, servers: List[Dict]) -> List[Dict]:
+    async def _filter_by_latency(self, servers: List[Dict]) -> List[Dict]:
         """Filter and sort servers by latency if PROTON_MAX_LATENCY is set"""
-        import concurrent.futures
-
         max_latency = self._max_latency
         if max_latency <= 0 and len(servers) <= 5:
             # No latency filtering, just return sorted by load
@@ -356,13 +482,15 @@ class ProtonProvider(VPNProvider):
         test_servers = servers[:20]
         results = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(self._ping_server, s): s for s in test_servers}
-            for future in concurrent.futures.as_completed(futures):
-                server = futures[future]
-                latency = future.result()
-                if latency is not None:
-                    results.append((server, latency))
+        semaphore = asyncio.Semaphore(10)
+
+        async def probe(server):
+            async with semaphore:
+                return server, await self._ping_server(server)
+
+        for server, latency in await asyncio.gather(*(probe(s) for s in test_servers)):
+            if latency is not None:
+                results.append((server, latency))
 
         if not results:
             log.warning("Could not reach any servers, using load-based selection")
@@ -398,6 +526,14 @@ class ProtonProvider(VPNProvider):
         servers = await self._fetch_servers()
         if not servers:
             return False
+
+        if self.failover_enabled:
+            candidates = self._policy().candidates(self._filter_servers(servers), time.monotonic())
+            if not candidates:
+                log.warning('No approved Proton endpoint is outside cooldown')
+                return False
+            self._select(candidates[0])
+            return True
 
         target_name = self._server_name
         using_saved_server = False
@@ -439,10 +575,7 @@ class ProtonProvider(VPNProvider):
             if target_name:
                 for server in filtered:
                     if server["name"] == target_name:
-                        self._selected_server = server
-                        self.state.server_ip = server["entry_ip"]
-                        self.state.server_hostname = server["hostname"]
-                        self.state.server_country = server.get("country")
+                        self._select(server)
                         log.info(f"Server: {server['name']} ({server['entry_ip']})")
                         return True
 
@@ -451,22 +584,19 @@ class ProtonProvider(VPNProvider):
                     target_name = None
                     using_saved_server = False
                 else:
-                    log.warning(f"Server '{target_name}' not found, selecting best available")
-                    target_name = None
+                    # A strict pin may belong to a later configured country.
+                    continue
 
             # Apply latency filtering if configured or many servers
             if self._max_latency > 0 or len(filtered) > 5:
-                filtered = self._filter_by_latency(filtered)
+                filtered = await self._filter_by_latency(filtered)
             else:
                 # Sort by load (lower is better)
                 filtered.sort(key=lambda s: s["load"])
 
             if filtered:
                 server = filtered[0]
-                self._selected_server = server
-                self.state.server_ip = server["entry_ip"]
-                self.state.server_hostname = server["hostname"]
-                self.state.server_country = server.get("country")
+                self._select(server)
                 log.info(f"Server: {server['name']} ({server['entry_ip']}) - {server['load']}% load")
                 return True
 
@@ -478,7 +608,7 @@ class ProtonProvider(VPNProvider):
             log.error("  Port forwarding requires P2P servers (Plus plan)")
         return False
 
-    def _generate_wireguard_keys(self) -> tuple:
+    async def _generate_wireguard_keys(self) -> tuple:
         """Generate WireGuard keys via ProtonVPN API
 
         ProtonVPN requires EC (Ed25519) keys registered via their API.
@@ -492,10 +622,10 @@ class ProtonProvider(VPNProvider):
 
         # Step 1: Get EC keys from ProtonVPN API
         log.debug("Requesting EC keys from ProtonVPN...")
-        key_response = self._proton_session.api_request("/vpn/v1/certificate/key/EC")
+        key_response = await self._api_request("/vpn/v1/certificate/key/EC")
 
         if key_response.get('Code') != 1000:
-            raise Exception(f"Key generation failed: {key_response.get('Error')}")
+            raise RuntimeError('Proton key generation failed')
 
         private_key_pem = key_response.get('PrivateKey')
         public_key_pem = key_response.get('PublicKey')
@@ -566,7 +696,8 @@ class ProtonProvider(VPNProvider):
             log.error("Must authenticate and select server first")
             return False
 
-        server = self._selected_server
+        server = self._selected_server.copy()
+        generation = self.state.generation
 
         # Try to reuse saved certificate
         saved_cert = self._load_saved_certificate()
@@ -579,7 +710,7 @@ class ProtonProvider(VPNProvider):
 
             try:
                 # Generate WireGuard keys via ProtonVPN API
-                x25519_private_key, ed25519_public_key = self._generate_wireguard_keys()
+                x25519_private_key, ed25519_public_key = await self._generate_wireguard_keys()
 
                 # Use consistent device name for this installation
                 device_name = "mole"
@@ -602,14 +733,17 @@ class ProtonProvider(VPNProvider):
                     }
                 }
 
-                response = self._proton_session.api_request(
+                response = await self._api_request(
                     "/vpn/v1/certificate",
                     "POST",
                     cert_request
                 )
 
                 if response.get("Code") != 1000:
-                    log.error(f"Certificate registration failed: {response.get('Error')}")
+                    log.error('Proton certificate registration failed')
+                    return False
+
+                if generation != self.state.generation or self._selected_server != server:
                     return False
 
                 # Save certificate for future use
@@ -619,16 +753,19 @@ class ProtonProvider(VPNProvider):
 
                 log.info(f"New certificate registered (expires {datetime.fromtimestamp(expiration_time)})")
 
-            except Exception as e:
-                log.error(f"WireGuard registration error: {sanitize_for_log(str(e))}")
+            except Exception:
+                log.error('Proton WireGuard registration failed')
                 return False
 
         # Configure WireGuard with the certificate
         try:
+            if generation != self.state.generation or self._selected_server != server:
+                return False
             # Proton assigns addresses in 10.2.0.0/16 range
             peer_ip = "10.2.0.2"
-            self.state.peer_ip = peer_ip
-            self.state.server_vip = server["entry_ip"]
+            if not self.state.tunnel_ready:
+                self.state.peer_ip = peer_ip
+                self.state.server_vip = server["entry_ip"]
 
             # DNS server - use our DOT server if enabled, otherwise Proton's
             if self.config.dot_enabled:
@@ -655,14 +792,18 @@ class ProtonProvider(VPNProvider):
                 f"PersistentKeepalive = 25\n"
             )
             # Write WireGuard config with restricted permissions (contains private key)
-            secure_write_file(Path(self.config.wg_conf), wg_config)
+            config_path = Path(self.config.wg_conf)
+            temporary = config_path.with_name(config_path.name + '.pending')
+            secure_write_file(temporary, wg_config)
+            os.replace(temporary, config_path)
 
             # Save state
             state_dir = Path(self.config.state_dir)
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            secure_write_file(state_dir / "server_ip", self.state.server_ip)
-            secure_write_file(state_dir / "hostname", self.state.server_hostname)
-            secure_write_file(state_dir / "server_name", server["name"])
+            if not self.state.tunnel_ready:
+                secure_write_file(state_dir / "server_ip", server['entry_ip'])
+                secure_write_file(state_dir / "hostname", server['hostname'])
+                secure_write_file(state_dir / "server_name", server["name"])
 
             log.info(f"WireGuard configured, peer IP: {peer_ip}")
             return True
@@ -694,17 +835,18 @@ class ProtonProvider(VPNProvider):
         log.info("Setting up port forwarding via NAT-PMP...")
 
         # Check if natpmpc is installed
-        result = run_cmd(["which", "natpmpc"], check=False)
+        result = await async_run_command(["which", "natpmpc"], timeout=10)
         if result.returncode != 0:
             log.error("natpmpc not installed. Install with: apt install natpmpc")
             return False
 
-        return self._renew_port_mappings()
+        return await self._renew_port_mappings()
 
-    def _request_port_mapping(self, protocol: str):
-        result = run_in_netns([
+    async def _request_port_mapping(self, protocol: str):
+        started = time.monotonic()
+        result = await async_run_in_netns([
             "natpmpc", "-a", "1", "0", protocol, "60", "-g", self._natpmp_gateway
-        ], self.config.netns, check=False)
+        ], self.config.netns, timeout=10)
         if result.returncode != 0:
             log.warning(f"NAT-PMP {protocol.upper()} request failed")
             return None
@@ -721,15 +863,40 @@ class ProtonProvider(VPNProvider):
         if not 1 <= port <= 65535 or lifetime <= 0:
             log.warning(f"Invalid NAT-PMP {protocol.upper()} port or lifetime")
             return None
-        return port, datetime.now() + timedelta(seconds=lifetime)
+        return port, started + lifetime
 
-    def _renew_port_mappings(self) -> bool:
+    def forwarding_valid(self) -> bool:
+        valid = bool(self.state.port and self.state.port_deadline > time.monotonic())
+        self.state.forwarding_ready = valid
+        return valid
+
+    def port_refresh_delay(self, configured: float) -> float:
+        remaining = self.state.port_deadline - time.monotonic()
+        if remaining <= 0:
+            self.state.forwarding_ready = False
+            return min(configured, 5)
+        return min(configured, 45, max(.1, remaining / 2))
+
+    async def _renew_port_mappings(self) -> bool:
+        generation = self.state.generation
+        if self._mapping_lock is None:
+            self._mapping_lock = asyncio.Lock()
+        async with self._mapping_lock:
+            if generation != self.state.generation:
+                return False
+            return await self._renew_locked(generation)
+
+    async def _renew_locked(self, generation: int) -> bool:
         try:
-            udp = self._request_port_mapping("udp")
+            udp = await self._request_port_mapping("udp")
             if udp is None:
                 return False
-            tcp = self._request_port_mapping("tcp")
+            tcp = await self._request_port_mapping("tcp")
             if tcp is None:
+                return False
+
+            deadline = min(udp[1], tcp[1])
+            if generation != self.state.generation or deadline <= time.monotonic():
                 return False
             if udp[0] != tcp[0]:
                 log.warning(f"NAT-PMP protocol port mismatch: UDP={udp[0]}, TCP={tcp[0]}")
@@ -740,17 +907,23 @@ class ProtonProvider(VPNProvider):
             previous_port = self.state.port or self._load_saved_port()
             secure_write_file(Path(self.config.state_dir) / "port", str(port))
             self.state.port = port
-            self.state.port_expires = min(udp[1], tcp[1])
+            if previous_port != port:
+                self.state.client_ready = False
+            self.state.port_deadline = deadline
+            self.state.port_expires = datetime.now() + timedelta(seconds=deadline - time.monotonic())
+            self.state.forwarding_ready = True
             if previous_port != port:
                 log.info(f"NAT-PMP forwarded port changed: {previous_port} -> {port}")
             return True
-        except Exception as e:
-            log.error(f"Port mapping renewal error: {sanitize_for_log(str(e))}")
+        except Exception:
+            self.forwarding_valid()
+            log.warning("NAT-PMP mapping renewal failed or timed out")
             return False
 
     async def refresh_port_forward(self) -> bool:
         """Refresh NAT-PMP port mapping (must be called every ~45 seconds)"""
-        if not self.config.port_forward or not self.state.port:
+        if not self.config.port_forward:
             return True
 
-        return self._renew_port_mappings()
+        self.forwarding_valid()
+        return await self._renew_port_mappings()

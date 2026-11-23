@@ -48,6 +48,12 @@ PIA_REGION=ca_toronto
 
 # PROTON_USER=your_proton_email
 # PROTON_PASS=your_proton_password
+# Explicit compatibility override; plain major.minor.patch only.
+# PROTON_CLIENT_VERSION=4.19.1
+
+# Readiness requires a recent intended-peer handshake and HTTPS via WireGuard.
+VPN_READY_TIMEOUT=30
+VPN_READY_PROBES=https://www.cloudflare.com/,https://www.wikipedia.org/
 
 # Country code (or comma-separated fallback list, tried in order)
 # If first country has no suitable servers, tries next country, etc.
@@ -60,6 +66,13 @@ PIA_REGION=ca_toronto
 # Specific server name (optional, overrides auto-selection)
 # Example: NL#458, CH#1, US-CA#1
 # PROTON_SERVER=
+
+# Optional automatic recovery, restricted to this explicit ordered list.
+# A configured PROTON_SERVER must be a member. Names below are placeholders.
+PROTON_FAILOVER_ENABLED=false
+# PROTON_FAILOVER_SERVERS=XX#1,XX#2,XX#3
+PROTON_FAILOVER_COOLDOWN=900
+PROTON_FAILOVER_MAX_ATTEMPTS=3
 
 # Account tier: 0=free, 1=basic, 2=plus/visionary (default: 2)
 # Port forwarding requires tier 2 (Plus plan)

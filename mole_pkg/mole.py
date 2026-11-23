@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -17,7 +18,7 @@ from typing import Optional, List
 from . import __version__
 from .config import Config
 from .constants import DEFAULT_CONFIG_FILE
-from .network import setup_namespace, disconnect_vpn, allow_vpn_server_ip
+from .network import async_setup_namespace, async_disconnect_vpn, async_allow_vpn_server_ip
 from .providers import PIAProvider, ProtonProvider
 from .services import QBittorrentClient
 from .utils import (
@@ -30,6 +31,11 @@ from .utils import (
     log,
     run_cmd,
     run_in_netns,
+    async_run_in_netns,
+    async_run_command,
+    handshake_timestamp,
+    read_wg_peer_key,
+    write_runtime_readiness,
     sanitize_for_log,
     secure_write_file,
 )
@@ -79,6 +85,17 @@ class Mole:
         self.shutdown_event = asyncio.Event()
         self._torrent_update_lock = None
         self._torrent_sync_task = None
+        self._listener_task = None
+        self._installed_server_ip = None
+        self._installed_peer_key = None
+        self._installed_generation = None
+        self._renewal_task = None
+        self._mapping_recovery_task = None
+        self._connecting = False
+        self._mapping_failures = 0
+        self._mapping_recovered = False
+        self._recovery_not_before = 0
+        self._recovery_exhaustions = 0
         self._keepalive_task = None
         self._watchdog_task = None
         self._restart_watcher_task = None
@@ -112,7 +129,7 @@ class Mole:
             restart_trigger.unlink()
 
         # Setup network namespace
-        setup_namespace(self.config)
+        await async_setup_namespace(self.config)
 
         # Start DNS server in namespace if enabled (must start BEFORE VPN connects)
         if self.config.dot_enabled:
@@ -301,6 +318,9 @@ class Mole:
         tasks = [task for task in (
             self._keepalive_task, self._watchdog_task, self._restart_watcher_task,
             getattr(self, '_torrent_sync_task', None),
+            getattr(self, '_mapping_recovery_task', None),
+            getattr(self, '_renewal_task', None),
+            getattr(self, '_listener_task', None),
         ) if task is not None]
         for task in tasks:
             task.cancel()
@@ -317,10 +337,16 @@ class Mole:
         self._stop_subprocess(self._dns_proc, "DNS")
 
         # Run pre-disconnect hook while the VPN namespace is still live
-        self._run_hook(self.config.post_disconnect_hook, "POST_DISCONNECT_HOOK")
+        await self._run_hook(self.config.post_disconnect_hook, "POST_DISCONNECT_HOOK")
 
+        # Invalidate evidence before bringing down the VPN.
+        self.state.generation += 1
+        self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
+        self.state.tunnel_deadline = self.state.port_deadline = 0
+        self.state.last_error = 'stopped'
+        self._publish_readiness()
         # Bring down VPN
-        disconnect_vpn(self.config)
+        await async_disconnect_vpn(self.config)
         log.info("Cleanup complete")
 
     def _write_state_files(self):
@@ -340,7 +366,126 @@ class Mole:
         if self.state.port:
             secure_write_file(state_dir / 'port', str(self.state.port))
 
-    async def _full_renewal(self) -> bool:
+    async def _full_renewal(self, reason: str = 'scheduled') -> bool:
+        active = getattr(self, '_renewal_task', None)
+        if active is not None and not active.done():
+            return await asyncio.shield(active)
+        if time.monotonic() < getattr(self, '_recovery_not_before', 0):
+            return False
+        task = asyncio.create_task(self._full_renewal_owned(reason))
+        self._renewal_task = task
+        try:
+            return await task
+        finally:
+            if task.done() and self._renewal_task is task:
+                self._renewal_task = None
+
+    def _defer_recovery(self):
+        count = min(getattr(self, '_recovery_exhaustions', 0), 4)
+        delay = min(300, 30 * (2 ** count) + random.uniform(0, 5))
+        self._recovery_not_before = time.monotonic() + delay
+        self._recovery_exhaustions = count + 1
+
+    def _mapping_result(self, success: bool) -> bool:
+        if success:
+            self._mapping_failures = 0
+            self._mapping_recovered = False
+            self._recovery_not_before = 0
+            self._recovery_exhaustions = 0
+            if not isinstance(self.provider, ProtonProvider) and self.state.port_expires:
+                expiry = self.state.port_expires
+                remaining = (expiry - datetime.now(expiry.tzinfo)).total_seconds()
+                self.state.port_deadline = time.monotonic() + max(0, min(remaining, self.config.keepalive_interval * 2))
+                self.state.forwarding_ready = remaining > 0
+            self.state.last_error = ''
+            return False
+        self._mapping_failures = getattr(self, '_mapping_failures', 0) + 1
+        self.state.last_error = 'forwarding_unavailable'
+        return self._mapping_failures >= 3 and not getattr(self, '_mapping_recovered', False)
+
+    async def _attempt_selected_server(self, old_server_ip):
+        if not await self.provider.register_wireguard():
+            return False
+        self._connecting = True
+        if isinstance(self.provider, ProtonProvider):
+            server = self.provider._selected_server
+            self.state.server_ip = server['entry_ip']
+            self.state.server_hostname = server['hostname']
+            self.state.server_country = server.get('country')
+            self.state.server_vip = server['entry_ip']
+            self.state.peer_ip = '10.2.0.2'
+        try:
+            if not await self._connect_vpn(old_server_ip):
+                return False
+        finally:
+            self._connecting = False
+        if self.config.port_forward:
+            self._mapping_result(await self.provider.setup_port_forward())
+        self._start_torrent_sync(retry=True)
+        if isinstance(self.provider, ProtonProvider):
+            self._installed_server = dict(self.provider._selected_server)
+            atomic_write_state(Path(self.config.state_dir), 'server_name',
+                               self._installed_server['name'])
+        return True
+
+    async def _recover_candidates(self, reason):
+        proton = isinstance(self.provider, ProtonProvider)
+        enabled = proton and self.provider.failover_enabled
+        limit = self.config.proton_failover_max_attempts if enabled else 1
+        installed = getattr(self, '_installed_server', None) or (self.provider._selected_server if proton else None)
+        previous = dict(installed) if proton and installed and self.state.tunnel_ready else None
+        attempted = set()
+        if reason == 'mapping':
+            if getattr(self, '_mapping_recovered', False):
+                return self.state.connected
+            self._mapping_recovered = True
+            if previous and await self.provider.restore_server(previous):
+                attempted.add(self.provider._selected_server['entry_ip'])
+                if await self._attempt_selected_server(self.state.server_ip):
+                    if self.state.forwarding_ready:
+                        self.provider.record_server_success()
+                        return True
+                self.provider.record_server_failure('mapping')
+
+        while len(attempted) < limit:
+            old_server_ip = self.state.server_ip
+            if not await self.provider.get_server():
+                break
+            address = self.provider._selected_server['entry_ip'] if proton else self.state.server_ip
+            if address in attempted:
+                break
+            attempted.add(address)
+            ready = await self._attempt_selected_server(old_server_ip)
+            if ready:
+                if proton:
+                    previous = dict(self.provider._selected_server)
+                if not self.config.port_forward or self.state.forwarding_ready or reason != 'mapping':
+                    if proton:
+                        self.provider.record_server_success()
+                    return True
+            if proton:
+                self.provider.record_server_failure('mapping' if ready else 'readiness')
+            if not enabled:
+                break
+
+        # Keep a verified private tunnel even when every mapping option failed.
+        if self.state.tunnel_ready:
+            self._defer_recovery()
+            return True
+        # One restoration is allowed only to a previously verified eligible
+        # endpoint already counted in this bounded cycle.
+        if previous and previous['entry_ip'] in attempted:
+            old_server_ip = self.state.server_ip
+            if await self.provider.restore_server(previous):
+                if await self._attempt_selected_server(old_server_ip):
+                    self._defer_recovery()
+                    return True
+        self.state.connected = self.state.tunnel_ready = False
+        self.state.last_error = 'approved_recovery_exhausted'
+        self._defer_recovery()
+        return False
+
+    async def _full_renewal_owned(self, reason: str) -> bool:
         """Full VPN renewal process.
 
         Operationally instrumented: every renewal attempt increments either
@@ -362,36 +507,18 @@ class Mole:
         try:
             # Step 1: Authenticate
             if not await self.provider.authenticate():
+                self.state.last_error = 'authentication_failed'
+                self._defer_recovery()
                 return False
 
-            # Step 2: Get server
-            if not await self.provider.get_server():
+            if not await self._recover_candidates(reason):
                 return False
-
-            # Step 3: Register WireGuard
-            if not await self.provider.register_wireguard():
-                return False
-
-            # Step 4: Connect VPN
-            if not await self._connect_vpn(old_server_ip):
-                return False
-
-            # Step 5: Setup port forwarding (if enabled)
-            if self.config.port_forward:
-                if not await self.provider.setup_port_forward():
-                    return False
-
-                # Step 6: Update torrent client interface and port (if configured)
-                # Retry with delay since torrent client may still be starting up
-                if self.torrent:
-                    await self._update_torrent_client()
-
-                log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
-            else:
-                log.info(f"Renewal complete! Server: {self.state.server_hostname} (port forwarding disabled)")
+            if not self.config.port_forward:
+                self._recovery_not_before = self._recovery_exhaustions = 0
 
             # Run post-connect hook if configured
-            self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK")
+            if self.config.post_connect_hook:
+                self.state.hook_ready = bool(await self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK"))
 
             # Write state files for API to read
             self._write_state_files()
@@ -399,6 +526,7 @@ class Mole:
             success = True
             return True
         finally:
+            self._publish_readiness()
             duration = time.time() - renewal_start
             try:
                 if success:
@@ -432,38 +560,118 @@ class Mole:
         log.info("Connecting VPN...")
 
         netns = self.config.netns
-
-        # Bring down existing connection
-        run_in_netns(["wg-quick", "down", "mole"], netns, check=False)
-
-        # Allow traffic to VPN server IP through the kill switch
-        allow_vpn_server_ip(self.config, self.state.server_ip, old_server_ip)
-
-        # Update routes
-        if old_server_ip:
-            run_in_netns(["ip", "route", "del", old_server_ip, "via", self.config.veth_host_ip], netns, check=False)
-
-        run_in_netns([
-            "ip", "route", "add", self.state.server_ip,
-            "via", self.config.veth_host_ip, "dev", "veth-vpn"
-        ], netns, check=False)
-
-        # Bring up WireGuard
-        result = run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, check=False)
-        if result.returncode != 0:
-            log.error(f"Failed to bring up WireGuard: {sanitize_for_log(result.stderr)}")
+        old_server_ip = getattr(self, '_installed_server_ip', None) or old_server_ip
+        self.state.generation += 1
+        self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
+        self.state.tunnel_deadline = self.state.port_deadline = 0
+        self.state.last_error = 'connecting'
+        self._publish_readiness()
+        try:
+            peer_key = read_wg_peer_key(self.config.wg_conf)
+        except ValueError:
+            self.state.last_error = 'invalid_peer_config'
+            self._publish_readiness()
             return False
 
-        await asyncio.sleep(5)
+        # Bring down existing connection
+        self._installed_peer_key = self._installed_generation = None
+        try:
+            await async_run_in_netns(["wg-quick", "down", "mole"], netns, timeout=30)
 
-        # Verify connection
-        result = run_in_netns(["ping", "-c", "1", "-W", "5", self.state.server_vip], netns, check=False)
+            # Allow traffic to VPN server IP through the kill switch.
+            await async_allow_vpn_server_ip(self.config, self.state.server_ip, old_server_ip)
+
+            # Update routes only after endpoint policy is reconciled.
+            if old_server_ip:
+                await async_run_in_netns(["ip", "route", "del", old_server_ip, "via", self.config.veth_host_ip], netns, timeout=10)
+
+            route = await async_run_in_netns([
+                "ip", "route", "replace", self.state.server_ip,
+                "via", self.config.veth_host_ip, "dev", "veth-vpn"
+            ], netns, timeout=10)
+            if route.returncode != 0:
+                raise RuntimeError('VPN endpoint route failed')
+            self._installed_server_ip = self.state.server_ip
+
+            # Bring up WireGuard.
+            self._attempt_wall = int(time.time())
+            result = await async_run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, timeout=30)
+        except (asyncio.TimeoutError, OSError, RuntimeError):
+            self.state.last_error = 'wireguard_setup_failed'
+            self._publish_readiness()
+            log.error('VPN setup command failed')
+            return False
         if result.returncode != 0:
-            log.warning("VPN connectivity check failed, but continuing...")
+            self.state.last_error = 'wireguard_setup_failed'
+            self._publish_readiness()
+            log.error("Failed to bring up WireGuard")
+            return False
 
-        self.state.connected = True
-        log.info("VPN connected")
-        return True
+        self._installed_peer_key = peer_key
+        self._installed_generation = self.state.generation
+
+        ready = await self._wait_for_readiness(peer_key, time.monotonic())
+        if ready:
+            log.info("VPN handshake and tunnel egress verified")
+        return ready
+
+    def _publish_readiness(self):
+        try:
+            write_runtime_readiness(Path(self.config.state_dir), self.state)
+        except OSError:
+            log.warning('Could not publish runtime readiness')
+
+    async def _verify_transport(self, peer_key, deadline, not_before):
+        for target in self.config.vpn_ready_probes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            timeout = min(5, remaining)
+            try:
+                response = await asyncio.wait_for(async_run_in_netns(
+                    ['curl', '--silent', '--head', '--output', '/dev/null', '--write-out', '%{http_code}',
+                     '--interface', 'mole', '--noproxy', '*', '--proto', '=https',
+                     '--max-time', str(timeout), target], self.config.netns, timeout), timeout)
+                if response.returncode != 0 or not response.stdout.strip().isdigit() or not 100 <= int(response.stdout.strip()) <= 599:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                handshake = await asyncio.wait_for(async_run_in_netns(
+                    ['wg', 'show', 'mole', 'latest-handshakes'], self.config.netns, min(5, remaining)), remaining)
+                if handshake.returncode == 0 and handshake_timestamp(handshake.stdout, peer_key, time.time(), not_before) is not None:
+                    return True
+            except (OSError, asyncio.TimeoutError):
+                continue
+        return False
+
+    async def _wait_for_readiness(self, peer_key: str, attempt_started: float) -> bool:
+        deadline = attempt_started + self.config.vpn_ready_timeout
+        generation = self.state.generation
+        try:
+            while time.monotonic() < deadline and generation == self.state.generation:
+                if await self._verify_transport(peer_key, deadline, self._attempt_wall):
+                    if generation != self.state.generation:
+                        return False
+                    self.state.connected = self.state.tunnel_ready = True
+                    self.state.tunnel_deadline = time.monotonic() + max(90, 2 * self.config.watchdog_interval + 10)
+                    self.state.last_error = ''
+                    self._publish_readiness()
+                    return True
+                await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+        except asyncio.CancelledError:
+            if generation != self.state.generation:
+                raise
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.last_error = 'readiness_cancelled'
+            self._publish_readiness()
+            raise
+        if generation != self.state.generation:
+            return False
+        self.state.connected = self.state.tunnel_ready = False
+        self.state.last_error = 'readiness_unproven'
+        self._publish_readiness()
+        return False
 
     async def _keepalive_loop(self):
         """Port forwarding keepalive loop.
@@ -487,17 +695,31 @@ class Mole:
 
         while not self.shutdown_event.is_set():
             try:
-                await asyncio.sleep(max(0, next_refresh - loop.time()))
+                if self.state.connected and isinstance(self.provider, ProtonProvider):
+                    next_refresh = min(next_refresh, loop.time() +
+                                       self.provider.port_refresh_delay(self.config.keepalive_interval))
+                # Notice a newly established short lease while initial client
+                # synchronization is still running in another task.
+                await asyncio.sleep(min(1, max(0, next_refresh - loop.time())))
+                if loop.time() < next_refresh:
+                    continue
                 next_refresh = loop.time() + self.config.keepalive_interval
 
                 # Retry initial mapping failures without requiring a tunnel reconnect.
                 # port_payload is PIA-specific and must not gate Proton renewals.
-                if self.state.connected:
+                if self.state.connected and not getattr(self, '_connecting', False):
+                    generation = self.state.generation
                     if self.state.port:
                         refresh_ok = await self.provider.refresh_port_forward()
                     else:
                         refresh_ok = await self.provider.setup_port_forward()
-                    next_refresh = loop.time() + self.config.keepalive_interval
+                    if generation != self.state.generation:
+                        continue
+                    recovery_due = self._mapping_result(refresh_ok)
+                    delay = self.config.keepalive_interval
+                    if isinstance(self.provider, ProtonProvider):
+                        delay = self.provider.port_refresh_delay(delay)
+                    next_refresh = loop.time() + delay
                     if refresh_ok and self.torrent:
                         # Client synchronization is supervised separately; a slow
                         # or failed API update does not mean the lease failed.
@@ -521,6 +743,12 @@ class Mole:
                         log.info(f"Port {self.state.port} keepalive OK")
                     else:
                         log.warning("Port keepalive failed")
+                    self._publish_readiness()
+                    task = getattr(self, '_mapping_recovery_task', None)
+                    if recovery_due and (task is None or task.done()):
+                        task = asyncio.create_task(self._full_renewal(reason='mapping'))
+                        self._mapping_recovery_task = task
+                        task.add_done_callback(self._recovery_finished)
 
             except asyncio.CancelledError:
                 break
@@ -538,6 +766,30 @@ class Mole:
         except Exception as exc:
             log.warning(f"qBittorrent synchronization failed: {sanitize_for_log(str(exc))}")
 
+    def _start_torrent_sync(self, retry=False):
+        if not self.torrent:
+            return
+        active = getattr(self, '_torrent_sync_task', None)
+        if active is None or active.done():
+            operation = self._update_torrent_client() if retry else self._sync_torrent_binding()
+            task = asyncio.create_task(operation)
+            self._torrent_sync_task = task
+            task.add_done_callback(self._torrent_sync_finished)
+
+    def _listener_finished(self, task):
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                log.warning('Torrent listener supervision failed')
+
+    def _recovery_finished(self, task):
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                log.error('Coordinated VPN recovery failed')
+
     def _torrent_lock(self):
         # Python 3.8 locks capture their loop eagerly; construct only on use.
         if self._torrent_update_lock is None:
@@ -547,6 +799,7 @@ class Mole:
     async def _sync_torrent_binding(self) -> bool:
         async with self._torrent_lock():
             while True:
+                generation = self.state.generation
                 address, port = self.state.peer_ip, self.state.port
                 if not address:
                     log.warning("Cannot synchronize torrent binding without a tunnel address")
@@ -554,7 +807,11 @@ class Mole:
                 success = await self.torrent.set_interface("mole", address)
                 if success and port:
                     success = await self.torrent.set_listen_port(port)
+                if generation != self.state.generation:
+                    return False
                 if (address, port) == (self.state.peer_ip, self.state.port):
+                    self.state.client_ready = bool(success)
+                    self._publish_readiness()
                     return success
                 # A renewal can change either target while HTTP is in flight.
                 # Keep the writer lock and reconcile before reporting completion.
@@ -618,46 +875,50 @@ class Mole:
     async def _check_health(self) -> bool:
         """Check VPN connection health"""
         try:
-            netns = self.config.netns
-
-            # Check interface
-            result = run_in_netns(["ip", "link", "show", "mole"], netns, check=False)
-            if result.returncode != 0:
+            peer_key = getattr(self, '_installed_peer_key', None)
+            if (not peer_key or getattr(self, '_installed_generation', None) != self.state.generation or
+                    getattr(self, '_installed_server_ip', None) != self.state.server_ip):
                 return False
+            generation = self.state.generation
+            ready = await self._verify_transport(peer_key, time.monotonic() + min(10, self.config.vpn_ready_timeout),
+                                                 getattr(self, '_attempt_wall', 0))
+            if generation != self.state.generation:
+                return False
+            self.state.connected = self.state.tunnel_ready = ready
+            self.state.tunnel_deadline = time.monotonic() + max(90, 2 * self.config.watchdog_interval + 10) if ready else 0
+            if not ready:
+                self.state.last_error = 'health_unproven'
+                self._publish_readiness()
+                return False
+            self._publish_readiness()
 
-            # Check handshake age
-            result = run_in_netns(["wg", "show", "mole", "latest-handshakes"], netns, check=False)
-            if result.returncode == 0 and result.stdout.strip():
-                parts = result.stdout.strip().split()
-                if len(parts) >= 2:
-                    handshake_ts = int(parts[1])
-                    if handshake_ts == 0:
-                        return False
-                    age = int(datetime.now().timestamp()) - handshake_ts
-                    if age > 180:
-                        return False
-
-            # Check VPN server ping (works for both PIA and ProtonVPN)
-            if self.state.server_vip:
-                result = run_in_netns(["ping", "-c", "1", "-W", "5", self.state.server_vip], netns, check=False)
-                if result.returncode != 0:
-                    return False
-
-            # Check torrent client listener is alive
-            if self.torrent and self.state.port:
-                await self._check_torrent_listener()
+            # Client work never owns the tunnel monitoring loop.
+            if self.torrent:
+                if not self.state.client_ready:
+                    self._start_torrent_sync()
+                task = getattr(self, '_listener_task', None)
+                if self.state.port and (task is None or task.done()):
+                    task = asyncio.create_task(self._check_torrent_listener())
+                    self._listener_task = task
+                    task.add_done_callback(self._listener_finished)
 
             return True
 
         except Exception as e:
-            log.error(f"Health check error: {e}")
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.last_error = 'health_check_failed'
+            self._publish_readiness()
+            log.error("VPN health check failed")
             return False
 
     async def _check_torrent_listener(self):
         """Check if torrent client listener is bound; fix via port toggle if not."""
         try:
             async with self._torrent_lock():
+                generation = self.state.generation
                 status = await self.torrent.get_connection_status()
+                if generation != self.state.generation:
+                    return
                 if status == "disconnected":
                     log.warning("Torrent listener is disconnected, attempting port toggle fix")
                     await self.torrent._toggle_port(self.state.port)
@@ -677,20 +938,20 @@ class Mole:
             allow_restart: If True, restart service as fallback (prevents recursion)
         """
         if not self.torrent:
-            return
+            return True
 
         interface_name = "mole"
         interface_address = self.state.peer_ip
 
         if not interface_address:
             log.warning("No peer IP available, skipping torrent client update")
-            return
+            return False
 
         for attempt in range(1, max_retries + 1):
             try:
                 if await self._sync_torrent_binding():
                     log.info(f"Torrent client updated: interface={interface_name}, port={self.state.port}")
-                    return
+                    return True
                 else:
                     log.warning(f"Torrent client update attempt {attempt}/{max_retries} failed")
 
@@ -709,25 +970,27 @@ class Mole:
         # Fallback: restart torrent client service if API updates failed
         if allow_restart:
             log.warning(f"API update failed after {max_retries} attempts, restarting torrent client service...")
-            await self._restart_torrent_service()
+            return await self._restart_torrent_service()
         else:
             log.error(f"Failed to update torrent client after {max_retries} attempts (restart already attempted)")
+        return False
 
     async def _restart_torrent_service(self):
         """Restart qBittorrent service as fallback when API update fails."""
         try:
-            result = run_cmd(["systemctl", "restart", "qbittorrent-mole"], check=False)
+            result = await async_run_command(["systemctl", "restart", "qbittorrent-mole"], timeout=10)
             if result.returncode == 0:
                 log.info("Torrent client service restarted successfully")
                 # Wait for service to start, then try API update again (no further restart)
                 await asyncio.sleep(15)
-                await self._update_torrent_client(max_retries=3, retry_delay=5.0, allow_restart=False)
+                return await self._update_torrent_client(max_retries=3, retry_delay=5.0, allow_restart=False)
             else:
-                log.error(f"Failed to restart torrent client service: {result.stderr}")
-        except Exception as e:
-            log.error(f"Error restarting torrent client service: {e}")
+                log.error('Failed to restart torrent client service')
+        except Exception:
+            log.error('Error restarting torrent client service')
+        return False
 
-    def _run_hook(self, hook_path: str, hook_name: str):
+    async def _run_hook(self, hook_path: str, hook_name: str) -> bool:
         """Run a hook script in the VPN namespace.
 
         The hook receives environment variables with connection info:
@@ -737,16 +1000,16 @@ class Mole:
         - MOLE_PORT: The forwarded port (if enabled)
         """
         if not hook_path:
-            return
+            return False
 
         hook_file = Path(hook_path)
         if not hook_file.exists():
             log.warning(f"{hook_name} not found: {hook_path}")
-            return
+            return False
 
         if not os.access(hook_path, os.X_OK):
             log.warning(f"{hook_name} is not executable: {hook_path}")
-            return
+            return False
 
         log.info(f"Running {hook_name}: {hook_path}")
 
@@ -758,17 +1021,17 @@ class Mole:
         env["MOLE_PORT"] = str(self.state.port) if self.state.port else ""
 
         try:
-            result = run_in_netns(
+            result = await async_run_in_netns(
                 [hook_path],
                 self.config.netns,
-                check=False,
+                timeout=30,
                 env=env
             )
             if result.returncode == 0:
                 log.info(f"{hook_name} completed successfully")
+                return True
             else:
                 log.warning(f"{hook_name} exited with code {result.returncode}")
-                if result.stderr:
-                    log.warning(f"{hook_name} stderr: {result.stderr[:500]}")
-        except Exception as e:
-            log.error(f"{hook_name} failed: {e}")
+        except Exception:
+            log.error(f"{hook_name} failed")
+        return False
