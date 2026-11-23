@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-23
+
 ### Fixed
 - Default Proton identity 4.19.1 with validated override and compatibility-rejection handling.
 - Bound asynchronous NAT-PMP commands, process cleanup, protocol agreement and monotonic lease validity.
