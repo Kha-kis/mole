@@ -17,6 +17,13 @@ from .constants import (
 )
 
 
+def validate_proton_client_version(value: str) -> str:
+    """Only a plain numeric release may enter the fixed provider identity."""
+    if not isinstance(value, str) or not re.fullmatch(r'[0-9]{1,4}\.[0-9]{1,4}\.[0-9]{1,4}', value):
+        raise ValueError('PROTON_CLIENT_VERSION must be a numeric major.minor.patch release')
+    return value
+
+
 def load_config(config_path: str = DEFAULT_CONFIG_FILE) -> Dict[str, str]:
     """Load configuration from config file and environment variables"""
     config = {}
@@ -61,6 +68,10 @@ class Config:
     @property
     def vpn_provider(self) -> str:
         return self.get('VPN_PROVIDER', 'pia')
+
+    @property
+    def proton_client_version(self) -> str:
+        return validate_proton_client_version(self.get('PROTON_CLIENT_VERSION', '4.19.1'))
 
     @property
     def netns(self) -> str:
@@ -539,6 +550,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
             errors.append(f"PIA CA certificate not found: {ca_cert}")
 
     # Required fields for ProtonVPN
+    if config.vpn_provider.lower() in ('proton', 'protonvpn'):
+        try:
+            config.proton_client_version
+        except ValueError as exc:
+            errors.append(str(exc))
     elif config.vpn_provider.lower() in ('proton', 'protonvpn'):
         if not config.get('PROTON_USER'):
             errors.append("PROTON_USER is not set")

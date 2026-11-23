@@ -48,6 +48,8 @@ PIA_REGION=ca_toronto
 
 # PROTON_USER=your_proton_email
 # PROTON_PASS=your_proton_password
+# Explicit compatibility override; plain major.minor.patch only.
+# PROTON_CLIENT_VERSION=4.19.1
 
 # Country code (or comma-separated fallback list, tried in order)
 # If first country has no suitable servers, tries next country, etc.

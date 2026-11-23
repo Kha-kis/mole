@@ -14,7 +14,7 @@ from typing import Dict, List, Optional
 
 from proton import Session as ProtonAPISession
 
-from ..config import Config
+from ..config import Config, validate_proton_client_version
 from ..utils import (
     VPNProvider,
     VPNState,
@@ -27,7 +27,7 @@ from ..utils import (
 
 # Proton API configuration
 PROTON_API_URL = "https://account.protonvpn.com/api"
-PROTON_CLIENT_VERSION = "4.19.0"
+PROTON_CLIENT_VERSION = "4.19.1"
 PROTON_APP_VERSION = f"linux-vpn@{PROTON_CLIENT_VERSION}"
 PROTON_USER_AGENT = f"ProtonVPN/{PROTON_CLIENT_VERSION} (Linux)"
 
@@ -35,16 +35,27 @@ PROTON_USER_AGENT = f"ProtonVPN/{PROTON_CLIENT_VERSION} (Linux)"
 class ProtonSessionWrapper:
     """Wrapper around proton.Session with persistence support"""
 
-    def __init__(self, session_file: Path):
+    def __init__(self, session_file: Path, client_version: str = PROTON_CLIENT_VERSION):
         self.session_file = session_file
         self._session: Optional[ProtonAPISession] = None
+        version = validate_proton_client_version(client_version)
+        self.app_version = f'linux-vpn@{version}'
+        self.user_agent = f'ProtonVPN/{version} (Linux)'
+        self.compatibility_rejected = False
+
+    def _classify_rejection(self, error: Exception) -> bool:
+        if getattr(error, 'code', None) in (5003, '5003'):
+            self.compatibility_rejected = True
+            log.error('Proton rejected the configured client version; review PROTON_CLIENT_VERSION')
+            return True
+        return False
 
     def _create_session(self) -> ProtonAPISession:
         """Create a new Proton API session"""
         return ProtonAPISession(
             api_url=PROTON_API_URL,
-            appversion=PROTON_APP_VERSION,
-            user_agent=PROTON_USER_AGENT,
+            appversion=self.app_version,
+            user_agent=self.user_agent,
             TLSPinning=False,  # Disable to avoid urllib3 compatibility issues
             timeout=30
         )
@@ -54,8 +65,8 @@ class ProtonSessionWrapper:
         try:
             if self.session_file.exists():
                 dump = json.loads(self.session_file.read_text())
-                dump["appversion"] = PROTON_APP_VERSION
-                dump["User-Agent"] = PROTON_USER_AGENT
+                dump["appversion"] = self.app_version
+                dump["User-Agent"] = self.user_agent
                 self._session = ProtonAPISession.load(
                     dump,
                     TLSPinning=False,
@@ -63,8 +74,8 @@ class ProtonSessionWrapper:
                 )
                 log.debug("Loaded saved Proton session")
                 return True
-        except Exception as e:
-            log.debug(f"Could not load session: {e}")
+        except Exception:
+            log.debug("Could not load saved Proton session")
         return False
 
     def save(self) -> None:
@@ -78,8 +89,8 @@ class ProtonSessionWrapper:
                 dump = json.dumps(dump)
             secure_write_file(self.session_file, dump)
             log.debug("Saved Proton session")
-        except Exception as e:
-            log.warning(f"Could not save session: {e}")
+        except Exception:
+            log.warning("Could not save Proton session")
 
     def refresh(self) -> bool:
         """Refresh access token"""
@@ -93,7 +104,8 @@ class ProtonSessionWrapper:
             log.info("Session refreshed successfully")
             return True
         except Exception as e:
-            log.warning(f"Session refresh failed: {e}")
+            if not self._classify_rejection(e):
+                log.warning("Proton session refresh failed")
             return False
 
     def authenticate(self, username: str, password: str, max_retries: int = 3) -> bool:
@@ -126,6 +138,8 @@ class ProtonSessionWrapper:
                 return True
 
             except Exception as e:
+                if self._classify_rejection(e):
+                    return False
                 error_str = str(e).lower()
                 # Check for rate limit indicators
                 if "too many" in error_str or "rate" in error_str or "429" in error_str:
@@ -136,7 +150,7 @@ class ProtonSessionWrapper:
                         log.error(f"Rate limited after {max_retries} retries. Wait before trying again.")
                         return False
 
-                log.error(f"Authentication failed: {sanitize_for_log(str(e))}")
+                log.error("Proton authentication failed")
                 return False
 
         return False
@@ -240,12 +254,15 @@ class ProtonProvider(VPNProvider):
         """Authenticate with ProtonVPN"""
         log.info("Authenticating with ProtonVPN...")
 
-        self._proton_session = ProtonSessionWrapper(self._session_file)
+        self._proton_session = ProtonSessionWrapper(
+            self._session_file, self.config.get('PROTON_CLIENT_VERSION', PROTON_CLIENT_VERSION))
 
         # Try to load and refresh existing session
         if self._proton_session.load():
             if self._proton_session.refresh():
                 return True
+            if self._proton_session.compatibility_rejected:
+                return False
             log.warning("Session refresh failed, re-authenticating...")
 
         # Fresh authentication
