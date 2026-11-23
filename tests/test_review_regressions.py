@@ -116,7 +116,7 @@ class TestReviewRegressions(unittest.IsolatedAsyncioTestCase):
             mole._watchdog_loop = AsyncMock()
             mole._restart_watcher_loop = AsyncMock()
             mole._cleanup = AsyncMock()
-            with patch('mole_pkg.mole.setup_namespace'), patch.object(
+            with patch('mole_pkg.mole.async_setup_namespace'), patch.object(
                 asyncio.get_running_loop(), 'add_signal_handler'
             ), patch('mole_pkg.mole.increment_counter'), patch(
                 'mole_pkg.mole.increment_dict_counter'
@@ -143,9 +143,9 @@ class ReviewedRecovery(unittest.IsolatedAsyncioTestCase):
         self.mole.provider.register_wireguard.return_value = False
         self.assertFalse(await self.mole._attempt_selected_server('192.0.2.1'))
         self.mole.provider._select(self.servers[2])
-        with patch('mole_pkg.mole.allow_vpn_server_ip') as allowance, patch(
+        with patch('mole_pkg.mole.async_allow_vpn_server_ip') as allowance, patch(
             'mole_pkg.mole.read_wg_peer_key', return_value='new-peer'
-        ), patch('mole_pkg.mole.run_in_netns', return_value=Mock(returncode=0)) as command, patch.object(
+        ), patch('mole_pkg.mole.async_run_in_netns', return_value=Mock(returncode=0)) as command, patch.object(
             self.mole, '_wait_for_readiness', return_value=False
         ):
             await Mole._connect_vpn(self.mole, '192.0.2.2')

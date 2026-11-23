@@ -63,14 +63,14 @@ class TestProtonMappingRenewal(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.state.port_expires, self.previous_expiry)
 
     async def test_setup_requires_both_protocols_to_agree(self):
-        with patch("mole_pkg.providers.proton.run_cmd", return_value=Mock(returncode=0)), patch(
+        with patch("mole_pkg.providers.proton.async_run_command", return_value=Mock(returncode=0)), patch(
             "mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP"), mapping("TCP", port=34567)]
         ):
             self.assertFalse(await self.provider.setup_port_forward())
         self.assertEqual(self.state.port, 12345)
 
     async def test_setup_persists_valid_mapping(self):
-        with patch("mole_pkg.providers.proton.run_cmd", return_value=Mock(returncode=0)), patch(
+        with patch("mole_pkg.providers.proton.async_run_command", return_value=Mock(returncode=0)), patch(
             "mole_pkg.providers.proton.async_run_in_netns", new_callable=AsyncMock, side_effect=[mapping("UDP"), mapping("TCP")]
         ):
             self.assertTrue(await self.provider.setup_port_forward())
@@ -359,7 +359,7 @@ class TestTorrentApiDoesNotBlockRenewal(unittest.IsolatedAsyncioTestCase):
         mole._watchdog_task = asyncio.create_task(writer())
         await started.wait()
         with patch.object(mole, '_stop_subprocess'), patch.object(mole, '_run_hook'), patch(
-            'mole_pkg.mole.disconnect_vpn', side_effect=lambda config: self.assertTrue(finished)
+            'mole_pkg.mole.async_disconnect_vpn', side_effect=lambda config: self.assertTrue(finished)
         ):
             try:
                 await mole._cleanup()

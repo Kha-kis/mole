@@ -357,7 +357,7 @@ class TestMoleAsync(unittest.TestCase):
 
         mole = Mole()
 
-        with patch('mole_pkg.mole.disconnect_vpn') as mock_disconnect:
+        with patch('mole_pkg.mole.async_disconnect_vpn') as mock_disconnect:
             async def check_cleanup():
                 tasks = [asyncio.create_task(asyncio.sleep(3600)) for _ in range(3)]
                 mole._keepalive_task, mole._watchdog_task, mole._restart_watcher_task = tasks

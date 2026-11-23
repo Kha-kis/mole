@@ -2,10 +2,14 @@
 MOLE Network Management - Namespace, veth, and iptables utilities
 """
 
+import asyncio
+import json
+import os
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from .utils import log, run_cmd, run_in_netns
+from .utils import log, run_cmd, run_in_netns, async_run_command, async_run_in_netns
 
 if TYPE_CHECKING:
     from .config import Config
@@ -41,9 +45,13 @@ def setup_namespace(config: "Config") -> None:
 
     # Create namespace if needed
     result = run_cmd(["ip", "netns", "list"], check=False)
-    if netns not in result.stdout:
+    if netns not in [line.split()[0] for line in result.stdout.splitlines() if line.split()]:
         log.info(f"Creating network namespace '{netns}'...")
         run_cmd(["ip", "netns", "add", netns])
+
+    # Protect the namespace before bringing an external link or NAT online.
+    setup_killswitch(config)
+    disable_ipv6_in_namespace(netns)
 
     # Create veth pair if needed
     result = run_cmd(["ip", "link", "show", "veth-host"], check=False)
@@ -60,9 +68,6 @@ def setup_namespace(config: "Config") -> None:
     # Enable IP forwarding
     Path("/proc/sys/net/ipv4/ip_forward").write_text("1")
 
-    # Disable IPv6 in namespace to prevent leaks (PIA doesn't support IPv6)
-    disable_ipv6_in_namespace(netns)
-
     # Setup NAT masquerade
     masq_check = run_cmd([
         "iptables", "-t", "nat", "-C", "POSTROUTING",
@@ -77,8 +82,45 @@ def setup_namespace(config: "Config") -> None:
             "-j", "MASQUERADE"
         ])
 
-    # Setup kill switch
-    setup_killswitch(config)
+
+
+async def async_setup_namespace(config: "Config") -> None:
+    request = dict(netns=config.netns, veth_host_ip=config.veth_host_ip,
+                   veth_vpn_ip=config.veth_vpn_ip, host_interface=config.host_interface)
+    env = dict(os.environ)
+    env['PYTHONPATH'] = str(Path(__file__).resolve().parents[1]) + os.pathsep + env.get('PYTHONPATH', '')
+    result = await async_run_command([sys.executable, '-m', 'mole_pkg.network_worker'],
+                                     120, env=env, input_data=json.dumps(request).encode())
+    if result.returncode != 0:
+        raise RuntimeError('namespace setup failed')
+
+
+async def async_allow_vpn_server_ip(config: "Config", server_ip: str,
+                                   old_server_ip: str = None) -> None:
+    async def command(args, required=True):
+        result = await async_run_in_netns(args, config.netns, timeout=10)
+        if required and result.returncode != 0:
+            raise RuntimeError('VPN endpoint policy failed')
+        return result
+
+    if old_server_ip and old_server_ip != server_ip:
+        rule = ['OUTPUT', '-o', 'veth-vpn', '-d', old_server_ip, '-j', 'ACCEPT']
+        # Remove all old duplicates, but bound reconciliation even if the ruleset
+        # is being changed by an unexpected writer.
+        for _ in range(32):
+            if (await command(['iptables', '-C'] + rule, False)).returncode != 0:
+                break
+            await command(['iptables', '-D'] + rule)
+        else:
+            raise RuntimeError('VPN endpoint policy did not converge')
+    rule = ['OUTPUT', '-o', 'veth-vpn', '-d', server_ip, '-j', 'ACCEPT']
+    if (await command(['iptables', '-C'] + rule, False)).returncode != 0:
+        await command(['iptables', '-I', 'OUTPUT', '3'] + rule[1:])
+    await command(['iptables', '-C'] + rule)
+
+
+async def async_disconnect_vpn(config: "Config") -> None:
+    await async_run_in_netns(['wg-quick', 'down', config.wg_conf], config.netns, timeout=30)
 
 
 def setup_killswitch(config: "Config") -> None:

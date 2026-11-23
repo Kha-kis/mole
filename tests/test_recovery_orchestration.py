@@ -27,7 +27,7 @@ class RecoveryOrchestration(unittest.IsolatedAsyncioTestCase):
         self.mole.shutdown_event = asyncio.Event()
         self.mole._torrent_update_lock = None
         self.mole._torrent_sync_task = None
-        self.mole._run_hook = Mock(return_value=True)
+        self.mole._run_hook = AsyncMock(return_value=True)
         self.servers = [server('XX#1', '192.0.2.1'), server('XX#2', '192.0.2.2'), server('XX#3', '192.0.2.3')]
         self.mole.provider._fetch_servers = AsyncMock(return_value=self.servers)
         self.mole.provider._filter_servers = lambda values, country=None: values
@@ -147,14 +147,17 @@ class RecoveryOrchestration(unittest.IsolatedAsyncioTestCase):
         self.mole._keepalive_task = self.mole._watchdog_task = self.mole._restart_watcher_task = None
         self.mole._api_proc = self.mole._proxy_proc = self.mole._dns_proc = None
         try:
-            with patch('mole_pkg.mole.disconnect_vpn', side_effect=lambda config: self.assertTrue(stopped.is_set())):
+            with patch('mole_pkg.mole.async_disconnect_vpn', side_effect=lambda config: self.assertTrue(stopped.is_set())):
                 await self.mole._cleanup()
         finally:
             self.mole._renewal_task.cancel()
             await asyncio.gather(self.mole._renewal_task, return_exceptions=True)
 
-    async def test_registration_failure_cannot_relabel_old_tunnel_as_new_ready(self):
+    async def test_registration_failure_preserves_verified_old_tunnel(self):
         self.assertTrue(await self.mole._full_renewal())
         self.mole.provider.register_wireguard.return_value = False
-        self.assertFalse(await self.mole._full_renewal())
-        self.assertFalse(self.mole.state.connected)
+        old_address, generation = self.mole.state.server_ip, self.mole.state.generation
+        self.assertTrue(await self.mole._full_renewal())
+        self.assertTrue(self.mole.state.connected)
+        self.assertEqual(self.mole.state.server_ip, old_address)
+        self.assertEqual(self.mole.state.generation, generation)

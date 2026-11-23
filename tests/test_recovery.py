@@ -119,7 +119,7 @@ class TunnelReadiness(unittest.IsolatedAsyncioTestCase):
         self.mole.state.connected = self.mole.state.tunnel_ready = True
         with patch('mole_pkg.mole.read_wg_peer_key', return_value='peer'), patch(
             'mole_pkg.mole.run_in_netns', return_value=Mock(returncode=0, stdout='', stderr='')
-        ), patch('mole_pkg.mole.allow_vpn_server_ip'), patch(
+        ), patch('mole_pkg.mole.async_allow_vpn_server_ip'), patch(
             'mole_pkg.mole.async_run_in_netns', return_value=Mock(returncode=0, stdout='')
         ):
             self.assertFalse(await self.mole._connect_vpn(None))

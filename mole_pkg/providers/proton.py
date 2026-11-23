@@ -268,6 +268,8 @@ class ProtonProvider(VPNProvider):
 
     def _select(self, server):
         self._selected_server = server
+        if self.state.connected and self.state.tunnel_ready:
+            return
         self.state.server_ip = server['entry_ip']
         self.state.server_hostname = server['hostname']
         self.state.server_country = server.get('country')
@@ -571,10 +573,7 @@ class ProtonProvider(VPNProvider):
             if target_name:
                 for server in filtered:
                     if server["name"] == target_name:
-                        self._selected_server = server
-                        self.state.server_ip = server["entry_ip"]
-                        self.state.server_hostname = server["hostname"]
-                        self.state.server_country = server.get("country")
+                        self._select(server)
                         log.info(f"Server: {server['name']} ({server['entry_ip']})")
                         return True
 
@@ -595,10 +594,7 @@ class ProtonProvider(VPNProvider):
 
             if filtered:
                 server = filtered[0]
-                self._selected_server = server
-                self.state.server_ip = server["entry_ip"]
-                self.state.server_hostname = server["hostname"]
-                self.state.server_country = server.get("country")
+                self._select(server)
                 log.info(f"Server: {server['name']} ({server['entry_ip']}) - {server['load']}% load")
                 return True
 
@@ -765,8 +761,9 @@ class ProtonProvider(VPNProvider):
                 return False
             # Proton assigns addresses in 10.2.0.0/16 range
             peer_ip = "10.2.0.2"
-            self.state.peer_ip = peer_ip
-            self.state.server_vip = server["entry_ip"]
+            if not self.state.tunnel_ready:
+                self.state.peer_ip = peer_ip
+                self.state.server_vip = server["entry_ip"]
 
             # DNS server - use our DOT server if enabled, otherwise Proton's
             if self.config.dot_enabled:
@@ -793,14 +790,18 @@ class ProtonProvider(VPNProvider):
                 f"PersistentKeepalive = 25\n"
             )
             # Write WireGuard config with restricted permissions (contains private key)
-            secure_write_file(Path(self.config.wg_conf), wg_config)
+            config_path = Path(self.config.wg_conf)
+            temporary = config_path.with_name(config_path.name + '.pending')
+            secure_write_file(temporary, wg_config)
+            os.replace(temporary, config_path)
 
             # Save state
             state_dir = Path(self.config.state_dir)
             state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-            secure_write_file(state_dir / "server_ip", self.state.server_ip)
-            secure_write_file(state_dir / "hostname", self.state.server_hostname)
-            secure_write_file(state_dir / "server_name", server["name"])
+            if not self.state.tunnel_ready:
+                secure_write_file(state_dir / "server_ip", server['entry_ip'])
+                secure_write_file(state_dir / "hostname", server['hostname'])
+                secure_write_file(state_dir / "server_name", server["name"])
 
             log.info(f"WireGuard configured, peer IP: {peer_ip}")
             return True
@@ -832,7 +833,7 @@ class ProtonProvider(VPNProvider):
         log.info("Setting up port forwarding via NAT-PMP...")
 
         # Check if natpmpc is installed
-        result = run_cmd(["which", "natpmpc"], check=False)
+        result = await async_run_command(["which", "natpmpc"], timeout=10)
         if result.returncode != 0:
             log.error("natpmpc not installed. Install with: apt install natpmpc")
             return False
