@@ -16,6 +16,7 @@ from typing import Dict, List, Optional
 from proton import Session as ProtonAPISession
 
 from ..config import Config, validate_proton_client_version
+from ..recovery import ApprovedServerPolicy
 from ..utils import (
     VPNProvider,
     VPNState,
@@ -173,6 +174,50 @@ class ProtonProvider(VPNProvider):
         self._proton_session: Optional[ProtonSessionWrapper] = None
         self._selected_server: Optional[Dict] = None
         self._mapping_lock = None
+        self._recovery_policy = None
+
+    @property
+    def failover_enabled(self):
+        return self.config.get('PROTON_FAILOVER_ENABLED', 'false').lower() in ('true', '1', 'yes', 'on')
+
+    def _policy(self):
+        if self._recovery_policy is None:
+            # Reuse Config validation even when embedded callers provide only get().
+            settings = Config('/nonexistent')
+            settings._data = {key: self.config.get(key, default) for key, default in (
+                ('PROTON_FAILOVER_ENABLED', 'false'), ('PROTON_FAILOVER_SERVERS', ''),
+                ('PROTON_SERVER', ''), ('PROTON_FAILOVER_COOLDOWN', '900'),
+                ('PROTON_FAILOVER_MAX_ATTEMPTS', '3'))}
+            settings.validate_proton_failover()
+            self._recovery_policy = ApprovedServerPolicy(settings.proton_failover_servers,
+                self._server_name or '', settings.proton_failover_cooldown)
+        return self._recovery_policy
+
+    def record_server_failure(self, reason: str) -> None:
+        if self.failover_enabled and self._selected_server:
+            self._policy().failed(self._selected_server['entry_ip'], time.monotonic())
+
+    def record_server_success(self) -> None:
+        if self.failover_enabled and self._selected_server:
+            self._policy().succeeded(self._selected_server['entry_ip'])
+
+    def _select(self, server):
+        self._selected_server = server
+        self.state.server_ip = server['entry_ip']
+        self.state.server_hostname = server['hostname']
+        self.state.server_country = server.get('country')
+
+    async def restore_server(self, previous):
+        servers = await self._fetch_servers()
+        if not servers:
+            return False
+        for candidate in self._filter_servers(servers):
+            if candidate['name'] == previous['name'] and candidate['entry_ip'] == previous['entry_ip']:
+                if self.failover_enabled and candidate['name'] not in self._policy().names:
+                    return False
+                self._select(candidate)
+                return True
+        return False
 
     @property
     def name(self) -> str:
@@ -328,6 +373,8 @@ class ProtonProvider(VPNProvider):
             # Get WireGuard server info
             servers_list = server.get("Servers", [])
             for s in servers_list:
+                if s.get('Status') == 0:
+                    continue
                 if s.get("X25519PublicKey"):
                     filtered.append({
                         "name": server.get("Name"),
@@ -419,6 +466,14 @@ class ProtonProvider(VPNProvider):
         if not servers:
             return False
 
+        if self.failover_enabled:
+            candidates = self._policy().candidates(self._filter_servers(servers), time.monotonic())
+            if not candidates:
+                log.warning('No approved Proton endpoint is outside cooldown')
+                return False
+            self._select(candidates[0])
+            return True
+
         target_name = self._server_name
         using_saved_server = False
 
@@ -471,8 +526,8 @@ class ProtonProvider(VPNProvider):
                     target_name = None
                     using_saved_server = False
                 else:
-                    log.warning(f"Server '{target_name}' not found, selecting best available")
-                    target_name = None
+                    log.warning('Pinned Proton server unavailable; refusing implicit failover')
+                    return False
 
             # Apply latency filtering if configured or many servers
             if self._max_latency > 0 or len(filtered) > 5:

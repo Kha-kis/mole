@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import random
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -83,6 +84,13 @@ class Mole:
         self.shutdown_event = asyncio.Event()
         self._torrent_update_lock = None
         self._torrent_sync_task = None
+        self._renewal_task = None
+        self._mapping_recovery_task = None
+        self._connecting = False
+        self._mapping_failures = 0
+        self._mapping_recovered = False
+        self._recovery_not_before = 0
+        self._recovery_exhaustions = 0
         self._keepalive_task = None
         self._watchdog_task = None
         self._restart_watcher_task = None
@@ -305,6 +313,8 @@ class Mole:
         tasks = [task for task in (
             self._keepalive_task, self._watchdog_task, self._restart_watcher_task,
             getattr(self, '_torrent_sync_task', None),
+            getattr(self, '_mapping_recovery_task', None),
+            getattr(self, '_renewal_task', None),
         ) if task is not None]
         for task in tasks:
             task.cancel()
@@ -323,6 +333,12 @@ class Mole:
         # Run pre-disconnect hook while the VPN namespace is still live
         self._run_hook(self.config.post_disconnect_hook, "POST_DISCONNECT_HOOK")
 
+        # Invalidate evidence before bringing down the VPN.
+        self.state.generation += 1
+        self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
+        self.state.tunnel_deadline = self.state.port_deadline = 0
+        self.state.last_error = 'stopped'
+        self._publish_readiness()
         # Bring down VPN
         disconnect_vpn(self.config)
         log.info("Cleanup complete")
@@ -344,7 +360,120 @@ class Mole:
         if self.state.port:
             secure_write_file(state_dir / 'port', str(self.state.port))
 
-    async def _full_renewal(self) -> bool:
+    async def _full_renewal(self, reason: str = 'scheduled') -> bool:
+        active = getattr(self, '_renewal_task', None)
+        if active is not None and not active.done():
+            return await asyncio.shield(active)
+        if time.monotonic() < getattr(self, '_recovery_not_before', 0):
+            return False
+        task = asyncio.create_task(self._full_renewal_owned(reason))
+        self._renewal_task = task
+        try:
+            return await task
+        finally:
+            if task.done() and self._renewal_task is task:
+                self._renewal_task = None
+
+    def _defer_recovery(self):
+        count = min(getattr(self, '_recovery_exhaustions', 0), 4)
+        delay = min(300, 30 * (2 ** count) + random.uniform(0, 5))
+        self._recovery_not_before = time.monotonic() + delay
+        self._recovery_exhaustions = count + 1
+
+    def _mapping_result(self, success: bool) -> bool:
+        if success:
+            self._mapping_failures = 0
+            self._mapping_recovered = False
+            self._recovery_not_before = 0
+            self._recovery_exhaustions = 0
+            if not isinstance(self.provider, ProtonProvider) and self.state.port_expires:
+                expiry = self.state.port_expires
+                remaining = (expiry - datetime.now(expiry.tzinfo)).total_seconds()
+                self.state.port_deadline = time.monotonic() + max(0, min(remaining, self.config.keepalive_interval * 2))
+                self.state.forwarding_ready = remaining > 0
+            self.state.last_error = ''
+            return False
+        self._mapping_failures = getattr(self, '_mapping_failures', 0) + 1
+        self.state.last_error = 'forwarding_unavailable'
+        return self._mapping_failures >= 3 and not getattr(self, '_mapping_recovered', False)
+
+    async def _attempt_selected_server(self, old_server_ip):
+        self._connecting = True
+        self.state.generation += 1
+        self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
+        self.state.tunnel_deadline = self.state.port_deadline = 0
+        self.state.last_error = 'renewing'
+        self._publish_readiness()
+        try:
+            if not await self.provider.register_wireguard():
+                return False
+            if not await self._connect_vpn(old_server_ip):
+                return False
+        finally:
+            self._connecting = False
+        if self.config.port_forward:
+            self._mapping_result(await self.provider.setup_port_forward())
+        if self.torrent:
+            await self._update_torrent_client()
+        return True
+
+    async def _recover_candidates(self, reason):
+        proton = isinstance(self.provider, ProtonProvider)
+        enabled = proton and self.provider.failover_enabled
+        limit = self.config.proton_failover_max_attempts if enabled else 1
+        previous = dict(self.provider._selected_server) if proton and self.provider._selected_server and self.state.tunnel_ready else None
+        attempted = set()
+        if reason == 'mapping':
+            if getattr(self, '_mapping_recovered', False):
+                return self.state.connected
+            self._mapping_recovered = True
+            if previous:
+                attempted.add(previous['entry_ip'])
+                if await self._attempt_selected_server(self.state.server_ip):
+                    if self.state.forwarding_ready:
+                        self.provider.record_server_success()
+                        return True
+                self.provider.record_server_failure('mapping')
+
+        while len(attempted) < limit:
+            old_server_ip = self.state.server_ip
+            if not await self.provider.get_server():
+                break
+            address = self.state.server_ip
+            if address in attempted:
+                break
+            attempted.add(address)
+            ready = await self._attempt_selected_server(old_server_ip)
+            if ready:
+                if proton:
+                    previous = dict(self.provider._selected_server)
+                if not self.config.port_forward or self.state.forwarding_ready or reason != 'mapping':
+                    if proton:
+                        self.provider.record_server_success()
+                    return True
+            if proton:
+                self.provider.record_server_failure('mapping' if ready else 'readiness')
+            if not enabled:
+                break
+
+        # Keep a verified private tunnel even when every mapping option failed.
+        if self.state.tunnel_ready:
+            self._defer_recovery()
+            return True
+        # One restoration is allowed only to a previously verified eligible
+        # endpoint already counted in this bounded cycle.
+        if previous and previous['entry_ip'] in attempted:
+            old_server_ip = self.state.server_ip
+            if await self.provider.restore_server(previous):
+                if await self._attempt_selected_server(old_server_ip):
+                    self._defer_recovery()
+                    return True
+        self.state.connected = self.state.tunnel_ready = False
+        self.state.last_error = 'approved_recovery_exhausted'
+        self._defer_recovery()
+        return False
+
+    async def _full_renewal_owned(self, reason: str) -> bool:
         """Full VPN renewal process.
 
         Operationally instrumented: every renewal attempt increments either
@@ -366,36 +495,18 @@ class Mole:
         try:
             # Step 1: Authenticate
             if not await self.provider.authenticate():
+                self.state.last_error = 'authentication_failed'
+                self._defer_recovery()
                 return False
 
-            # Step 2: Get server
-            if not await self.provider.get_server():
+            if not await self._recover_candidates(reason):
                 return False
-
-            # Step 3: Register WireGuard
-            if not await self.provider.register_wireguard():
-                return False
-
-            # Step 4: Connect VPN
-            if not await self._connect_vpn(old_server_ip):
-                return False
-
-            # Step 5: Setup port forwarding (if enabled)
-            if self.config.port_forward:
-                if not await self.provider.setup_port_forward():
-                    return False
-
-                # Step 6: Update torrent client interface and port (if configured)
-                # Retry with delay since torrent client may still be starting up
-                if self.torrent:
-                    await self._update_torrent_client()
-
-                log.info(f"Renewal complete! Server: {self.state.server_hostname}, Port: {self.state.port}")
-            else:
-                log.info(f"Renewal complete! Server: {self.state.server_hostname} (port forwarding disabled)")
+            if not self.config.port_forward:
+                self._recovery_not_before = self._recovery_exhaustions = 0
 
             # Run post-connect hook if configured
-            self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK")
+            if self.config.post_connect_hook:
+                self.state.hook_ready = bool(self._run_hook(self.config.post_connect_hook, "POST_CONNECT_HOOK"))
 
             # Write state files for API to read
             self._write_state_files()
@@ -403,6 +514,7 @@ class Mole:
             success = True
             return True
         finally:
+            self._publish_readiness()
             duration = time.time() - renewal_start
             try:
                 if success:
@@ -569,11 +681,15 @@ class Mole:
 
                 # Retry initial mapping failures without requiring a tunnel reconnect.
                 # port_payload is PIA-specific and must not gate Proton renewals.
-                if self.state.connected:
+                if self.state.connected and not getattr(self, '_connecting', False):
+                    generation = self.state.generation
                     if self.state.port:
                         refresh_ok = await self.provider.refresh_port_forward()
                     else:
                         refresh_ok = await self.provider.setup_port_forward()
+                    if generation != self.state.generation:
+                        continue
+                    recovery_due = self._mapping_result(refresh_ok)
                     delay = self.config.keepalive_interval
                     if isinstance(self.provider, ProtonProvider):
                         delay = self.provider.port_refresh_delay(delay)
@@ -602,6 +718,11 @@ class Mole:
                     else:
                         log.warning("Port keepalive failed")
                     self._publish_readiness()
+                    task = getattr(self, '_mapping_recovery_task', None)
+                    if recovery_due and (task is None or task.done()):
+                        task = asyncio.create_task(self._full_renewal(reason='mapping'))
+                        self._mapping_recovery_task = task
+                        task.add_done_callback(self._recovery_finished)
 
             except asyncio.CancelledError:
                 break
@@ -618,6 +739,13 @@ class Mole:
                 log.warning("qBittorrent synchronization failed; will retry on next keepalive")
         except Exception as exc:
             log.warning(f"qBittorrent synchronization failed: {sanitize_for_log(str(exc))}")
+
+    def _recovery_finished(self, task):
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                log.error('Coordinated VPN recovery failed')
 
     def _torrent_lock(self):
         # Python 3.8 locks capture their loop eagerly; construct only on use.
@@ -841,9 +969,9 @@ class Mole:
             )
             if result.returncode == 0:
                 log.info(f"{hook_name} completed successfully")
+                return True
             else:
                 log.warning(f"{hook_name} exited with code {result.returncode}")
-                if result.stderr:
-                    log.warning(f"{hook_name} stderr: {result.stderr[:500]}")
-        except Exception as e:
-            log.error(f"{hook_name} failed: {e}")
+        except Exception:
+            log.error(f"{hook_name} failed")
+        return False

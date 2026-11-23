@@ -145,8 +145,17 @@ class LegacyRuntime(unittest.TestCase):
         with patch.object(sys, 'argv', ['mole', 'run']), patch('mole_pkg.mole.Mole') as runtime:
             runtime.return_value.run = AsyncMock()
             module['main'].__globals__['Mole'] = Mock(side_effect=AssertionError('legacy runtime used'))
-            self.assertEqual(module['main'](), 0)
+            with patch('mole_pkg.cli.validate_config', return_value=(True, [])):
+                self.assertEqual(module['main'](), 0)
             runtime.assert_called_once()
+
+    def test_legacy_runtime_respects_shared_configuration_gate(self):
+        import runpy
+        import sys
+        module = runpy.run_path(str(Path(__file__).resolve().parents[1] / 'mole'), run_name='legacy_mole_test')
+        with patch.object(sys, 'argv', ['mole', 'run']), patch('mole_pkg.cli.validate_config', return_value=(False, ['invalid configuration'])), patch('mole_pkg.mole.Mole') as runtime:
+            self.assertEqual(module['main'](), 1)
+            runtime.assert_not_called()
 
 
 class RuntimeReadiness(unittest.TestCase):

@@ -337,6 +337,8 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
 class TestTorrentApiDoesNotBlockRenewal(unittest.IsolatedAsyncioTestCase):
     async def test_cleanup_drains_watchdog_before_disconnect(self):
         mole = Mole.__new__(Mole)
+        mole.state = VPNState()
+        mole._publish_readiness = Mock()
         mole.config = Mock(post_disconnect_hook='')
         mole._keepalive_task = None
         mole._restart_watcher_task = None

@@ -76,6 +76,44 @@ class Config:
         return validate_proton_client_version(self.get('PROTON_CLIENT_VERSION', '4.19.1'))
 
     @property
+    def proton_failover_enabled(self) -> bool:
+        value = self.get('PROTON_FAILOVER_ENABLED', 'false').lower()
+        if value not in ('true', 'false', '1', '0', 'yes', 'no', 'on', 'off'):
+            raise ValueError('PROTON_FAILOVER_ENABLED must be a boolean')
+        return value in ('true', '1', 'yes', 'on')
+
+    @property
+    def proton_failover_servers(self) -> List[str]:
+        return [name.strip() for name in self.get('PROTON_FAILOVER_SERVERS', '').split(',') if name.strip()]
+
+    @property
+    def proton_failover_cooldown(self) -> float:
+        try:
+            value = float(self.get('PROTON_FAILOVER_COOLDOWN', '900'))
+            if not math.isfinite(value) or not 900 <= value <= 86400:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('PROTON_FAILOVER_COOLDOWN must be between 900 and 86400 seconds') from None
+
+    @property
+    def proton_failover_max_attempts(self) -> int:
+        try:
+            value = int(self.get('PROTON_FAILOVER_MAX_ATTEMPTS', '3'))
+            if not 1 <= value <= 3:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('PROTON_FAILOVER_MAX_ATTEMPTS must be between 1 and 3') from None
+
+    def validate_proton_failover(self):
+        if self.proton_failover_enabled:
+            from .recovery import ApprovedServerPolicy
+            self.proton_failover_max_attempts
+            ApprovedServerPolicy(self.proton_failover_servers, self.get('PROTON_SERVER', '').strip(),
+                                 self.proton_failover_cooldown)
+
+    @property
     def vpn_ready_timeout(self) -> float:
         try:
             value = float(self.get('VPN_READY_TIMEOUT', '30'))
@@ -594,6 +632,7 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
     if config.vpn_provider.lower() in ('proton', 'protonvpn'):
         try:
             config.proton_client_version
+            config.validate_proton_failover()
         except ValueError as exc:
             errors.append(str(exc))
     elif config.vpn_provider.lower() in ('proton', 'protonvpn'):

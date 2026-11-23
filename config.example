@@ -67,6 +67,13 @@ VPN_READY_PROBES=https://www.cloudflare.com/,https://www.wikipedia.org/
 # Example: NL#458, CH#1, US-CA#1
 # PROTON_SERVER=
 
+# Optional automatic recovery, restricted to this explicit ordered list.
+# A configured PROTON_SERVER must be a member. Names below are placeholders.
+PROTON_FAILOVER_ENABLED=false
+# PROTON_FAILOVER_SERVERS=XX#1,XX#2,XX#3
+PROTON_FAILOVER_COOLDOWN=900
+PROTON_FAILOVER_MAX_ATTEMPTS=3
+
 # Account tier: 0=free, 1=basic, 2=plus/visionary (default: 2)
 # Port forwarding requires tier 2 (Plus plan)
 # PROTON_TIER=2
