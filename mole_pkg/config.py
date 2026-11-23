@@ -635,7 +635,6 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
             config.validate_proton_failover()
         except ValueError as exc:
             errors.append(str(exc))
-    elif config.vpn_provider.lower() in ('proton', 'protonvpn'):
         if not config.get('PROTON_USER'):
             errors.append("PROTON_USER is not set")
         if not config.get('PROTON_PASS'):

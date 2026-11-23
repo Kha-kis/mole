@@ -670,10 +670,14 @@ class HTTPAPIServerStandalone:
     async def _get_port(self) -> dict:
         """GET /v1/port - Current forwarded port"""
         port = self._read_state_file('port')
+        readiness = read_runtime_readiness(self.state_dir)
+        last_known = int(port) if port and port.isdigit() else None
         return {
             'status': 200,
             'body': {
-                'port': int(port) if port and port.isdigit() else None,
+                'port': readiness['port'],
+                'last_known_port': last_known,
+                'forwarding_ready': readiness['forwarding_ready'],
                 'enabled': self._get_config_bool('PORT_FORWARD', True),
             }
         }
@@ -802,8 +806,7 @@ class HTTPAPIServerStandalone:
 
         readiness = read_runtime_readiness(self.state_dir)
         connected = readiness['connected']
-        if not readiness['forwarding_ready']:
-            port = 0
+        port = readiness['port'] or 0
 
         handshake_age = None
         try:

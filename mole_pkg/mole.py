@@ -84,6 +84,10 @@ class Mole:
         self.shutdown_event = asyncio.Event()
         self._torrent_update_lock = None
         self._torrent_sync_task = None
+        self._listener_task = None
+        self._installed_server_ip = None
+        self._installed_peer_key = None
+        self._installed_generation = None
         self._renewal_task = None
         self._mapping_recovery_task = None
         self._connecting = False
@@ -315,6 +319,7 @@ class Mole:
             getattr(self, '_torrent_sync_task', None),
             getattr(self, '_mapping_recovery_task', None),
             getattr(self, '_renewal_task', None),
+            getattr(self, '_listener_task', None),
         ) if task is not None]
         for task in tasks:
             task.cancel()
@@ -413,8 +418,7 @@ class Mole:
             self._connecting = False
         if self.config.port_forward:
             self._mapping_result(await self.provider.setup_port_forward())
-        if self.torrent:
-            await self._update_torrent_client()
+        self._start_torrent_sync(retry=True)
         return True
 
     async def _recover_candidates(self, reason):
@@ -548,6 +552,7 @@ class Mole:
         log.info("Connecting VPN...")
 
         netns = self.config.netns
+        old_server_ip = getattr(self, '_installed_server_ip', None) or old_server_ip
         self.state.generation += 1
         self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
         self.state.tunnel_deadline = self.state.port_deadline = 0
@@ -561,6 +566,7 @@ class Mole:
             return False
 
         # Bring down existing connection
+        self._installed_peer_key = self._installed_generation = None
         run_in_netns(["wg-quick", "down", "mole"], netns, check=False)
 
         # Allow traffic to VPN server IP through the kill switch
@@ -574,6 +580,7 @@ class Mole:
             "ip", "route", "add", self.state.server_ip,
             "via", self.config.veth_host_ip, "dev", "veth-vpn"
         ], netns, check=False)
+        self._installed_server_ip = self.state.server_ip
 
         # Bring up WireGuard
         self._attempt_wall = int(time.time())
@@ -583,6 +590,9 @@ class Mole:
             self._publish_readiness()
             log.error("Failed to bring up WireGuard")
             return False
+
+        self._installed_peer_key = peer_key
+        self._installed_generation = self.state.generation
 
         ready = await self._wait_for_readiness(peer_key, time.monotonic())
         if ready:
@@ -740,6 +750,23 @@ class Mole:
         except Exception as exc:
             log.warning(f"qBittorrent synchronization failed: {sanitize_for_log(str(exc))}")
 
+    def _start_torrent_sync(self, retry=False):
+        if not self.torrent:
+            return
+        active = getattr(self, '_torrent_sync_task', None)
+        if active is None or active.done():
+            operation = self._update_torrent_client() if retry else self._sync_torrent_binding()
+            task = asyncio.create_task(operation)
+            self._torrent_sync_task = task
+            task.add_done_callback(self._torrent_sync_finished)
+
+    def _listener_finished(self, task):
+        if not task.cancelled():
+            try:
+                task.result()
+            except Exception:
+                log.warning('Torrent listener supervision failed')
+
     def _recovery_finished(self, task):
         if not task.cancelled():
             try:
@@ -756,6 +783,7 @@ class Mole:
     async def _sync_torrent_binding(self) -> bool:
         async with self._torrent_lock():
             while True:
+                generation = self.state.generation
                 address, port = self.state.peer_ip, self.state.port
                 if not address:
                     log.warning("Cannot synchronize torrent binding without a tunnel address")
@@ -763,6 +791,8 @@ class Mole:
                 success = await self.torrent.set_interface("mole", address)
                 if success and port:
                     success = await self.torrent.set_listen_port(port)
+                if generation != self.state.generation:
+                    return False
                 if (address, port) == (self.state.peer_ip, self.state.port):
                     self.state.client_ready = bool(success)
                     self._publish_readiness()
@@ -829,7 +859,10 @@ class Mole:
     async def _check_health(self) -> bool:
         """Check VPN connection health"""
         try:
-            peer_key = read_wg_peer_key(self.config.wg_conf)
+            peer_key = getattr(self, '_installed_peer_key', None)
+            if (not peer_key or getattr(self, '_installed_generation', None) != self.state.generation or
+                    getattr(self, '_installed_server_ip', None) != self.state.server_ip):
+                return False
             generation = self.state.generation
             ready = await self._verify_transport(peer_key, time.monotonic() + min(10, self.config.vpn_ready_timeout),
                                                  getattr(self, '_attempt_wall', 0))
@@ -843,9 +876,15 @@ class Mole:
                 return False
             self._publish_readiness()
 
-            # Check torrent client listener is alive
-            if self.torrent and self.state.port:
-                await self._check_torrent_listener()
+            # Client work never owns the tunnel monitoring loop.
+            if self.torrent:
+                if not self.state.client_ready:
+                    self._start_torrent_sync()
+                task = getattr(self, '_listener_task', None)
+                if self.state.port and (task is None or task.done()):
+                    task = asyncio.create_task(self._check_torrent_listener())
+                    self._listener_task = task
+                    task.add_done_callback(self._listener_finished)
 
             return True
 
@@ -860,7 +899,10 @@ class Mole:
         """Check if torrent client listener is bound; fix via port toggle if not."""
         try:
             async with self._torrent_lock():
+                generation = self.state.generation
                 status = await self.torrent.get_connection_status()
+                if generation != self.state.generation:
+                    return
                 if status == "disconnected":
                     log.warning("Torrent listener is disconnected, attempting port toggle fix")
                     await self.torrent._toggle_port(self.state.port)
@@ -880,20 +922,20 @@ class Mole:
             allow_restart: If True, restart service as fallback (prevents recursion)
         """
         if not self.torrent:
-            return
+            return True
 
         interface_name = "mole"
         interface_address = self.state.peer_ip
 
         if not interface_address:
             log.warning("No peer IP available, skipping torrent client update")
-            return
+            return False
 
         for attempt in range(1, max_retries + 1):
             try:
                 if await self._sync_torrent_binding():
                     log.info(f"Torrent client updated: interface={interface_name}, port={self.state.port}")
-                    return
+                    return True
                 else:
                     log.warning(f"Torrent client update attempt {attempt}/{max_retries} failed")
 
@@ -912,9 +954,10 @@ class Mole:
         # Fallback: restart torrent client service if API updates failed
         if allow_restart:
             log.warning(f"API update failed after {max_retries} attempts, restarting torrent client service...")
-            await self._restart_torrent_service()
+            return await self._restart_torrent_service()
         else:
             log.error(f"Failed to update torrent client after {max_retries} attempts (restart already attempted)")
+        return False
 
     async def _restart_torrent_service(self):
         """Restart qBittorrent service as fallback when API update fails."""
@@ -924,11 +967,12 @@ class Mole:
                 log.info("Torrent client service restarted successfully")
                 # Wait for service to start, then try API update again (no further restart)
                 await asyncio.sleep(15)
-                await self._update_torrent_client(max_retries=3, retry_delay=5.0, allow_restart=False)
+                return await self._update_torrent_client(max_retries=3, retry_delay=5.0, allow_restart=False)
             else:
                 log.error(f"Failed to restart torrent client service: {result.stderr}")
         except Exception as e:
             log.error(f"Error restarting torrent client service: {e}")
+        return False
 
     def _run_hook(self, hook_path: str, hook_name: str):
         """Run a hook script in the VPN namespace.

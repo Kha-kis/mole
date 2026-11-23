@@ -114,7 +114,7 @@ def write_runtime_readiness(directory: Path, state: VPNState) -> None:
 
 def read_runtime_readiness(directory: Path) -> dict:
     blocked = dict(connected=False, tunnel_ready=False, forwarding_ready=False,
-                   client_ready=False, hook_ready=None, last_error='no_current_evidence', generation=None)
+                   client_ready=False, hook_ready=None, last_error='no_current_evidence', generation=None, port=None)
     try:
         evidence = json.loads((directory / 'runtime_readiness.json').read_text())
         generation = int((directory / 'runtime_generation').read_text())
@@ -125,11 +125,12 @@ def read_runtime_readiness(directory: Path) -> dict:
         now = time.monotonic()
         tunnel = evidence['tunnel_ready'] is True and now < float(evidence['tunnel_deadline']) <= now + 3600
         forwarding = (tunnel and evidence['forwarding_ready'] is True and
+                      type(evidence['port']) is int and 1 <= evidence['port'] <= 65535 and
                       now < float(evidence['port_deadline']) <= now + 86400)
         return dict(connected=tunnel, tunnel_ready=tunnel, forwarding_ready=forwarding,
                     client_ready=tunnel and evidence['client_ready'] is True,
                     hook_ready=evidence.get('hook_ready'), last_error=evidence.get('last_error', ''),
-                    generation=generation)
+                    generation=generation, port=evidence['port'] if forwarding else None)
     except (OSError, ValueError, TypeError, KeyError, IndexError):
         return blocked
 

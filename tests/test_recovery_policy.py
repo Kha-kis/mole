@@ -114,3 +114,21 @@ class ProviderPolicy(unittest.IsolatedAsyncioTestCase):
         raw = dict(Name='XX#1', Status=1, Tier=2, Features=4, ExitCountry='XX',
                    Servers=[dict(Status=0, EntryIP='192.0.2.1', X25519PublicKey='synthetic')])
         self.assertEqual(self.provider._filter_servers([raw]), [])
+
+    async def test_raw_provider_resolution_skips_shared_failure_and_accepts_address_churn(self):
+        self.config._data['PROTON_FAILOVER_SERVERS'] = 'XX#1,XX#2,XX#3'
+
+        def raw(name, address):
+            return dict(Name=name, Domain='vpn.example.org', Status=1, Tier=2, Features=4, ExitCountry='XX',
+                        Servers=[dict(Status=1, EntryIP=address, ExitIP=address, X25519PublicKey='synthetic')])
+
+        values = [raw('XX#1', '192.0.2.1'), raw('XX#2', '192.0.2.1'), raw('XX#3', '192.0.2.2')]
+        with patch.object(self.provider, '_fetch_servers', return_value=values):
+            self.assertTrue(await self.provider.get_server())
+            self.provider.record_server_failure('readiness')
+            self.assertTrue(await self.provider.get_server())
+            self.assertEqual(self.provider.state.server_ip, '192.0.2.2')
+            self.provider.record_server_failure('readiness')
+            values[0]['Servers'][0]['EntryIP'] = '192.0.2.3'
+            self.assertTrue(await self.provider.get_server())
+            self.assertEqual(self.provider.state.server_ip, '192.0.2.3')

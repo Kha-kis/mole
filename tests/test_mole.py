@@ -328,6 +328,9 @@ class TestMoleCheckHealth(unittest.TestCase):
 
         mole = Mole()
         mole.state.server_vip = '10.0.0.1'
+        mole._installed_peer_key = 'peer'
+        mole._installed_server_ip = mole.state.server_ip
+        mole._installed_generation = mole.state.generation
 
         async def verify(cmd, *args, **kwargs):
             return MagicMock(returncode=0, stdout=f'peer {int(datetime.now().timestamp())}' if cmd[0] == 'wg' else '200')

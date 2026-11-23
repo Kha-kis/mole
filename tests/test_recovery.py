@@ -159,6 +159,26 @@ class LegacyRuntime(unittest.TestCase):
 
 
 class RuntimeReadiness(unittest.TestCase):
+    def test_actual_owner_process_exit_invalidates_runtime_evidence(self):
+        import subprocess
+        import sys
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root)
+            state = utils.VPNState(tunnel_ready=True, tunnel_deadline=time.monotonic() + 90)
+            utils.write_runtime_readiness(directory, state)
+            child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(.2)'])
+            try:
+                evidence = json.loads((directory / 'runtime_readiness.json').read_text())
+                evidence.update(pid=child.pid, process_identity=utils._process_identity(child.pid))
+                (directory / 'runtime_readiness.json').write_text(json.dumps(evidence))
+                self.assertTrue(utils.read_runtime_readiness(directory)['connected'])
+                child.wait(timeout=2)
+                self.assertFalse(utils.read_runtime_readiness(directory)['connected'])
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.wait()
+
     def test_runtime_rejects_restart_truncation_generation_and_expired_lease(self):
         self.assertTrue(callable(getattr(utils, 'read_runtime_readiness', None)))
         with tempfile.TemporaryDirectory() as root:

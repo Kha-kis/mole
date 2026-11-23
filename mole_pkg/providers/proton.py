@@ -13,7 +13,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from proton import Session as ProtonAPISession
+try:
+    from proton import Session as ProtonAPISession
+except ImportError:
+    ProtonAPISession = None
 
 from ..config import Config, validate_proton_client_version
 from ..recovery import ApprovedServerPolicy
@@ -55,6 +58,8 @@ class ProtonSessionWrapper:
 
     def _create_session(self) -> ProtonAPISession:
         """Create a new Proton API session"""
+        if ProtonAPISession is None:
+            raise RuntimeError('Proton support requires the optional proton-client package')
         return ProtonAPISession(
             api_url=PROTON_API_URL,
             appversion=self.app_version,
@@ -301,6 +306,9 @@ class ProtonProvider(VPNProvider):
     async def authenticate(self) -> bool:
         """Authenticate with ProtonVPN"""
         log.info("Authenticating with ProtonVPN...")
+        if ProtonAPISession is None:
+            log.error('Proton support requires the optional proton-client package')
+            return False
 
         self._proton_session = ProtonSessionWrapper(
             self._session_file, self.config.get('PROTON_CLIENT_VERSION', PROTON_CLIENT_VERSION))
@@ -526,8 +534,8 @@ class ProtonProvider(VPNProvider):
                     target_name = None
                     using_saved_server = False
                 else:
-                    log.warning('Pinned Proton server unavailable; refusing implicit failover')
-                    return False
+                    # A strict pin may belong to a later configured country.
+                    continue
 
             # Apply latency filtering if configured or many servers
             if self._max_latency > 0 or len(filtered) > 5:
@@ -841,6 +849,8 @@ class ProtonProvider(VPNProvider):
             previous_port = self.state.port or self._load_saved_port()
             secure_write_file(Path(self.config.state_dir) / "port", str(port))
             self.state.port = port
+            if previous_port != port:
+                self.state.client_ready = False
             self.state.port_deadline = deadline
             self.state.port_expires = datetime.now() + timedelta(seconds=deadline - time.monotonic())
             self.state.forwarding_ready = True
