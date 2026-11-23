@@ -6,6 +6,8 @@ import ipaddress
 import os
 import re
 import subprocess
+import math
+from urllib.parse import urlsplit
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
@@ -72,6 +74,40 @@ class Config:
     @property
     def proton_client_version(self) -> str:
         return validate_proton_client_version(self.get('PROTON_CLIENT_VERSION', '4.19.1'))
+
+    @property
+    def vpn_ready_timeout(self) -> float:
+        try:
+            value = float(self.get('VPN_READY_TIMEOUT', '30'))
+            if not math.isfinite(value) or not 1 <= value <= 120:
+                raise ValueError
+            return value
+        except (TypeError, ValueError):
+            raise ValueError('VPN_READY_TIMEOUT must be between 1 and 120 seconds') from None
+
+    @property
+    def vpn_ready_probes(self) -> List[str]:
+        urls = self.get('VPN_READY_PROBES', 'https://www.cloudflare.com/,https://www.wikipedia.org/').split(',')
+        if len(urls) != 2 or len(set(urls)) != 2:
+            raise ValueError('VPN_READY_PROBES requires two distinct public HTTPS URLs')
+        try:
+            for url in urls:
+                parsed = urlsplit(url)
+                host = parsed.hostname or ''
+                if (parsed.scheme != 'https' or parsed.username or parsed.password or parsed.query or
+                        parsed.fragment or not host or '.' not in host or host.endswith(('.local', '.localhost', '.internal')) or
+                        parsed.port not in (None, 443) or any(c.isspace() or ord(c) < 32 for c in url)):
+                    raise ValueError
+                try:
+                    address = ipaddress.ip_address(host)
+                except ValueError:
+                    pass
+                else:
+                    if not address.is_global:
+                        raise ValueError
+            return urls
+        except ValueError:
+            raise ValueError('VPN_READY_PROBES requires public HTTPS URLs without credentials, query or fragment') from None
 
     @property
     def netns(self) -> str:
@@ -490,6 +526,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
         return False, errors
 
     # Required fields for PIA
+    for setting in ('vpn_ready_timeout', 'vpn_ready_probes'):
+        try:
+            getattr(config, setting)
+        except ValueError as exc:
+            errors.append(str(exc))
     if config.vpn_provider.lower() == 'pia':
         if not config.get('PIA_USER') or config.get('PIA_USER') == 'your_username':
             errors.append("PIA_USER is not set or still has default value")

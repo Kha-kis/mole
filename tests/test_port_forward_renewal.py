@@ -268,6 +268,7 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
 
     async def test_interface_binding_succeeds_without_forwarded_port(self):
         mole = Mole.__new__(Mole)
+        mole._publish_readiness = Mock()
         mole.state = VPNState()
         mole.state.peer_ip = "192.0.2.2"
         mole._torrent_update_lock = asyncio.Lock()
@@ -299,6 +300,7 @@ class TestKeepaliveTorrentPortSync(unittest.IsolatedAsyncioTestCase):
 
     async def test_watchdog_cannot_restore_old_port_after_new_port_sync(self):
         mole = Mole.__new__(Mole)
+        mole._publish_readiness = Mock()
         mole.state = VPNState()
         mole.state.port = 12345
         mole.state.peer_ip = "192.0.2.2"

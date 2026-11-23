@@ -3,11 +3,14 @@ MOLE Utilities - Logging, state management, and helper functions
 """
 
 import asyncio
+import configparser
+import json
 import logging
 import os
 import re
 import signal
 import subprocess
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from datetime import datetime
@@ -51,6 +54,84 @@ class VPNState:
     generation: int = 0
     forwarding_ready: bool = False
     port_deadline: float = 0.0
+    tunnel_ready: bool = False
+    tunnel_deadline: float = 0.0
+    client_ready: bool = False
+    hook_ready: Optional[bool] = None
+    last_error: str = ''
+
+
+def read_wg_peer_key(config_path: str) -> str:
+    parser = configparser.ConfigParser(interpolation=None, strict=True)
+    try:
+        with open(config_path) as handle:
+            parser.read_file(handle)
+        if parser.sections().count('Peer') != 1:
+            raise ValueError
+        key = parser.get('Peer', 'PublicKey').strip()
+        if not key or any(c.isspace() for c in key):
+            raise ValueError
+        return key
+    except (OSError, ValueError, configparser.Error):
+        raise ValueError('WireGuard config must contain exactly one intended peer') from None
+
+
+def handshake_timestamp(output: str, peer_key: str, now: float, not_before: float = 0):
+    rows = [row.split() for row in output.strip().splitlines()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][0] != peer_key:
+        return None
+    try:
+        timestamp = int(rows[0][1])
+    except ValueError:
+        return None
+    if timestamp <= 0 or not 0 <= now - timestamp <= 180 or timestamp < not_before:
+        return None
+    return timestamp
+
+
+def _process_identity(pid: int) -> str:
+    # PID alone can be reused. Bind evidence to this boot and process start tick.
+    boot = Path('/proc/sys/kernel/random/boot_id').read_text().strip()
+    start = Path(f'/proc/{pid}/stat').read_text().rpartition(')')[2].split()[19]
+    return boot + ':' + start
+
+
+def write_runtime_readiness(directory: Path, state: VPNState) -> None:
+    evidence = {
+        'pid': os.getpid(), 'process_identity': _process_identity(os.getpid()),
+        'generation': state.generation, 'tunnel_ready': state.tunnel_ready,
+        'tunnel_deadline': state.tunnel_deadline, 'forwarding_ready': state.forwarding_ready,
+        'port_deadline': state.port_deadline, 'port': state.port,
+        'client_ready': state.client_ready, 'hook_ready': state.hook_ready,
+        'last_error': state.last_error,
+    }
+    for name, content in [('runtime_generation', str(state.generation)),
+                          ('runtime_readiness.json', json.dumps(evidence))]:
+        temporary = directory / (name + '.tmp')
+        secure_write_file(temporary, content)
+        os.replace(temporary, directory / name)
+
+
+def read_runtime_readiness(directory: Path) -> dict:
+    blocked = dict(connected=False, tunnel_ready=False, forwarding_ready=False,
+                   client_ready=False, hook_ready=None, last_error='no_current_evidence', generation=None)
+    try:
+        evidence = json.loads((directory / 'runtime_readiness.json').read_text())
+        generation = int((directory / 'runtime_generation').read_text())
+        if type(evidence['pid']) is not int or type(evidence['generation']) is not int:
+            return blocked
+        if evidence['generation'] != generation or evidence['process_identity'] != _process_identity(evidence['pid']):
+            return blocked
+        now = time.monotonic()
+        tunnel = evidence['tunnel_ready'] is True and now < float(evidence['tunnel_deadline']) <= now + 3600
+        forwarding = (tunnel and evidence['forwarding_ready'] is True and
+                      now < float(evidence['port_deadline']) <= now + 86400)
+        return dict(connected=tunnel, tunnel_ready=tunnel, forwarding_ready=forwarding,
+                    client_ready=tunnel and evidence['client_ready'] is True,
+                    hook_ready=evidence.get('hook_ready'), last_error=evidence.get('last_error', ''),
+                    generation=generation)
+    except (OSError, ValueError, TypeError, KeyError, IndexError):
+        return blocked
 
 
 async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subprocess.CompletedProcess:

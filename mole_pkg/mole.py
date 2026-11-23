@@ -30,6 +30,10 @@ from .utils import (
     log,
     run_cmd,
     run_in_netns,
+    async_run_in_netns,
+    handshake_timestamp,
+    read_wg_peer_key,
+    write_runtime_readiness,
     sanitize_for_log,
     secure_write_file,
 )
@@ -432,6 +436,17 @@ class Mole:
         log.info("Connecting VPN...")
 
         netns = self.config.netns
+        self.state.generation += 1
+        self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
+        self.state.tunnel_deadline = self.state.port_deadline = 0
+        self.state.last_error = 'connecting'
+        self._publish_readiness()
+        try:
+            peer_key = read_wg_peer_key(self.config.wg_conf)
+        except ValueError:
+            self.state.last_error = 'invalid_peer_config'
+            self._publish_readiness()
+            return False
 
         # Bring down existing connection
         run_in_netns(["wg-quick", "down", "mole"], netns, check=False)
@@ -449,21 +464,76 @@ class Mole:
         ], netns, check=False)
 
         # Bring up WireGuard
+        self._attempt_wall = int(time.time())
         result = run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, check=False)
         if result.returncode != 0:
-            log.error(f"Failed to bring up WireGuard: {sanitize_for_log(result.stderr)}")
+            self.state.last_error = 'wireguard_setup_failed'
+            self._publish_readiness()
+            log.error("Failed to bring up WireGuard")
             return False
 
-        await asyncio.sleep(5)
+        ready = await self._wait_for_readiness(peer_key, time.monotonic())
+        if ready:
+            log.info("VPN handshake and tunnel egress verified")
+        return ready
 
-        # Verify connection
-        result = run_in_netns(["ping", "-c", "1", "-W", "5", self.state.server_vip], netns, check=False)
-        if result.returncode != 0:
-            log.warning("VPN connectivity check failed, but continuing...")
+    def _publish_readiness(self):
+        try:
+            write_runtime_readiness(Path(self.config.state_dir), self.state)
+        except OSError:
+            log.warning('Could not publish runtime readiness')
 
-        self.state.connected = True
-        log.info("VPN connected")
-        return True
+    async def _verify_transport(self, peer_key, deadline, not_before):
+        for target in self.config.vpn_ready_probes:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            timeout = min(5, remaining)
+            try:
+                response = await asyncio.wait_for(async_run_in_netns(
+                    ['curl', '--silent', '--head', '--output', '/dev/null', '--write-out', '%{http_code}',
+                     '--interface', 'mole', '--noproxy', '*', '--proto', '=https',
+                     '--max-time', str(timeout), target], self.config.netns, timeout), timeout)
+                if response.returncode != 0 or not response.stdout.strip().isdigit() or not 100 <= int(response.stdout.strip()) <= 599:
+                    continue
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                handshake = await asyncio.wait_for(async_run_in_netns(
+                    ['wg', 'show', 'mole', 'latest-handshakes'], self.config.netns, min(5, remaining)), remaining)
+                if handshake.returncode == 0 and handshake_timestamp(handshake.stdout, peer_key, time.time(), not_before) is not None:
+                    return True
+            except (OSError, asyncio.TimeoutError):
+                continue
+        return False
+
+    async def _wait_for_readiness(self, peer_key: str, attempt_started: float) -> bool:
+        deadline = attempt_started + self.config.vpn_ready_timeout
+        generation = self.state.generation
+        try:
+            while time.monotonic() < deadline and generation == self.state.generation:
+                if await self._verify_transport(peer_key, deadline, self._attempt_wall):
+                    if generation != self.state.generation:
+                        return False
+                    self.state.connected = self.state.tunnel_ready = True
+                    self.state.tunnel_deadline = time.monotonic() + max(90, 2 * self.config.watchdog_interval + 10)
+                    self.state.last_error = ''
+                    self._publish_readiness()
+                    return True
+                await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+        except asyncio.CancelledError:
+            if generation != self.state.generation:
+                raise
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.last_error = 'readiness_cancelled'
+            self._publish_readiness()
+            raise
+        if generation != self.state.generation:
+            return False
+        self.state.connected = self.state.tunnel_ready = False
+        self.state.last_error = 'readiness_unproven'
+        self._publish_readiness()
+        return False
 
     async def _keepalive_loop(self):
         """Port forwarding keepalive loop.
@@ -531,6 +601,7 @@ class Mole:
                         log.info(f"Port {self.state.port} keepalive OK")
                     else:
                         log.warning("Port keepalive failed")
+                    self._publish_readiness()
 
             except asyncio.CancelledError:
                 break
@@ -565,6 +636,8 @@ class Mole:
                 if success and port:
                     success = await self.torrent.set_listen_port(port)
                 if (address, port) == (self.state.peer_ip, self.state.port):
+                    self.state.client_ready = bool(success)
+                    self._publish_readiness()
                     return success
                 # A renewal can change either target while HTTP is in flight.
                 # Keep the writer lock and reconcile before reporting completion.
@@ -628,30 +701,19 @@ class Mole:
     async def _check_health(self) -> bool:
         """Check VPN connection health"""
         try:
-            netns = self.config.netns
-
-            # Check interface
-            result = run_in_netns(["ip", "link", "show", "mole"], netns, check=False)
-            if result.returncode != 0:
+            peer_key = read_wg_peer_key(self.config.wg_conf)
+            generation = self.state.generation
+            ready = await self._verify_transport(peer_key, time.monotonic() + min(10, self.config.vpn_ready_timeout),
+                                                 getattr(self, '_attempt_wall', 0))
+            if generation != self.state.generation:
                 return False
-
-            # Check handshake age
-            result = run_in_netns(["wg", "show", "mole", "latest-handshakes"], netns, check=False)
-            if result.returncode == 0 and result.stdout.strip():
-                parts = result.stdout.strip().split()
-                if len(parts) >= 2:
-                    handshake_ts = int(parts[1])
-                    if handshake_ts == 0:
-                        return False
-                    age = int(datetime.now().timestamp()) - handshake_ts
-                    if age > 180:
-                        return False
-
-            # Check VPN server ping (works for both PIA and ProtonVPN)
-            if self.state.server_vip:
-                result = run_in_netns(["ping", "-c", "1", "-W", "5", self.state.server_vip], netns, check=False)
-                if result.returncode != 0:
-                    return False
+            self.state.connected = self.state.tunnel_ready = ready
+            self.state.tunnel_deadline = time.monotonic() + max(90, 2 * self.config.watchdog_interval + 10) if ready else 0
+            if not ready:
+                self.state.last_error = 'health_unproven'
+                self._publish_readiness()
+                return False
+            self._publish_readiness()
 
             # Check torrent client listener is alive
             if self.torrent and self.state.port:
@@ -660,7 +722,10 @@ class Mole:
             return True
 
         except Exception as e:
-            log.error(f"Health check error: {e}")
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.last_error = 'health_check_failed'
+            self._publish_readiness()
+            log.error("VPN health check failed")
             return False
 
     async def _check_torrent_listener(self):

@@ -24,7 +24,7 @@ from pathlib import Path
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from mole_pkg.utils import log, read_dict_counter, read_ring_buffer
+from mole_pkg.utils import log, read_dict_counter, read_ring_buffer, read_runtime_readiness
 from mole_pkg import __version__
 
 
@@ -128,6 +128,9 @@ def format_prometheus_metrics(
     )
 
     port = vpn_status.get("port") or 0
+    for field in ('tunnel_ready', 'forwarding_ready', 'client_ready'):
+        emit('mole_vpn_' + field, 'gauge', '1 when current verified ' + field + ' evidence is valid.',
+             [(None, 1 if vpn_status.get(field) else 0)])
     emit(
         "mole_vpn_forwarded_port",
         "gauge",
@@ -650,14 +653,12 @@ class HTTPAPIServerStandalone:
         port = self._read_state_file('port')
         peer_ip = self._read_state_file('peer_ip')
 
-        # Check if WireGuard is up
-        result = self._run_cmd(['wg', 'show', 'mole'])
-        connected = result.returncode == 0
+        readiness = read_runtime_readiness(self.state_dir)
 
         return {
             'status': 200,
             'body': {
-                'connected': connected,
+                **readiness,
                 'server': server_hostname,
                 'server_ip': server_ip,
                 'peer_ip': peer_ip,
@@ -706,20 +707,15 @@ class HTTPAPIServerStandalone:
 
     async def _get_health(self) -> dict:
         """GET /v1/health - Health check status"""
-        # Check WireGuard interface (we're in namespace, run directly)
-        result = self._run_cmd(['wg', 'show', 'mole'])
-        wg_up = result.returncode == 0
-
-        # Check connectivity
-        ping_result = self._run_cmd(['ping', '-c', '1', '-W', '2', '1.1.1.1'])
-        connected = ping_result.returncode == 0
+        readiness = read_runtime_readiness(self.state_dir)
 
         return {
             'status': 200,
             'body': {
-                'healthy': wg_up and connected,
-                'wireguard_up': wg_up,
-                'internet_connected': connected,
+                'healthy': readiness['connected'],
+                'wireguard_up': readiness['tunnel_ready'],
+                'internet_connected': readiness['connected'],
+                **readiness,
             }
         }
 
@@ -804,8 +800,10 @@ class HTTPAPIServerStandalone:
         port_str = self._read_state_file('port')
         port = int(port_str) if port_str and port_str.isdigit() else 0
 
-        wg_result = self._run_cmd(['wg', 'show', 'mole'])
-        connected = wg_result.returncode == 0
+        readiness = read_runtime_readiness(self.state_dir)
+        connected = readiness['connected']
+        if not readiness['forwarding_ready']:
+            port = 0
 
         handshake_age = None
         try:
@@ -851,6 +849,7 @@ class HTTPAPIServerStandalone:
             pass
 
         vpn_status = {
+            **readiness,
             'connected': connected,
             'port': port,
             'hostname': self._read_state_file('hostname') or '',

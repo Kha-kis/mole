@@ -4643,8 +4643,9 @@ Examples:
     elif args.command == "logs":
         return cmd_logs(args)
     elif args.command == "run":
+        from mole_pkg.mole import Mole as RuntimeMole
         config_path = getattr(args, 'config', DEFAULT_CONFIG_FILE)
-        mole = Mole(config_path)
+        mole = RuntimeMole(config_path)
         asyncio.run(mole.run())
         return 0
     else:

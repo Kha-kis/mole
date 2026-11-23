@@ -51,6 +51,10 @@ PIA_REGION=ca_toronto
 # Explicit compatibility override; plain major.minor.patch only.
 # PROTON_CLIENT_VERSION=4.19.1
 
+# Readiness requires a recent intended-peer handshake and HTTPS via WireGuard.
+VPN_READY_TIMEOUT=30
+VPN_READY_PROBES=https://www.cloudflare.com/,https://www.wikipedia.org/
+
 # Country code (or comma-separated fallback list, tried in order)
 # If first country has no suitable servers, tries next country, etc.
 # Use 2-letter country codes: US, CH, NL, DE, etc.
