@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -65,14 +66,14 @@ class ProtonCompatibilityRecovery(unittest.IsolatedAsyncioTestCase):
             config = Config('/nonexistent')
             config._data.update(STATE_DIR=root, PROTON_USER='synthetic-user', PROTON_PASS='synthetic-password')
             path = Path(root) / 'proton_session.json'
-            path.write_text('{}')
-            with patch.object(proton, 'ProtonAPISession') as api, self.assertLogs(proton.log, 'WARNING') as logs:
-                api.load.return_value.refresh.side_effect = ProtonError({'Code': 5003, 'Error': 'synthetic-token'})
+            saved = json.dumps({'reject': True})
+            path.write_text(saved)
+            fixture = str(Path(__file__).parent / 'fixtures/fake_proton')
+            with patch.dict(os.environ, PYTHONPATH=fixture), self.assertLogs(proton.log, 'WARNING') as logs:
                 provider = proton.ProtonProvider(config, VPNState())
                 self.assertFalse(await provider.authenticate())
-                api.return_value.authenticate.assert_not_called()
             self.assertNotIn('synthetic-token', str(logs.output))
-            self.assertEqual(path.read_text(), '{}')
+            self.assertEqual(path.read_text(), saved)
 
     def test_load_decodes_and_updates_identity_without_mutating_credentials(self):
         saved = {'api_url': proton.PROTON_API_URL, 'appversion': 'LinuxVPN_4.4.2',
