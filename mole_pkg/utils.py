@@ -135,9 +135,12 @@ def read_runtime_readiness(directory: Path) -> dict:
         return blocked
 
 
-async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subprocess.CompletedProcess:
+async def async_run_command(cmd: list, timeout: float, env=None,
+                            input_data=None) -> subprocess.CompletedProcess:
     """Own the command's process group until completion, timeout or cancellation."""
-    argv = ['ip', 'netns', 'exec', netns] + cmd
+    if timeout <= 0:
+        raise ValueError('command timeout must be positive')
+    deadline = asyncio.get_running_loop().time() + timeout
 
     async def drain(task):
         while not task.done():
@@ -148,11 +151,12 @@ async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subproces
         return task.result()
 
     spawn = asyncio.create_task(asyncio.create_subprocess_exec(
-        *argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        start_new_session=True))
+        *cmd, stdin=asyncio.subprocess.PIPE if input_data is not None else asyncio.subprocess.DEVNULL,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        start_new_session=True, env=env))
     try:
-        process = await asyncio.shield(spawn)
-    except asyncio.CancelledError:
+        process = await asyncio.wait_for(asyncio.shield(spawn), timeout=timeout)
+    except (asyncio.TimeoutError, asyncio.CancelledError):
         process = await drain(spawn)
         try:
             os.killpg(process.pid, signal.SIGKILL)
@@ -161,10 +165,11 @@ async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subproces
         await drain(asyncio.create_task(process.communicate()))
         raise
 
-    output = asyncio.create_task(process.communicate())
+    output = asyncio.create_task(process.communicate(input_data))
     try:
-        stdout, stderr = await asyncio.wait_for(asyncio.shield(output), timeout=timeout)
-        return subprocess.CompletedProcess(argv, process.returncode,
+        stdout, stderr = await asyncio.wait_for(
+            asyncio.shield(output), timeout=max(0, deadline - asyncio.get_running_loop().time()))
+        return subprocess.CompletedProcess(cmd, process.returncode,
                                            stdout.decode(errors='replace'),
                                            stderr.decode(errors='replace'))
     except (asyncio.TimeoutError, asyncio.CancelledError):
@@ -174,6 +179,12 @@ async def async_run_in_netns(cmd: list, netns: str, timeout: float) -> subproces
             pass
         await drain(output)
         raise
+
+
+async def async_run_in_netns(cmd: list, netns: str, timeout: float,
+                             env=None) -> subprocess.CompletedProcess:
+    return await async_run_command(['ip', 'netns', 'exec', netns] + cmd,
+                                   timeout, env=env)
 
 
 def run_cmd(cmd: list, check: bool = True, env: dict = None) -> subprocess.CompletedProcess:
