@@ -94,6 +94,11 @@ RENEWAL_INTERVAL=604800   # 7 days. NAT-PMP keepalive keeps the port forward ali
 WATCHDOG_INTERVAL=60
 WATCHDOG_MAX_FAILURES=3
 
+# Validated recovery is opt-in; enforcement prerequisites must be configured.
+PROTON_RECOVERY_MODE=legacy
+PROTON_DISCOVERY_MAX_AGE=86400
+PROTON_RECOVERY_CYCLE_TIMEOUT=300
+
 # DNS over TLS (disabled by default)
 DOT_ENABLED=false
 

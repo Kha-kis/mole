@@ -131,6 +131,19 @@ def format_prometheus_metrics(
     for field in ('tunnel_ready', 'forwarding_ready', 'client_ready'):
         emit('mole_vpn_' + field, 'gauge', '1 when current verified ' + field + ' evidence is valid.',
              [(None, 1 if vpn_status.get(field) else 0)])
+    for field in ('authorization_ready', 'gate_open', 'dns_ready', 'workload_ready'):
+        if type(vpn_status.get(field)) is bool:
+            emit('mole_vpn_' + field, 'gauge', '1 when current verified ' + field + ' evidence is valid.',
+                 [(None, int(vpn_status[field]))])
+    for field, metric in (('cache_age_seconds', 'discovery_cache_age_seconds'),
+                          ('next_retry_in_seconds', 'next_retry_seconds')):
+        if vpn_status.get(field) is not None:
+            emit('mole_vpn_' + metric, 'gauge', 'Current recovery ' + field + '.',
+                 [(None, max(0, _prom_num(vpn_status[field])))])
+    source = vpn_status.get('discovery_source')
+    if source in ('live', 'cache', 'none'):
+        emit('mole_vpn_discovery_source', 'gauge', 'Current discovery source.',
+             [({'source': source}, 1)])
     emit(
         "mole_vpn_forwarded_port",
         "gauge",

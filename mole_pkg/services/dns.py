@@ -152,10 +152,10 @@ class DOTServer:
         except (TypeError, ValueError):
             return default
 
-    async def start(self):
+    async def start(self, cached_only=False):
         """Start the DNS server"""
         # Load blocklists
-        await self._load_blocklists()
+        await self._load_blocklists(cached_only=cached_only)
         self._last_blocklist_update = time.time()
 
         # Create UDP server
@@ -216,7 +216,7 @@ class DOTServer:
                 self._blocklist_update_failures_total += 1
                 log.error(f"Blocklist update error: {e}")
 
-    async def _load_blocklists(self):
+    async def _load_blocklists(self, cached_only=False):
         """Load and parse blocklists"""
         blocklists_to_load = []
         if self.config.dot_block_ads:
@@ -243,28 +243,54 @@ class DOTServer:
 
             # Try to download fresh blocklist
             try:
-                async with asyncio.timeout(30):
-                    proc = await asyncio.create_subprocess_exec(
-                        'curl', '-sL', '--max-time', '25', url,
-                        stdout=asyncio.subprocess.PIPE,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                    stdout, _ = await proc.communicate()
-                    if proc.returncode == 0 and stdout:
+                if not cached_only:
+                    stdout = await self._download_blocklist(url)
+                    if stdout:
                         content = stdout.decode('utf-8', errors='ignore')
-                        # Cache the blocklist
                         cache_file.write_text(content)
                         log.debug(f"Downloaded {name} blocklist")
             except Exception as e:
                 log.debug(f"Failed to download {name} blocklist: {e}")
 
             # Fall back to cached version
-            if not content and cache_file.exists():
+            if not content and cache_file.is_file() and not cache_file.is_symlink():
+                if cached_only and cache_file.stat().st_size > 32 * 1024 * 1024:
+                    raise RuntimeError('required blocklist cache is oversized')
                 content = cache_file.read_text()
                 log.debug(f"Using cached {name} blocklist")
 
             if content:
+                previous = self.blocked_domains
+                self.blocked_domains = set()
                 self._parse_hosts_file(content)
+                parsed = self.blocked_domains
+                self.blocked_domains = previous | parsed
+                if cached_only and not parsed:
+                    raise RuntimeError('required blocklist cache is invalid')
+            elif cached_only:
+                raise RuntimeError('required blocklist cache is missing')
+
+    async def _download_blocklist(self, url):
+        # Curl stays in the DNS worker's group so a supervisor's kill/reap also
+        # removes an in-flight download. Graceful cancellation reaps it here.
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            'curl', '-sL', '--max-time', '25', url,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL))
+        proc = None
+        try:
+            proc = await asyncio.shield(spawn)
+            stdout, _ = await asyncio.wait_for(proc.communicate(), 30)
+            return stdout if proc.returncode == 0 else b''
+        finally:
+            from ..validation import _drain
+            if proc is None:
+                proc = await _drain(spawn)
+            if proc.returncode is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            await _drain(asyncio.create_task(proc.wait()))
 
     def _parse_hosts_file(self, content: str):
         """Parse hosts file format and add domains to blocklist"""

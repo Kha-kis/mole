@@ -6,6 +6,8 @@ Port forwarding uses NAT-PMP protocol.
 """
 
 import asyncio
+import base64
+import hashlib
 import json
 import os
 import re
@@ -42,8 +44,19 @@ PROTON_CLIENT_VERSION = "4.19.1"
 PROTON_APP_VERSION = f"linux-vpn@{PROTON_CLIENT_VERSION}"
 PROTON_USER_AGENT = f"ProtonVPN/{PROTON_CLIENT_VERSION} (Linux)"
 SDK_API_OPERATIONS = {('/vpn/logicals', 'GET'),
+                      ('/vpn/v2', 'GET'),
                       ('/vpn/v1/certificate/key/EC', 'GET'),
                       ('/vpn/v1/certificate', 'POST')}
+
+SDK_FAILURE_KINDS = frozenset(('transient', 'credentials_rejected', 'compatibility',
+                               'invalid_response', 'local_state'))
+
+
+class SDKFailure(RuntimeError):
+    """Finite, non-secret boundary between the SDK helper and recovery policy."""
+    def __init__(self, kind):
+        self.kind = kind if kind in SDK_FAILURE_KINDS else 'local_state'
+        super().__init__('Proton operation: ' + self.kind)
 
 
 class ProtonSessionWrapper:
@@ -56,6 +69,7 @@ class ProtonSessionWrapper:
         self.app_version = f'linux-vpn@{version}'
         self.user_agent = f'ProtonVPN/{version} (Linux)'
         self.compatibility_rejected = False
+        self.last_failure = None
 
     def _classify_rejection(self, error: Exception) -> bool:
         if getattr(error, 'code', None) in (5003, '5003'):
@@ -120,6 +134,7 @@ class ProtonSessionWrapper:
             log.info("Session refreshed successfully")
             return True
         except Exception as e:
+            self.last_failure = e
             if not self._classify_rejection(e):
                 log.warning("Proton session refresh failed")
             return False
@@ -154,6 +169,7 @@ class ProtonSessionWrapper:
                 return True
 
             except Exception as e:
+                self.last_failure = e
                 if self._classify_rejection(e):
                     return False
                 error_str = str(e).lower()
@@ -191,7 +207,7 @@ class ProtonProvider(VPNProvider):
         self._sdk_lock = None
 
     async def _run_sdk_job(self, operation, endpoint='', method='GET', data=None) -> dict:
-        if not ((operation == 'authenticate' and not endpoint and method == 'GET') or
+        if not ((operation in ('authenticate', 'load', 'refresh') and not endpoint and method == 'GET') or
                 (operation == 'api' and (endpoint, method) in SDK_API_OPERATIONS)):
             raise ValueError('unsupported Proton operation')
         if self._sdk_lock is None:
@@ -211,6 +227,10 @@ class ProtonProvider(VPNProvider):
                                session_file=str(staged_session), username=self._user, password=self._pass,
                                client_version=self.config.get('PROTON_CLIENT_VERSION', PROTON_CLIENT_VERSION))
                 env = dict(os.environ)
+                gnupg_home = staging / 'gnupg'
+                gnupg_home.mkdir(mode=0o700)
+                secure_write_file(gnupg_home / 'gpg.conf', 'no-autostart\n')
+                env['GNUPGHOME'] = str(gnupg_home)
                 package_root = str(Path(__file__).resolve().parents[2])
                 env['PYTHONPATH'] = package_root + os.pathsep + env.get('PYTHONPATH', '')
                 result = await async_run_command(
@@ -218,14 +238,14 @@ class ProtonProvider(VPNProvider):
                     120 if operation == 'authenticate' else 45, env=env,
                     input_data=json.dumps(request).encode())
                 if result.returncode != 0:
-                    raise RuntimeError('Proton helper failed')
+                    raise SDKFailure('local_state')
                 reply = json.loads(result.stdout)
                 if not isinstance(reply, dict):
-                    raise RuntimeError('invalid Proton helper response')
+                    raise SDKFailure('invalid_response')
                 if reply.get('error'):
-                    raise RuntimeError('Proton ' + ('client version rejected' if reply['error'] == 'compatibility' else 'operation failed'))
+                    raise SDKFailure(reply['error'])
                 if not isinstance(reply.get('result'), dict):
-                    raise RuntimeError('invalid Proton helper response')
+                    raise SDKFailure('invalid_response')
                 current = self._session_file.read_bytes() if self._session_file.exists() else None
                 if generation != self.state.generation or current != original:
                     raise RuntimeError('stale Proton operation rejected')
@@ -235,8 +255,12 @@ class ProtonProvider(VPNProvider):
                 os.chmod(staged_session, 0o600)
                 os.replace(staged_session, self._session_file)
                 return reply['result']
-            except (asyncio.TimeoutError, OSError, ValueError, TypeError, KeyError):
-                raise RuntimeError('Proton operation failed') from None
+            except asyncio.TimeoutError:
+                raise SDKFailure('transient') from None
+            except (ValueError, TypeError, KeyError):
+                raise SDKFailure('invalid_response') from None
+            except OSError:
+                raise SDKFailure('local_state') from None
             finally:
                 shutil.rmtree(staging)
 
@@ -277,6 +301,12 @@ class ProtonProvider(VPNProvider):
         self.state.server_country = server.get('country')
 
     async def restore_server(self, previous):
+        if self.config.get('PROTON_RECOVERY_MODE', 'legacy') == 'validated':
+            for candidate in getattr(self, '_validated_candidates', []):
+                if candidate['name'] == previous['name'] and candidate['entry_ip'] == previous['entry_ip']:
+                    self._select(candidate)
+                    return True
+            return False
         servers = await self._fetch_servers()
         if not servers:
             return False
@@ -381,6 +411,144 @@ class ProtonProvider(VPNProvider):
             log.warning('Proton authentication failed; check session and client compatibility')
             return False
 
+    def _local_discovery_binding(self):
+        from ..discovery import _PrivateRecord, identity_scope
+        session = _PrivateRecord(self._session_file)._read()
+        certificate = _PrivateRecord(Path(self.config.state_dir) / 'proton_certificate.json')._read()
+        if (not isinstance(session, dict) or session.get('api_url') != PROTON_API_URL or
+                not isinstance(session.get('session_data'), dict) or not isinstance(certificate, dict)):
+            raise ValueError('missing local discovery binding')
+        saved = session['session_data']
+        for name in ('UID', 'AccessToken', 'RefreshToken'):
+            if not isinstance(saved.get(name), str) or not saved[name]:
+                raise ValueError('incomplete local session')
+        for name in ('x25519_private_key', 'ed25519_public_key'):
+            value = certificate.get(name)
+            if not isinstance(value, str) or len(base64.b64decode(value, validate=True)) != 32:
+                raise ValueError('invalid saved certificate identity')
+        expiration = certificate.get('expiration_time')
+        if type(expiration) not in (int, float) or not time.time() + 3600 < expiration < float('inf'):
+            raise ValueError('saved certificate requires online renewal')
+        return identity_scope(PROTON_API_URL, saved['UID'], self._user, self._tier,
+                              certificate['ed25519_public_key']), saved['UID'], certificate
+
+    async def _revalidate_saved_certificate(self, certificate):
+        request = dict(ClientPublicKey=certificate['ed25519_public_key'], DeviceName='mole',
+                       Mode='persistent', Features=dict(SafeMode=False, SplitTCP=False,
+                       PortForwarding=self.config.port_forward, NetShieldLevel=self._netshield_level,
+                       RandomNAT=False))
+        response = await self._api_request('/vpn/v1/certificate', 'POST', request)
+        expiry = response.get('ExpirationTime')
+        if (response.get('Code') != 1000 or type(expiry) not in (int, float) or
+                not time.time() + 3600 < expiry < float('inf')):
+            raise SDKFailure('invalid_response')
+        self._save_certificate(certificate['x25519_private_key'], certificate['ed25519_public_key'], expiry, 'mole')
+
+    async def prepare_recovery(self):
+        return await self._prepare_recovery(allow_refresh=True)
+
+    async def _prepare_recovery(self, allow_refresh):
+        """Warm live discovery, or reuse a complete scoped record on transient failure."""
+        from ..discovery import DiscoveryCache, RejectionJournal, normalize_candidates
+        directory = Path(self.config.state_dir)
+        cache = DiscoveryCache(directory / 'proton_discovery.json')
+        journal = RejectionJournal(directory / 'discovery_blocked.json')
+        self._validated_candidates = []
+        self.state.discovery_source = 'none'
+        self.state.cache_age_seconds = None
+        # An incomplete local identity cannot enable fallback. Its provisional
+        # barrier still precedes any authentication/certificate network request.
+        provisional = hashlib.sha256((PROTON_API_URL + '\0' + self._user + '\0' + str(self._tier)).encode()).hexdigest()
+        scope, uid, certificate = provisional, None, None
+        transaction, created = None, False
+        prior_record = None
+        try:
+            try:
+                scope, uid, certificate = self._local_discovery_binding()
+            except (OSError, ValueError, TypeError, KeyError):
+                pass
+            if uid is not None:
+                prior_record = cache.load(scope, time.time(), time.monotonic(),
+                    Path('/proc/sys/kernel/random/boot_id').read_text().strip(), 86400)
+            blocked_before = journal.blocked(scope)
+            transaction, created = journal.begin(scope, time.time())
+            if uid is None:
+                # Missing local material requires an online setup, never a cache shortcut.
+                result = await self._run_sdk_job('authenticate')
+                if result.get('authenticated') is not True:
+                    raise SDKFailure('credentials_rejected')
+                private, public = await self._generate_wireguard_keys()
+                certificate = dict(x25519_private_key=private, ed25519_public_key=public)
+                await self._revalidate_saved_certificate(certificate)
+                scope, uid, certificate = self._local_discovery_binding()
+            loaded = await self._run_sdk_job('load')
+            if loaded.get('uid') != uid:
+                raise SDKFailure('local_state')
+            self._proton_session = ProtonSessionWrapper(self._session_file, self.config.proton_client_version)
+            entitlement = await self._api_request('/vpn/v2')
+            entitlement_time = time.time()
+            maximum = entitlement.get('VPN', {}).get('MaxTier')
+            if entitlement.get('Code') != 1000 or type(maximum) is not int or not 0 <= maximum <= 2:
+                raise SDKFailure('invalid_response')
+            self._effective_tier = min(self._tier, maximum)
+            response = await self._api_request('/vpn/logicals')
+            if response.get('Code') != 1000:
+                raise SDKFailure('invalid_response')
+            candidates = normalize_candidates(response.get('LogicalServers'), self._policy().names,
+                self._effective_tier, self.config.port_forward or self._prefer_p2p)
+            if blocked_before:
+                await self._revalidate_saved_certificate(certificate)
+            current_scope, current_uid, _ = self._local_discovery_binding()
+            if (current_scope, current_uid) != (scope, uid):
+                raise SDKFailure('local_state')
+            record = dict(schema=1, scope=scope, entitlement_tier=self._effective_tier,
+                          entitlement_observed_wall=entitlement_time, observed_wall=time.time(),
+                          boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+                          observed_mono=time.monotonic(), candidates=candidates)
+            cache.publish(record)
+            journal.finish(scope, transaction, 'success', created, revalidated=True)
+            self._validated_candidates = candidates
+            self.state.discovery_source = 'live'
+            return True
+        except SDKFailure as error:
+            restricted = (prior_record is not None and getattr(self, '_effective_tier', 2) <
+                          prior_record['entitlement_tier'])
+            if transaction is not None and not (error.kind == 'transient' and restricted):
+                journal.finish(scope, transaction, error.kind, created)
+            if error.kind == 'credentials_rejected' and allow_refresh:
+                # One refresh-only online revalidation, never a password loop.
+                # Rejection remains durable until the entire subsequent warmup succeeds.
+                try:
+                    refreshed = await self._run_sdk_job('refresh')
+                    if refreshed.get('authenticated') is True:
+                        return await self._prepare_recovery(allow_refresh=False)
+                except SDKFailure:
+                    pass
+            if error.kind == 'transient' and uid is not None and not journal.blocked(scope):
+                value = cache.load(scope, time.time(), time.monotonic(),
+                    Path('/proc/sys/kernel/random/boot_id').read_text().strip(), self.config.proton_discovery_max_age)
+                if value is not None and value['entitlement_tier'] <= self._tier:
+                    # A freshly observed restriction must not be forgotten on
+                    # an immediately following discovery timeout.
+                    if getattr(self, '_effective_tier', value['entitlement_tier']) < value['entitlement_tier']:
+                        return False
+                    self._effective_tier = value['entitlement_tier']
+                    self._validated_candidates = [c for c in value['candidates']
+                        if c['name'] in self._policy().names and c['tier'] <= self._effective_tier and
+                        (not (self.config.port_forward or self._prefer_p2p) or c['features'] & 4)]
+                    self.state.discovery_source = 'cache'
+                    self.state.cache_age_seconds = value['cache_age_seconds']
+                    self.state.cache_age_recorded_mono = time.monotonic()
+                    self._proton_session = ProtonSessionWrapper(self._session_file, self.config.proton_client_version)
+                    return True
+            self.state.recovery_reason = ('credentials_rejected' if error.kind == 'credentials_rejected' else
+                'compatibility_rejected' if error.kind == 'compatibility' else 'transient_discovery')
+            return False
+        except (OSError, ValueError, TypeError, KeyError):
+            # Unknown/persistence/malformed completion leaves the durable barrier.
+            self.state.recovery_reason = 'credentials_rejected'
+            return False
+
     async def _fetch_servers(self) -> Optional[List[Dict]]:
         """Fetch server list from ProtonVPN API"""
         if not self._proton_session and not self._session_file.exists():
@@ -410,6 +578,11 @@ class ProtonProvider(VPNProvider):
             servers: Raw server list from API
             country: Optional country code to filter by (for fallback support)
         """
+        if self.config.get('PROTON_RECOVERY_MODE', 'legacy') == 'validated':
+            from ..discovery import normalize_candidates
+            return normalize_candidates(servers, self._policy().names,
+                                        getattr(self, '_effective_tier', self._tier),
+                                        self.config.port_forward or self._prefer_p2p)
         filtered = []
 
         for server in servers:
@@ -523,6 +696,12 @@ class ProtonProvider(VPNProvider):
         2. Last used server (if PROTON_PREFER_LAST_SERVER=true, default)
         3. Best server by latency/load in configured countries
         """
+        if self.config.get('PROTON_RECOVERY_MODE', 'legacy') == 'validated':
+            candidates = self._policy().candidates(getattr(self, '_validated_candidates', []), time.monotonic())
+            if not candidates:
+                return False
+            self._select(candidates[0])
+            return True
         servers = await self._fetch_servers()
         if not servers:
             return False

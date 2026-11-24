@@ -15,6 +15,19 @@ from mole_pkg.services.api_main import (
 
 # ---------- _prom_escape_label ----------
 
+
+class RecoveryMetrics(unittest.TestCase):
+    def test_component_metrics_are_unlabelled_and_do_not_invent_tracker_readiness(self):
+        output = format_prometheus_metrics({}, dict(authorization_ready=True, gate_open=True,
+            dns_ready=False, workload_ready=False, discovery_source='cache', cache_age_seconds=25,
+            next_retry_in_seconds=10))
+        self.assertIn('mole_vpn_authorization_ready 1\n', output)
+        self.assertIn('mole_vpn_gate_open 1\n', output)
+        self.assertIn('mole_vpn_dns_ready 0\n', output)
+        self.assertIn('mole_vpn_workload_ready 0\n', output)
+        self.assertIn('mole_vpn_discovery_cache_age_seconds 25', output)
+        self.assertNotIn('mam_ready', output)
+
 class TestPromEscapeLabel(unittest.TestCase):
     def test_passthrough_simple(self):
         self.assertEqual(_prom_escape_label("custom"), "custom")

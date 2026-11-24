@@ -20,7 +20,7 @@ if __name__ == "__main__":
 
 from mole_pkg.services.dns import DOTServer
 from mole_pkg.services.dns_upstream import DOT_PROVIDERS
-from mole_pkg.utils import log
+from mole_pkg.utils import log, _process_identity
 
 
 class StandaloneConfig:
@@ -60,6 +60,9 @@ async def _stats_writer_loop(server: DOTServer, state_dir: Path,
     while True:
         try:
             stats = server.get_stats()
+            stats.update(pid=os.getpid(), process_identity=_process_identity(os.getpid()),
+                         listener_ready=server._transport is not None,
+                         observed_mono=asyncio.get_running_loop().time())
             stats['cache_entries'] = stats.pop('cache_size', 0)
             stats['cache_size_bytes'] = sum(
                 len(v[0]) for v in server._cache.values()
@@ -88,22 +91,21 @@ async def main_async(args):
         loop.add_signal_handler(sig, signal_handler)
 
     # Start server in background
-    server_task = asyncio.create_task(server.start())
+    server_task = asyncio.create_task(server.start(cached_only=getattr(args, 'repair_cached', False)))
     stats_task = asyncio.create_task(
         _stats_writer_loop(server, Path(args.state_dir))
     )
 
-    # Wait for shutdown signal
-    await shutdown_event.wait()
-
-    # Cleanup
-    await server.stop()
-    for task in (server_task, stats_task):
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    shutdown_task = asyncio.create_task(shutdown_event.wait())
+    try:
+        await asyncio.wait((server_task, shutdown_task), return_when=asyncio.FIRST_COMPLETED)
+        if server_task.done():
+            server_task.result()
+    finally:
+        for task in (server_task, stats_task, shutdown_task):
+            task.cancel()
+        await asyncio.gather(server_task, stats_task, shutdown_task, return_exceptions=True)
+        await server.stop()
 
     log.info("DNS server stopped")
 
@@ -151,6 +153,8 @@ Examples:
                         help="Blocklist update period in seconds (default: 86400)")
     parser.add_argument("--state-dir", default="/var/lib/mole",
                         help="State directory for caching blocklists")
+    parser.add_argument('--repair-cached', action='store_true',
+                        help='Require cached blocklists before repair listener startup')
     parser.add_argument("--pool-size", type=int, default=2,
                         help="Persistent TLS connections per upstream (default: 2)")
     parser.add_argument("--query-timeout", type=float, default=2.0,
