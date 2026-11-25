@@ -117,6 +117,11 @@ Validation failure logs identify only a fixed implementation stage and outcome.
 Never interpolate exception messages, helper output, requests or account data.
 Classifying a failure must not change denial, cancellation, revocation, timeout
 or disconnect semantics. The aggregate readiness error remains compatible.
+If probe-rule or group cleanup fails during cancellation, retain cancellation
+as the control-flow result and report only a fixed cleanup diagnostic. Do not
+remove a group when rule cleanup is unverified. The controller must still
+revoke permission or attempt interface-down before cancellation propagates;
+the cleanup failure must not turn cancellation into a normal retry result.
 
 DNS health queries the configured resolver with a fresh 128-bit random label
 under example.com, not a fixed cacheable name or a direct public resolver.

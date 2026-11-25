@@ -53,9 +53,11 @@ health-check defect and diagnostic opacity, not provider availability.
   loss was reproduced in two failing test methods, then repaired while retaining
   the cancellation object. The loopback test now uses run_in_executor and passes
   with to_thread unavailable. The final full suite passes after these corrections.
-- Preexisting risk: cancellation together with failed probe-rule cleanup can
+- Risk identified at this checkpoint: cancellation together with failed probe-rule cleanup can
   replace CancelledError with the cleanup exception. This repair preserves that
   prior behavior; it does not establish combined-failure cancellation safety.
+  The subsequent isolated correction is recorded in
+  [cancelled probe cleanup](../cancelled-probe-cleanup/fix.md).
 - Existing static type errors outside changed lines remain. The installed
   Bandit launcher is broken, so no successful Bandit run is claimed. Runtime
   tests used Python 3.13; Python 3.8 itself was not run.

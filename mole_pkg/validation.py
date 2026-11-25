@@ -16,6 +16,7 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .discovery import HEX, canonical_candidate, public_ipv4
+from .utils import log
 
 
 class AuthorizationDenied(ValueError):
@@ -186,6 +187,7 @@ class ExitValidator:
             targets = validate_targets(targets)
         with validation_stage('admission'):
             group = self._create_cgroup(attempt, round_)
+        cancellation = None
         try:
             command = self._observer_command or [sys.executable, '-m', 'mole_pkg.validation_worker']
             with validation_stage('admission'):
@@ -210,11 +212,21 @@ class ExitValidator:
                                 reply.get('round_id') != round_.id):
                             raise RuntimeError('exit observation failed')
                         return public_ipv4(reply.get('exit_ip'))
+        except asyncio.CancelledError as error:
+            cancellation = error
+            raise
         finally:
             # Remove identity permissions before allowing inode/cgroup reuse.
-            with validation_stage('cleanup'):
-                await self.gate.remove_probe(attempt, round_)
-                group.rmdir()
+            try:
+                with validation_stage('cleanup'):
+                    await self.gate.remove_probe(attempt, round_)
+                    group.rmdir()
+            except (Exception, asyncio.CancelledError):
+                if cancellation is None:
+                    raise
+                log.warning('Validation cleanup failed during cancellation')
+                cancellation._mole_validation_stage = 'cleanup'
+                raise cancellation from None
 
     async def validate(self, attempt, round_, transport_probe, deadline):
         stage = 'observation'
