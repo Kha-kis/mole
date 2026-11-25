@@ -4,8 +4,12 @@ MOLE Network Management - Namespace, veth, and iptables utilities
 
 import asyncio
 import json
+import ipaddress
 import os
+import re
 import sys
+import time
+import functools
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -13,6 +17,249 @@ from .utils import log, run_cmd, run_in_netns, async_run_command, async_run_in_n
 
 if TYPE_CHECKING:
     from .config import Config
+
+
+def _bounded_gate(method):
+    @functools.wraps(method)
+    async def bounded(*args, **kwargs):
+        return await asyncio.wait_for(method(*args, **kwargs), 5)
+    return bounded
+
+
+class ValidationGate:
+    """Single-owner namespace guard. Never edits another table or host rules."""
+    TABLE = 'inet mole_validation'
+
+    def __init__(self, netns, management_subnet):
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,63}', netns):
+            raise ValueError('invalid gate namespace')
+        subnet = ipaddress.ip_network(management_subnet)
+        if subnet.version != 4 or subnet.prefixlen != 32:
+            raise ValueError('management must identify the exact host IPv4 address')
+        self.netns = netns
+        self.management_subnet = str(subnet)
+        self.lock = asyncio.Lock()
+        self.attempt = None
+        self.round = None
+        self.active_round = None
+        self.deadline = 0
+        self._known_rounds = []
+
+    def closed_rules(self):
+        commands = [f'add table {self.TABLE}',
+                    f'add chain {self.TABLE} workload',
+                    f'add chain {self.TABLE} probes_out',
+                    f'add chain {self.TABLE} probes_in',
+                    f'add chain {self.TABLE} outer_out',
+                    f'add chain {self.TABLE} outer_in']
+        for hook in ('output', 'input', 'forward'):
+            commands.append(f'add chain {self.TABLE} {hook} {{ type filter hook {hook} priority -150; policy drop; }}')
+            prefix = f'add rule {self.TABLE} {hook}'
+            commands.append(prefix + ' meta nfproto ipv6 counter drop')
+            if hook != 'forward':
+                direction = 'oifname' if hook == 'output' else 'iifname'
+                address = 'daddr' if hook == 'output' else 'saddr'
+                flow = 'reply' if hook == 'output' else 'original'
+                commands.append(prefix + f' {direction} "lo" accept')
+                commands.append(prefix + f' {direction} "veth-vpn" ip {address} {self.management_subnet} '
+                                f'ct direction {flow} accept')
+                commands.append(prefix + ' jump outer_' + ('out' if hook == 'output' else 'in'))
+                commands.append(prefix + ' jump probes_' + ('out' if hook == 'output' else 'in'))
+            commands.append(prefix + ' jump workload')
+            commands.append(prefix + ' counter drop')
+        return '\n'.join(commands) + '\n'
+
+    async def check_support(self, root):
+        """Kernel validation only; do not commit a table during preflight."""
+        import secrets
+        relative = Path(root).relative_to('/sys/fs/cgroup')
+        if not re.fullmatch(r'[A-Za-z0-9_./-]+', str(relative)):
+            raise RuntimeError('unsupported probe cgroup path')
+        table = 'inet mole_check_' + secrets.token_hex(8)
+        script = self.closed_rules().replace(self.TABLE, table)
+        script += (f'add set {table} fence {{ type mark; flags timeout; timeout 90s; }}\n'
+                   f'add rule {table} probes_out meta mark & 0x0 @fence '
+                   f'socket cgroupv2 level {len(relative.parts)} "{relative}" accept\n')
+        result = await async_run_command(['nsenter', '--net=/run/netns/' + self.netns, '--',
+            'nft', '--check', '-f', '-'], 5, input_data=script.encode())
+        if result.returncode:
+            raise RuntimeError('validated recovery enforcement unsupported')
+
+    def peer_rules(self, attempt):
+        address, port = attempt.candidate['entry_ip'], attempt.candidate['port']
+        return (f'flush chain {self.TABLE} outer_out\nflush chain {self.TABLE} outer_in\n'
+                f'add rule {self.TABLE} outer_out oifname "veth-vpn" ip daddr {address} '
+                f'udp dport {port} meta mark 51820 accept\n'
+                f'add rule {self.TABLE} outer_in iifname "veth-vpn" ip saddr {address} '
+                f'udp sport {port} ct state established accept\n')
+
+    @staticmethod
+    def _names(round_):
+        return 'f_' + round_.id[:24], 'g_' + round_.id[:24]
+
+    def round_rules(self, round_):
+        fence, grant = self._names(round_)
+        return (f'add set {self.TABLE} {fence} {{ type mark; flags timeout; timeout 90s; }}\n'
+                f'add element {self.TABLE} {fence} {{ 0 timeout 90s }}\n'
+                f'add set {self.TABLE} {grant} {{ type mark; flags timeout; timeout 90s; }}\n')
+
+    def grant_rules(self, round_):
+        fence, grant = self._names(round_)
+        commands = [f'add element {self.TABLE} {grant} {{ 0 timeout 90s }}',
+                    f'flush chain {self.TABLE} workload']
+        # A late grant has no effect after the independently established fence.
+        for direction in ('oifname', 'iifname'):
+            commands.append(f'add rule {self.TABLE} workload {direction} "mole" '
+                            f'meta mark & 0x0 @{fence} meta mark & 0x0 @{grant} counter accept')
+        return '\n'.join(commands) + '\n'
+
+    async def _command(self, script):
+        # ip-netns-exec remounts sysfs and hides cgroup v2 on some hosts.
+        # Enter only the network namespace so nft can resolve the private leaf.
+        result = await async_run_command(['nsenter', '--net=/run/netns/' + self.netns, '--', 'nft', '-f', '-'],
+                                         5, input_data=script.encode())
+        if result.returncode:
+            raise RuntimeError('validation gate mutation failed')
+
+    async def _table(self):
+        result = await async_run_command(['nsenter', '--net=/run/netns/' + self.netns, '--',
+                                          'nft', '-j', 'list', 'table', 'inet', 'mole_validation'], 5)
+        if result.returncode:
+            raise RuntimeError('validation gate verification failed')
+        return json.loads(result.stdout)['nftables']
+
+    async def _verify_base(self):
+        entries = await self._table()
+        chains = {x['chain']['name']: x['chain'] for x in entries if 'chain' in x}
+        for hook in ('output', 'input', 'forward'):
+            chain = chains.get(hook, {})
+            if chain.get('policy') != 'drop' or chain.get('prio') != -150 or chain.get('hook') != hook:
+                raise RuntimeError('validation gate is not fail closed')
+        return entries
+
+    def _current(self, attempt):
+        if self.attempt is None or self.attempt != attempt:
+            raise RuntimeError('stale validation gate owner')
+
+    @_bounded_gate
+    async def quarantine(self, attempt):
+        async with self.lock:
+            self.deadline = 0
+            # Atomic replacement closes an old controller's permissions too.
+            result = await async_run_in_netns(['nft', 'list', 'table', 'inet', 'mole_validation'],
+                                               self.netns, 5)
+            script = (f'delete table {self.TABLE}\n' if result.returncode == 0 else '') + self.closed_rules()
+            await self._command(script)
+            await self._verify_base()
+            self.attempt, self.round = attempt, None
+            self.active_round = None
+            self._known_rounds = []
+            if attempt is not None:
+                await self._command(self.peer_rules(attempt))
+
+    @_bounded_gate
+    async def prepare_round(self, attempt):
+        from .validation import ValidationRound
+        import secrets
+        async with self.lock:
+            self._current(attempt)
+            round_ = ValidationRound(secrets.token_hex(32), attempt, 0)
+            await self._command(self.round_rules(round_))
+            acknowledged = time.monotonic()
+            round_ = ValidationRound(round_.id, attempt, acknowledged)
+            await self._verify_base()
+            self.round = round_
+            self._known_rounds.append(round_)
+            return round_
+
+    @_bounded_gate
+    async def authorize(self, attempt, round_, evidence, current_check=None):
+        async with self.lock:
+            self._current(attempt)
+            if current_check is not None and current_check() is not True:
+                raise RuntimeError('candidate authorization invalidated')
+            if (round_ is None or self.round != round_ or evidence.get('attempt') != attempt.to_dict() or
+                    evidence.get('round_id') != round_.id or evidence.get('allowed') is not True or
+                    min(evidence.get('authorization_deadline', 0), evidence.get('transport_deadline', 0)) <
+                    round_.acknowledged_mono + 90 or time.monotonic() >= round_.acknowledged_mono + 90):
+                raise RuntimeError('invalid gate evidence')
+            await self._command(self.grant_rules(round_))
+            entries = await self._verify_base()
+            names = self._names(round_)
+            for name in names:
+                sets = [x['set'] for x in entries if 'set' in x and x['set'].get('name') == name]
+                if len(sets) != 1 or not sets[0].get('elem'):
+                    raise RuntimeError('validation permit not verified')
+            self.deadline = round_.acknowledged_mono + 90
+            self.active_round = round_
+            keep = set(self._names(round_)) | {'p_' + round_.id[:24]}
+            obsolete = [entry['set']['name'] for entry in entries if 'set' in entry and
+                        re.fullmatch(r'[fgp]_[0-9a-f]{24}', entry['set'].get('name', '')) and
+                        entry['set']['name'] not in keep]
+            if obsolete:
+                await self._command(''.join(f'delete set {self.TABLE} {name}\n' for name in obsolete))
+            self._known_rounds = [round_]
+
+    @_bounded_gate
+    async def prepare_probe(self, attempt, round_, group, targets):
+        # The caller's fixed-adapter validator enforces global destinations.
+        # This low-level packet primitive also serves isolated synthetic tests.
+        addresses = [str(ipaddress.IPv4Address(target['ip'])) for target in targets]
+        if not 1 <= len(addresses) <= 2:
+            raise ValueError('invalid probe destinations')
+        relative = Path(group).relative_to('/sys/fs/cgroup')
+        path = str(relative)
+        if not re.fullmatch(r'[A-Za-z0-9_./-]+', path) or '..' in relative.parts:
+            raise ValueError('invalid observer cgroup')
+        name = 'p_' + round_.id[:24]
+        async with self.lock:
+            self._current(attempt)
+            if self.round != round_:
+                raise RuntimeError('stale probe round')
+            elements = ', '.join(address + ' timeout 20s' for address in addresses)
+            script = (f'add set {self.TABLE} {name} {{ type ipv4_addr; flags timeout; timeout 20s; }}\n'
+                      f'add element {self.TABLE} {name} {{ {elements} }}\n'
+                      f'flush chain {self.TABLE} probes_out\nflush chain {self.TABLE} probes_in\n'
+                      f'add rule {self.TABLE} probes_out oifname "mole" ip daddr @{name} '
+                      f'tcp dport 443 socket cgroupv2 level {len(relative.parts)} "{path}" '
+                      f'ct mark set 0x4d4f4c45 counter accept\n'
+                      f'add rule {self.TABLE} probes_in iifname "mole" ip saddr @{name} '
+                      f'tcp sport 443 ct state established ct mark 0x4d4f4c45 counter accept\n')
+            await self._command(script)
+            await self._verify_base()
+
+    @_bounded_gate
+    async def remove_probe(self, attempt, round_):
+        async with self.lock:
+            self._current(attempt)
+            if self.round != round_:
+                raise RuntimeError('stale probe cleanup')
+            await self._command(f'flush chain {self.TABLE} probes_out\n'
+                                f'flush chain {self.TABLE} probes_in\n')
+
+    @_bounded_gate
+    async def revoke(self, attempt):
+        async with self.lock:
+            self._current(attempt)
+            self.deadline = 0
+            await self._command(f'flush chain {self.TABLE} workload\n'
+                                f'flush chain {self.TABLE} probes_out\n'
+                                f'flush chain {self.TABLE} probes_in\n')
+            await self._verify_base()
+            self.round = None
+            self.active_round = None
+
+    @_bounded_gate
+    async def verify_open(self, attempt):
+        async with self.lock:
+            self._current(attempt)
+            if not self.active_round or time.monotonic() >= self.deadline:
+                return False
+            entries = await self._verify_base()
+            for name in self._names(self.active_round):
+                if not any(x.get('set', {}).get('name') == name and x['set'].get('elem') for x in entries):
+                    return False
+            return True
 
 
 def disable_ipv6_in_namespace(netns: str) -> None:

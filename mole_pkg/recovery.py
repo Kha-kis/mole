@@ -35,6 +35,13 @@ class ApprovedServerPolicy:
                 self._cursor = (self.names.index(server['name']) + 1) % len(self.names)
                 break
 
+    def next_eligible_at(self, servers: list, now: float):
+        destinations = {server.get('entry_ip') for server in servers
+                        if server.get('name') in self.names and server.get('entry_ip')}
+        if not destinations:
+            return None
+        return max(now, min(self._failed.get(address, now) for address in destinations))
+
     def succeeded(self, entry_ip: str) -> None:
         self._failed.pop(entry_ip, None)
         for server in self._resolved:

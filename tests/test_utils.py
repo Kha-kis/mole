@@ -5,6 +5,48 @@ Tests for mole_pkg.utils module
 import os
 import tempfile
 import unittest
+
+
+class RecoveryStatusEvidence(unittest.TestCase):
+    def test_legacy_has_no_fabricated_authorization_or_gate(self):
+        import tempfile
+        from pathlib import Path
+        from mole_pkg.utils import VPNState, write_runtime_readiness, read_runtime_readiness
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)
+            write_runtime_readiness(path, VPNState())
+            result = read_runtime_readiness(path)
+            self.assertIsNone(result['gate_open'])
+            self.assertIsNone(result['authorization_ready'])
+            self.assertIsNone(result['workload_ready'])
+
+    def test_aggregate_needs_current_auth_gate_dns_and_required_components(self):
+        import tempfile
+        import time
+        from pathlib import Path
+        from mole_pkg.utils import VPNState, write_runtime_readiness, read_runtime_readiness
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root)
+            now = time.monotonic()
+            state = VPNState(recovery_mode='validated', tunnel_ready=True, tunnel_deadline=now + 120,
+                             authorization_ready=True, gate_open=True, authorization_deadline=now + 90,
+                             gate_verification_deadline=now + 60, dns_ready=True, dns_deadline=now + 60,
+                             forwarding_required=False, client_required=False)
+            write_runtime_readiness(path, state)
+            result = read_runtime_readiness(path)
+            self.assertTrue(result['workload_ready'])
+            self.assertTrue(result['connected'])
+            state.dns_ready = False
+            write_runtime_readiness(path, state)
+            result = read_runtime_readiness(path)
+            self.assertFalse(result['workload_ready'])
+            self.assertTrue(result['connected'])
+            state.authorization_deadline = now - 1
+            write_runtime_readiness(path, state)
+            result = read_runtime_readiness(path)
+            self.assertFalse(result['authorization_ready'])
+            self.assertFalse(result['gate_open'])
+            self.assertNotIn('mam_ready', result)
 from pathlib import Path
 
 import json

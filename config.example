@@ -333,3 +333,11 @@ WATCHDOG_MAX_FAILURES=3
 # CONFIG_DIR=/etc/mole
 # STATE_DIR=/var/lib/mole
 # WG_CONF=/etc/wireguard/mole.conf
+
+# Unreleased opt-in validated Proton recovery. Keep legacy until the external
+# policy, private cgroup delegation and isolated packet acceptance are reviewed.
+PROTON_RECOVERY_MODE=legacy
+PROTON_DISCOVERY_MAX_AGE=86400
+PROTON_RECOVERY_CYCLE_TIMEOUT=300
+# PROTON_EXIT_VALIDATOR=/usr/local/libexec/mole-exit-policy
+# PROTON_VALIDATION_CGROUP_ROOT=/sys/fs/cgroup/system.slice/mole.service/probes

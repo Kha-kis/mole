@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, Mock, patch
 from mole_pkg.config import Config
 from mole_pkg.providers.proton import ProtonProvider
 from mole_pkg.utils import VPNState
+from mole_pkg.recovery import ApprovedServerPolicy
 
 
 def server(name, address):
@@ -17,8 +18,19 @@ def server(name, address):
 
 class ApprovedPolicy(unittest.TestCase):
     def policy(self, names, initial='', cooldown=900):
-        from mole_pkg.recovery import ApprovedServerPolicy
         return ApprovedServerPolicy(names, initial, cooldown)
+
+    def test_earliest_cooldown_is_destination_keyed_across_alias_and_key_change(self):
+        policy = ApprovedServerPolicy(['NL#1', 'NL#2'])
+        servers = [dict(name='NL#1', entry_ip='8.8.8.8'), dict(name='NL#2', entry_ip='1.1.1.1')]
+        self.assertEqual(policy.next_eligible_at(servers, 100), 100)
+        policy.failed('8.8.8.8', 100)
+        policy.failed('1.1.1.1', 110)
+        self.assertEqual(policy.next_eligible_at(servers, 120), 1000)
+        alias = [dict(name='NL#2', entry_ip='8.8.8.8', public_key='changed')]
+        self.assertEqual(policy.next_eligible_at(alias, 120), 1000)
+        self.assertEqual(policy.next_eligible_at(alias, 1001), 1001)
+        self.assertIsNone(policy.next_eligible_at([], 100))
 
     def test_ordering_wrap_and_physical_cooldown(self):
         policy = self.policy(['XX#1', 'XX#2', 'XX#3'], 'XX#2')

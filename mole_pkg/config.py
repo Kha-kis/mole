@@ -76,6 +76,44 @@ class Config:
         return validate_proton_client_version(self.get('PROTON_CLIENT_VERSION', '4.19.1'))
 
     @property
+    def proton_recovery_mode(self) -> str:
+        value = self.get('PROTON_RECOVERY_MODE', 'legacy')
+        if value not in ('legacy', 'validated'):
+            raise ValueError('PROTON_RECOVERY_MODE must be legacy or validated')
+        return value
+
+    def _bounded_int(self, key, default, minimum, maximum):
+        value = self.get(key, str(default))
+        if not isinstance(value, str) or not re.fullmatch(r'[0-9]+', value):
+            raise ValueError(key + ' must be an integer')
+        number = int(value)
+        if not minimum <= number <= maximum:
+            raise ValueError(key + ' is outside its allowed range')
+        return number
+
+    @property
+    def proton_discovery_max_age(self) -> int:
+        return self._bounded_int('PROTON_DISCOVERY_MAX_AGE', 86400, 0, 86400)
+
+    @property
+    def proton_recovery_cycle_timeout(self) -> int:
+        return self._bounded_int('PROTON_RECOVERY_CYCLE_TIMEOUT', 300, 120, 600)
+
+    def validate_proton_recovery(self):
+        self.proton_discovery_max_age
+        self.proton_recovery_cycle_timeout
+        if self.proton_recovery_mode == 'legacy':
+            return
+        if self.vpn_provider.lower() not in ('proton', 'protonvpn') or not self.proton_failover_enabled:
+            raise ValueError('Validated recovery requires Proton and explicit approved-list failover')
+        self.validate_proton_failover()
+        for key in ('PROTON_EXIT_VALIDATOR', 'PROTON_VALIDATION_CGROUP_ROOT'):
+            path = self.get(key, '')
+            if (not isinstance(path, str) or not path.startswith('/') or
+                    '..' in Path(path).parts or any(ord(c) < 33 or ord(c) == 127 for c in path)):
+                raise ValueError(key + ' must be an absolute path without control characters')
+
+    @property
     def proton_failover_enabled(self) -> bool:
         value = self.get('PROTON_FAILOVER_ENABLED', 'false').lower()
         if value not in ('true', 'false', '1', '0', 'yes', 'no', 'on', 'off'):
@@ -562,6 +600,11 @@ def validate_config(config_path: str = DEFAULT_CONFIG_FILE) -> Tuple[bool, List[
     except Exception as e:
         errors.append(f"Failed to parse config: {e}")
         return False, errors
+
+    try:
+        config.validate_proton_recovery()
+    except ValueError as exc:
+        errors.append(str(exc))
 
     # Required fields for PIA
     for setting in ('vpn_ready_timeout', 'vpn_ready_probes'):

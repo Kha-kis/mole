@@ -167,7 +167,12 @@ class TestMoleSubprocessEnv(unittest.TestCase):
         env = mole._get_subprocess_env()
 
         self.assertIn('PYTHONPATH', env)
-        self.assertEqual(env['PYTHONPATH'], '/usr/local/lib/mole')
+        import subprocess
+        import sys
+        imported = subprocess.run([sys.executable, '-B', '-c', 'import mole_pkg;print(mole_pkg.__file__)'],
+                                  env=env, capture_output=True, text=True, check=True, timeout=5)
+        self.assertEqual(Path(imported.stdout.strip()).resolve(),
+                         Path(__file__).resolve().parents[1] / 'mole_pkg' / '__init__.py')
 
 
 class TestMoleSignalHandler(unittest.TestCase):
@@ -351,7 +356,10 @@ class TestMoleAsync(unittest.TestCase):
     @patch('mole_pkg.mole.get_torrent_client')
     def test_cleanup(self, mock_torrent, mock_provider, mock_config):
         """_cleanup cancels tasks and disconnects"""
-        mock_config_instance = MagicMock()
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        mock_config_instance = Config('/nonexistent')
+        mock_config_instance._data.update(STATE_DIR=root.name, POST_DISCONNECT_HOOK='', TORRENT_CLIENT='none')
         mock_config.return_value = mock_config_instance
         mock_provider.return_value = MagicMock()
         mock_torrent.return_value = None

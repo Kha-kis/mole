@@ -875,6 +875,49 @@ PIA has stricter rate limits. MOLE will retry with longer delays (30s, 60s, 120s
 2. Validate config: `mole validate`
 3. Try a different server/region
 
+## Validated Proton Recovery (Unreleased)
+
+The opt-in `PROTON_RECOVERY_MODE=validated` extends approved-list failover with
+all eligible physical endpoints, scoped discovery caching, and an expiring
+namespace traffic gate. The default remains `legacy`; PIA behavior is unchanged.
+This branch is not a production release. Provider and deployment acceptance are
+separate from synthetic tests.
+
+Validated mode requires Linux nftables with socket cgroup-v2 matching, `nsenter`,
+WireGuard, a privately delegated cgroup-v2 directory, and a root-owned external
+exit-policy executable. Mole does not install packages, grant delegation, supply
+hosting-network approvals or change tracker authorization automatically. Missing
+prerequisites fail closed. The validator and every parent directory must be
+root-owned and not writable by other users.
+
+Workload traffic stays closed until a private helper observes the actual exit
+and the external policy authorizes it. A separate kernel deadline fence and
+grant limit permission to 90 seconds; new observation starts every 30 seconds.
+Controller death cannot make permission indefinite. Existing sockets and root or
+unprivileged workloads receive no identity exemption. IPv6 remains denied.
+Trusted host administrators are outside this isolation boundary.
+
+Discovery fallback is limited to typed transient control-plane failures and
+previously verified account/session/certificate scope. Both catalogue and
+entitlement age must fit `PROTON_DISCOVERY_MAX_AGE` (default/max 86400 seconds;
+zero disables fallback). Known rejection, incomplete bindings, invalid data and
+unsafe storage cannot use old approval. Private pending/rejection markers survive
+restart until successful online revalidation; there is no rejection expiry.
+
+Status adds `authorization_ready`, `gate_open`, `dns_ready`, `discovery_source`,
+`cache_age_seconds`, `next_retry_in_seconds`, `recovery_reason` and
+`workload_ready`. Legacy authorization/gate fields are null. `connected` still
+means verified transport, not application or tracker acceptance. Tracker checks
+remain independently owned; a successful hook is not registration evidence.
+DNS-only repair preserves filtering and does not restart qBittorrent or rotate
+the VPN merely because the resolver failed.
+
+See [the validation contract](specs/001-proton-pool-recovery/contracts/validation.md)
+and [isolated acceptance guide](specs/001-proton-pool-recovery/quickstart.md).
+Do not roll back by deleting a guard under an active unverified tunnel: verify
+CLOSED, disconnect the candidate, restore reviewed code/configuration, then
+verify the previous path before retiring task-owned rules.
+
 ## License
 
 MIT License

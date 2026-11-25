@@ -16,6 +16,32 @@ from mole_pkg.services.dns import (
 )
 from mole_pkg.services.dns_main import _stats_writer_loop
 from mole_pkg.services.dns_upstream import UpstreamExhausted
+from mole_pkg.config import Config
+
+
+class CachedRepairStartup(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.config = Config('/nonexistent')
+        self.config._data.update(STATE_DIR=self.directory.name, DOT_BLOCK_ADS='true',
+                                 DOT_BLOCK_MALWARE='false', DOT_BLOCK_TRACKING='false')
+
+    async def test_repair_loads_required_cache_without_downloading(self):
+        path = Path(self.directory.name) / 'blocklists'
+        path.mkdir()
+        (path / 'ads.txt').write_text('0.0.0.0 ads.example.com\n')
+        server = DOTServer(self.config, 'qa-fixture')
+        await server._load_blocklists(cached_only=True)
+        self.assertTrue(server._is_blocked('ads.example.com'))
+        await server.stop()
+
+    async def test_missing_cache_fails_instead_of_binding_unfiltered_listener(self):
+        server = DOTServer(self.config, 'qa-fixture')
+        with self.assertRaises(RuntimeError):
+            await server._load_blocklists(cached_only=True)
+        self.assertIsNone(server._transport)
+        await server.stop()
 
 
 class TestDOTProviders(unittest.TestCase):

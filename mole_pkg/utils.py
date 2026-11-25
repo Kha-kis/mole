@@ -6,6 +6,7 @@ import asyncio
 import configparser
 import json
 import logging
+import math
 import os
 import re
 import signal
@@ -59,6 +60,20 @@ class VPNState:
     client_ready: bool = False
     hook_ready: Optional[bool] = None
     last_error: str = ''
+    recovery_mode: str = 'legacy'
+    authorization_ready: Optional[bool] = None
+    gate_open: Optional[bool] = None
+    authorization_deadline: float = 0.0
+    gate_verification_deadline: float = 0.0
+    dns_ready: Optional[bool] = None
+    dns_deadline: float = 0.0
+    discovery_source: str = 'none'
+    cache_age_seconds: Optional[float] = None
+    cache_age_recorded_mono: float = 0.0
+    next_retry_deadline: float = 0.0
+    recovery_reason: str = 'none'
+    forwarding_required: bool = True
+    client_required: bool = True
 
 
 def read_wg_peer_key(config_path: str) -> str:
@@ -105,6 +120,14 @@ def write_runtime_readiness(directory: Path, state: VPNState) -> None:
         'client_ready': state.client_ready, 'hook_ready': state.hook_ready,
         'last_error': state.last_error,
     }
+    for name in ('recovery_mode', 'authorization_ready', 'gate_open', 'authorization_deadline',
+                 'gate_verification_deadline', 'dns_ready', 'dns_deadline', 'discovery_source',
+                 'next_retry_deadline', 'recovery_reason', 'forwarding_required', 'client_required'):
+        evidence[name] = getattr(state, name)
+    age = state.cache_age_seconds
+    if age is not None and state.cache_age_recorded_mono:
+        age += max(0, time.monotonic() - state.cache_age_recorded_mono)
+    evidence.update(cache_age_seconds=age, observed_mono=time.monotonic())
     for name, content in [('runtime_generation', str(state.generation)),
                           ('runtime_readiness.json', json.dumps(evidence))]:
         temporary = directory / (name + '.tmp')
@@ -115,6 +138,9 @@ def write_runtime_readiness(directory: Path, state: VPNState) -> None:
 def read_runtime_readiness(directory: Path) -> dict:
     blocked = dict(connected=False, tunnel_ready=False, forwarding_ready=False,
                    client_ready=False, hook_ready=None, last_error='no_current_evidence', generation=None, port=None)
+    blocked.update(authorization_ready=None, gate_open=None, dns_ready=None,
+                   discovery_source='none', cache_age_seconds=None, next_retry_in_seconds=None,
+                   recovery_reason='none', workload_ready=None)
     try:
         evidence = json.loads((directory / 'runtime_readiness.json').read_text())
         generation = int((directory / 'runtime_generation').read_text())
@@ -127,10 +153,40 @@ def read_runtime_readiness(directory: Path) -> dict:
         forwarding = (tunnel and evidence['forwarding_ready'] is True and
                       type(evidence['port']) is int and 1 <= evidence['port'] <= 65535 and
                       now < float(evidence['port_deadline']) <= now + 86400)
-        return dict(connected=tunnel, tunnel_ready=tunnel, forwarding_ready=forwarding,
+        result = dict(connected=tunnel, tunnel_ready=tunnel, forwarding_ready=forwarding,
                     client_ready=tunnel and evidence['client_ready'] is True,
                     hook_ready=evidence.get('hook_ready'), last_error=evidence.get('last_error', ''),
                     generation=generation, port=evidence['port'] if forwarding else None)
+        result.update({key: blocked[key] for key in ('authorization_ready', 'gate_open', 'dns_ready',
+                      'discovery_source', 'cache_age_seconds', 'next_retry_in_seconds',
+                      'recovery_reason', 'workload_ready')})
+        if evidence.get('recovery_mode', 'legacy') == 'validated':
+            def current_deadline(name, maximum):
+                value = evidence.get(name)
+                return type(value) in (int, float) and math.isfinite(value) and now < value <= now + maximum
+            auth = tunnel and evidence.get('authorization_ready') is True and current_deadline('authorization_deadline', 90)
+            gate = auth and evidence.get('gate_open') is True and current_deadline('gate_verification_deadline', 60)
+            dns = evidence.get('dns_ready')
+            dns = (dns is True and current_deadline('dns_deadline', 65)) if type(dns) is bool else None
+            result.update(authorization_ready=bool(auth), gate_open=bool(gate), dns_ready=dns,
+                          workload_ready=bool(tunnel and auth and gate and dns is True and
+                          (evidence.get('forwarding_required') is False or forwarding) and
+                          (evidence.get('client_required') is False or result['client_ready'])))
+            source = evidence.get('discovery_source')
+            result['discovery_source'] = source if source in ('live', 'cache', 'none') else 'none'
+            age, observed = evidence.get('cache_age_seconds'), evidence.get('observed_mono')
+            if (source == 'cache' and type(age) in (int, float) and math.isfinite(age) and age >= 0 and
+                    type(observed) in (int, float) and math.isfinite(observed) and 0 <= observed <= now):
+                result['cache_age_seconds'] = age + now - observed
+            retry = evidence.get('next_retry_deadline')
+            if type(retry) in (int, float) and math.isfinite(retry) and 0 < retry <= now + 86400:
+                result['next_retry_in_seconds'] = max(0, retry - now)
+            reasons = ('none', 'connecting', 'transient_discovery', 'no_eligible_candidates', 'pool_cooldown',
+                       'transport_failed', 'authorization_denied', 'authorization_unknown', 'enforcement_unavailable',
+                       'dns_failed', 'forwarding_failed', 'client_sync_failed', 'credentials_rejected', 'compatibility_rejected')
+            reason = evidence.get('recovery_reason')
+            result['recovery_reason'] = reason if reason in reasons else 'authorization_unknown'
+        return result
     except (OSError, ValueError, TypeError, KeyError, IndexError):
         return blocked
 

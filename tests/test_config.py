@@ -10,6 +10,41 @@ from pathlib import Path
 from mole_pkg.config import Config, load_config, validate_config
 
 
+class ValidatedRecoveryConfig(unittest.TestCase):
+    def config(self, **values):
+        config = Config('/nonexistent')
+        config._data.update(values)
+        return config
+
+    def test_legacy_default_needs_no_enforcement(self):
+        config = self.config()
+        self.assertEqual(config.proton_recovery_mode, 'legacy')
+        config.validate_proton_recovery()
+
+    def test_validated_requires_provider_pool_and_absolute_paths(self):
+        values = dict(PROTON_RECOVERY_MODE='validated', VPN_PROVIDER='proton',
+                      PROTON_FAILOVER_ENABLED='true', PROTON_FAILOVER_SERVERS='NL#1',
+                      PROTON_EXIT_VALIDATOR='/usr/bin/true',
+                      PROTON_VALIDATION_CGROUP_ROOT='/sys/fs/cgroup/mole-probes')
+        self.config(**values).validate_proton_recovery()
+        for key, invalid in [('VPN_PROVIDER', 'pia'), ('PROTON_FAILOVER_ENABLED', 'false'),
+                             ('PROTON_EXIT_VALIDATOR', 'relative'),
+                             ('PROTON_VALIDATION_CGROUP_ROOT', ''),
+                             ('PROTON_RECOVERY_MODE', 'automatic')]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.config(**dict(values, **{key: invalid})).validate_proton_recovery()
+
+    def test_cache_and_cycle_bounds_reject_invalid_instead_of_defaulting(self):
+        for key, prop, invalid in [
+            ('PROTON_DISCOVERY_MAX_AGE', 'proton_discovery_max_age', ['-1', '86401', 'nan', '1.5']),
+            ('PROTON_RECOVERY_CYCLE_TIMEOUT', 'proton_recovery_cycle_timeout', ['119', '601', 'inf'])]:
+            for value in invalid:
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    getattr(self.config(**{key: value}), prop)
+        self.assertEqual(self.config(PROTON_DISCOVERY_MAX_AGE='0').proton_discovery_max_age, 0)
+        self.assertEqual(self.config().proton_recovery_cycle_timeout, 300)
+
+
 class TestLoadConfig(unittest.TestCase):
     """Test load_config function"""
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Opt-in validated Proton recovery with all-physical approved discovery, scoped
+  offline fallback and durable credential-rejection barriers.
+- Namespace-only nftables quarantine with private probe cgroups and independent
+  expiring fence/grant predicates; deployment acceptance remains separate.
+- Additive authorization, gate, DNS, retry and workload readiness reporting.
+
+### Changed
+- Validated-mode DNS-only repair uses required cached filtering before binding
+  and does not restart the torrent client. Legacy remains the default.
+
 ## [0.6.0] - 2026-11-23
 
 ### Fixed
