@@ -34,13 +34,14 @@ class ValidationGate:
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,63}', netns):
             raise ValueError('invalid gate namespace')
         subnet = ipaddress.ip_network(management_subnet)
-        if subnet.version != 4 or subnet.prefixlen < 24:
-            raise ValueError('invalid management subnet')
+        if subnet.version != 4 or subnet.prefixlen != 32:
+            raise ValueError('management must identify the exact host IPv4 address')
         self.netns = netns
         self.management_subnet = str(subnet)
         self.lock = asyncio.Lock()
         self.attempt = None
         self.round = None
+        self.active_round = None
         self.deadline = 0
         self._known_rounds = []
 
@@ -58,8 +59,10 @@ class ValidationGate:
             if hook != 'forward':
                 direction = 'oifname' if hook == 'output' else 'iifname'
                 address = 'daddr' if hook == 'output' else 'saddr'
+                flow = 'reply' if hook == 'output' else 'original'
                 commands.append(prefix + f' {direction} "lo" accept')
-                commands.append(prefix + f' {direction} "veth-vpn" ip {address} {self.management_subnet} accept')
+                commands.append(prefix + f' {direction} "veth-vpn" ip {address} {self.management_subnet} '
+                                f'ct direction {flow} accept')
                 commands.append(prefix + ' jump outer_' + ('out' if hook == 'output' else 'in'))
                 commands.append(prefix + ' jump probes_' + ('out' if hook == 'output' else 'in'))
             commands.append(prefix + ' jump workload')
@@ -149,6 +152,7 @@ class ValidationGate:
             await self._command(script)
             await self._verify_base()
             self.attempt, self.round = attempt, None
+            self.active_round = None
             self._known_rounds = []
             if attempt is not None:
                 await self._command(self.peer_rules(attempt))
@@ -169,9 +173,11 @@ class ValidationGate:
             return round_
 
     @_bounded_gate
-    async def authorize(self, attempt, round_, evidence):
+    async def authorize(self, attempt, round_, evidence, current_check=None):
         async with self.lock:
             self._current(attempt)
+            if current_check is not None and current_check() is not True:
+                raise RuntimeError('candidate authorization invalidated')
             if (round_ is None or self.round != round_ or evidence.get('attempt') != attempt.to_dict() or
                     evidence.get('round_id') != round_.id or evidence.get('allowed') is not True or
                     min(evidence.get('authorization_deadline', 0), evidence.get('transport_deadline', 0)) <
@@ -185,6 +191,7 @@ class ValidationGate:
                 if len(sets) != 1 or not sets[0].get('elem'):
                     raise RuntimeError('validation permit not verified')
             self.deadline = round_.acknowledged_mono + 90
+            self.active_round = round_
             keep = set(self._names(round_)) | {'p_' + round_.id[:24]}
             obsolete = [entry['set']['name'] for entry in entries if 'set' in entry and
                         re.fullmatch(r'[fgp]_[0-9a-f]{24}', entry['set'].get('name', '')) and
@@ -240,15 +247,16 @@ class ValidationGate:
                                 f'flush chain {self.TABLE} probes_in\n')
             await self._verify_base()
             self.round = None
+            self.active_round = None
 
     @_bounded_gate
     async def verify_open(self, attempt):
         async with self.lock:
             self._current(attempt)
-            if not self.round or time.monotonic() >= self.deadline:
+            if not self.active_round or time.monotonic() >= self.deadline:
                 return False
             entries = await self._verify_base()
-            for name in self._names(self.round):
+            for name in self._names(self.active_round):
                 if not any(x.get('set', {}).get('name') == name and x['set'].get('elem') for x in entries):
                     return False
             return True

@@ -14,6 +14,7 @@ import re
 import secrets
 import stat
 import time
+from typing import Any, Dict, Optional
 
 
 NAME = re.compile(r'[A-Z]{2}(?:-[A-Z0-9]+)*#[0-9]+\Z', re.ASCII)
@@ -44,7 +45,7 @@ def _integer(value, minimum, maximum):
     return value
 
 
-def canonical_candidate(record):
+def canonical_candidate(record) -> Dict[str, Any]:
     """Validate a persisted or freshly normalized candidate without coercion."""
     if not isinstance(record, dict):
         raise ValueError('invalid candidate')
@@ -52,6 +53,8 @@ def canonical_candidate(record):
     if not isinstance(name, str) or len(name) > 64 or not NAME.fullmatch(name):
         raise ValueError('invalid candidate name')
     key = record.get('public_key')
+    if not isinstance(key, str):
+        raise ValueError('invalid candidate public key')
     try:
         decoded = base64.b64decode(key, validate=True)
         if len(decoded) != 32 or base64.b64encode(decoded).decode('ascii') != key:
@@ -62,7 +65,7 @@ def canonical_candidate(record):
     if not isinstance(country, str) or not re.fullmatch(r'[A-Z]{2}', country, re.ASCII):
         raise ValueError('invalid candidate country')
     load = record.get('load')
-    if type(load) not in (int, float) or not math.isfinite(load) or not 0 <= load <= 100:
+    if not isinstance(load, (int, float)) or isinstance(load, bool) or not math.isfinite(load) or not 0 <= load <= 100:
         raise ValueError('invalid candidate load')
     return dict(name=name, hostname=_hostname(record.get('hostname')),
                 entry_ip=public_ipv4(record.get('entry_ip')),
@@ -80,15 +83,28 @@ def normalize_candidates(logicals, approved_names, tier, require_p2p):
             any(not isinstance(item, dict) or not isinstance(item.get('Servers'), list)
                 for item in logicals)):
         raise ValueError('invalid global discovery catalogue')
+    required = {'Name', 'Status', 'Tier', 'Features', 'ExitCountry', 'Load', 'Servers'}
+    for logical in logicals:
+        if (not required <= logical.keys() or not isinstance(logical['Name'], str) or
+                not logical['Name'] or type(logical['Status']) is not int or logical['Status'] not in (0, 1) or
+                type(logical['Tier']) is not int or logical['Tier'] < 0 or
+                type(logical['Features']) is not int or logical['Features'] < 0):
+            raise ValueError('incomplete global logical record')
     if (not isinstance(approved_names, list) or not approved_names or
             len(approved_names) > 32 or len(set(approved_names)) != len(approved_names) or
             any(not isinstance(n, str) or len(n) > 64 or not NAME.fullmatch(n) for n in approved_names)):
         raise ValueError('invalid approved names')
     eligible, keys = [], {}
+    malformed_eligible = False
     for logical in logicals:
+        eligible_logical = (logical['Name'] in approved_names and logical['Status'] == 1 and
+                            logical['Tier'] <= tier and (not require_p2p or logical['Features'] & 4))
         for physical in logical['Servers']:
             if not isinstance(physical, dict):
                 raise ValueError('invalid global physical catalogue')
+            if type(physical.get('Status')) is not int or physical['Status'] not in (0, 1):
+                malformed_eligible = malformed_eligible or eligible_logical
+                continue
             try:
                 candidate = canonical_candidate(dict(
                     name=logical.get('Name'), hostname=physical.get('Domain') or logical.get('Domain'),
@@ -97,6 +113,7 @@ def normalize_candidates(logicals, approved_names, tier, require_p2p):
                     tier=logical.get('Tier'), features=logical.get('Features'),
                     load=logical.get('Load'), country=logical.get('ExitCountry')))
             except ValueError:
+                malformed_eligible = malformed_eligible or eligible_logical and physical['Status'] == 1
                 continue
             keys.setdefault(candidate['entry_ip'], set()).add(candidate['public_key'])
             if (logical.get('Status') != 1 or physical.get('Status') != 1 or
@@ -111,6 +128,8 @@ def normalize_candidates(logicals, approved_names, tier, require_p2p):
         if address not in seen and len(keys[address]) == 1:
             seen.add(address)
             result.append(candidate)
+    if not result and (malformed_eligible or eligible):
+        raise ValueError('malformed eligible catalogue is not an authoritative withdrawal')
     return result
 
 
@@ -129,7 +148,7 @@ def _timestamp(value, minimum=0):
     return value
 
 
-def _record(value):
+def _record(value) -> Dict[str, Any]:
     if not isinstance(value, dict) or type(value.get('schema')) is not int or value['schema'] != 1:
         raise ValueError('unknown discovery schema')
     if not isinstance(value.get('scope'), str) or not HEX.fullmatch(value['scope']):
@@ -176,7 +195,7 @@ class _PrivateRecord:
         finally:
             os.close(fd)
 
-    def _read(self):
+    def _read(self) -> Any:
         with self._directory() as directory:
             try:
                 fd = os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
@@ -231,7 +250,7 @@ class DiscoveryCache(_PrivateRecord):
     def publish(self, record):
         self._write(_record(record))
 
-    def load(self, scope, now_wall, now_mono, boot_id, max_age):
+    def load(self, scope, now_wall, now_mono, boot_id, max_age) -> Optional[Dict[str, Any]]:
         try:
             _integer(max_age, 0, 86400)
             if not max_age:

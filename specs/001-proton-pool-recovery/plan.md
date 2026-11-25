@@ -15,8 +15,9 @@ registration remains independently owned by the host.
 **Tech Stack:** Python 3.8+ standard library and existing Proton SDK; Linux
 WireGuard/iptables, plus nftables and cgroup v2 for the new validated mode.
 
-**Spec:** [spec.md](spec.md), owner approved 2026-11-24. This design awaits
-approval; no feature branch, executable edits, merge, release or deployment yet.
+**Spec:** [spec.md](spec.md), detailed design and isolated implementation approved
+2026-11-24. Source and synthetic acceptance are implemented on the feature branch;
+no merge, push, release or production deployment follows from that approval.
 
 ## Global Constraints
 
@@ -134,8 +135,11 @@ New `mole_pkg/validation.py` and `validation_worker.py`; gate operations live in
 The guard covers OUTPUT, tunnel INPUT and FORWARD before established/interface
 acceptance. CLOSED permits only probe-cgroup traffic to explicit public IPv4
 HTTPS destinations and identified replies. DNS/proxy/blocklist/torrent processes
-receive no exemption. Preserve local veth management; other veth egress is limited
-to selected WireGuard UDP endpoint/port/mark, not arbitrary packets to its IP.
+receive no exemption. Preserve only the exact host's management address and
+host-initiated connections (INPUT original direction, OUTPUT reply direction).
+Namespace-initiated host proxy/DNS connections remain blocked, including existing
+connections. Other veth egress is limited to the selected WireGuard UDP
+endpoint/port/mark, not arbitrary packets to its IP.
 IPv6 remains denied. No root/nobody/whole-service-cgroup exception is allowed.
 
 One orchestrator-owned mutation lock covers identity check, kernel transaction,
@@ -156,7 +160,11 @@ safety property. Each refresh requires a new round/fence and new bound proof;
 old proof cannot authorize a future fence.
 
 Only serialized orchestration switches the active round chain reference after
-checking connection identity. Mutations retain a five-second execution/cleanup
+checking connection identity and current provider authorization. Pending refresh
+rounds do not replace the active round used to report readiness. A changed pool,
+scope or durable rejection closes and drains the old permit before publication;
+every grant rechecks current eligibility under the mutation lock.
+Mutations retain a five-second execution/cleanup
 budget and post-ack verification, but the fence enforces expiry independently
 if a grant arrives late or the controller dies. Schedule new validation rounds
 every 30 seconds from their start, not 30 seconds after slow completion, so the

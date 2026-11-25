@@ -49,7 +49,7 @@ def execute(request):
                     classify_error(wrapper.last_failure)}
         result = {'authenticated': True}
     elif operation == 'load':
-        if not wrapper.load():
+        if not wrapper.load() or wrapper._session is None:
             return {'error': 'local_state'}
         result = {'uid': wrapper._session.dump().get('session_data', {}).get('UID')}
     else:

@@ -32,11 +32,13 @@ class NormalizeCandidates(unittest.TestCase):
         self.assertEqual(result[1]['port'], 51820)
 
     def test_filters_disabled_tier_p2p_and_unapproved(self):
-        for field, value in [('Status', 0), ('Tier', 3), ('Features', 0),
-                             ('Load', float('nan')), ('ExitCountry', 'nl')]:
+        for field, value in [('Status', 0), ('Tier', 3), ('Features', 0)]:
             item = logical()
             item[field] = value
             self.assertEqual(normalize_candidates([item], ['NL#1'], 2, True), [])
+        for field, value in [('Load', float('nan')), ('ExitCountry', 'nl')]:
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                normalize_candidates([dict(logical(), **{field: value})], ['NL#1'], 2, True)
         self.assertEqual(normalize_candidates([logical()], ['NL#2'], 2, True), [])
         self.assertEqual(normalize_candidates([logical()], ['NL#1'], 1, True), [])
         item = logical()
@@ -49,7 +51,8 @@ class NormalizeCandidates(unittest.TestCase):
                              ('Domain', 'https://user:pass@host'), ('Domain', 'bad host')]:
             item = logical()
             item['Servers'] = [dict(item['Servers'][0], **{field: value})]
-            self.assertEqual(normalize_candidates([item], ['NL#1'], 2, True), [])
+            with self.assertRaises(ValueError):
+                normalize_candidates([item], ['NL#1'], 2, True)
 
     def test_alias_dedup_and_conflicting_keys_remove_destination(self):
         alias = logical('NL#2')
@@ -60,7 +63,7 @@ class NormalizeCandidates(unittest.TestCase):
         self.assertEqual([s['entry_ip'] for s in result], ['1.1.1.1'])
 
     def test_malformed_catalogue_is_not_a_valid_withdrawal(self):
-        for data in ([], {}, [None], [dict(logical(), Servers='invalid')]):
+        for data in ([], {}, [None], [dict(logical(), Servers='invalid')], [{'Servers': []}]):
             with self.assertRaises(ValueError):
                 normalize_candidates(data, ['NL#1'], 2, True)
         self.assertEqual(normalize_candidates([logical('NL#2')], ['NL#1'], 2, True), [])

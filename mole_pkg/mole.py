@@ -15,13 +15,13 @@ import random
 import secrets
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, List
+from typing import Optional, List, cast
 
 from . import __version__
 from .config import Config
 from .constants import DEFAULT_CONFIG_FILE
 from .network import async_setup_namespace, async_disconnect_vpn, async_allow_vpn_server_ip, ValidationGate
-from .validation import Attempt, ExitValidator, configuration_digest
+from .validation import Attempt, ExitValidator, AuthorizationDenied, configuration_digest
 from .providers import PIAProvider, ProtonProvider
 from .services import QBittorrentClient
 from .utils import (
@@ -110,6 +110,10 @@ class Mole:
         self._validation_attempt = None
         self._validation_task = None
         self._validator = None
+        self._dns_repair_after = 0.0
+        self._dns_proc_identity: Optional[str] = None
+        self._candidate_deadline = 0.0
+        self._cycle_deadline = 0.0
 
         # Subprocess handles for services running in namespace
         self._dns_proc: Optional[subprocess.Popen] = None
@@ -140,23 +144,27 @@ class Mole:
             restart_trigger.unlink()
 
         self.config.validate_proton_recovery()
+        root, gate = None, None
         if self._validated_mode:
             from .validation import trusted_executable, validate_cgroup_root
             trusted_executable(self.config.get('PROTON_EXIT_VALIDATOR'))
             root = validate_cgroup_root(self.config.get('PROTON_VALIDATION_CGROUP_ROOT'))
-            subnet = str(ipaddress.ip_network(self.config.veth_vpn_ip + '/24', strict=False))
-            self._validation_gate = ValidationGate(self.config.netns, subnet)
-            self._validator = ExitValidator(self.config, self._validation_gate)
+            subnet = str(ipaddress.IPv4Address(self.config.veth_host_ip)) + '/32'
+            gate = ValidationGate(self.config.netns, subnet)
+            self._validation_gate = gate
+            self._validator = ExitValidator(self.config, gate)
             namespaces = await async_run_command(['ip', 'netns', 'list'], 5)
             if self.config.netns in [line.split()[0] for line in namespaces.stdout.splitlines() if line.split()]:
-                await self._validation_gate.check_support(root)
-                await self._validation_gate.quarantine(None)
+                await gate.check_support(root)
+                await gate.quarantine(None)
 
         # Setup network namespace
         await async_setup_namespace(self.config)
         if self._validated_mode:
-            await self._validation_gate.check_support(root)
-            await self._validation_gate.quarantine(None)
+            if gate is None or root is None:
+                raise RuntimeError('validated recovery was not prepared')
+            await gate.check_support(root)
+            await gate.quarantine(None)
 
         # Start DNS server in namespace if enabled (must start BEFORE VPN connects)
         if self.config.dot_enabled:
@@ -225,15 +233,42 @@ class Mole:
                 await async_disconnect_vpn(self.config)
                 raise RuntimeError('validation gate could not be closed') from None
         self.state.authorization_ready = self.state.gate_open = False
+        self._validation_attempt = None
+
+    async def _before_recovery_change(self, candidates, scope):
+        attempt = getattr(self, '_validation_attempt', None)
+        if attempt is None:
+            return
+        identity = ProtonProvider.candidate_identity(attempt.candidate)
+        eligible = any(ProtonProvider.candidate_identity(c) == identity for c in candidates)
+        if scope != getattr(self.provider, '_validated_scope', None) or not eligible:
+            # Drain the only refresh owner and close before publishing a new
+            # pool/rejection. Its in-flight grant cannot overtake invalidation.
+            await self._stop_validation()
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.tunnel_deadline = 0
+
+    async def _reconcile_current_permission(self):
+        attempt = getattr(self, '_validation_attempt', None)
+        if attempt is not None and not cast(ProtonProvider, self.provider).authorization_current(attempt.candidate):
+            await self._stop_validation()
+            self.state.connected = self.state.tunnel_ready = False
+            self.state.tunnel_deadline = 0
 
     async def _begin_validated_attempt(self):
         await self._stop_validation()
+        gate, validator = self._validation_gate, self._validator
+        if gate is None or validator is None:
+            raise RuntimeError('validated recovery was not prepared')
+        server = cast(ProtonProvider, self.provider)._selected_server
+        if server is None:
+            raise RuntimeError('validated candidate unavailable')
         deadline = time.monotonic() + 20
-        revision = await self._validator.describe(self._validation_config_digest(), deadline)
+        revision = await validator.describe(self._validation_config_digest(), deadline)
         attempt = Attempt(_process_identity(os.getpid()), self.state.generation,
-                          secrets.token_hex(32), self.provider._selected_server,
-                          revision, getattr(self, '_candidate_deadline', time.monotonic() + 90))
-        await self._validation_gate.quarantine(attempt)
+                          secrets.token_hex(32), server,
+                          revision, getattr(self, '_candidate_deadline', 0) or time.monotonic() + 90)
+        await gate.quarantine(attempt)
         self._validation_attempt = attempt
 
     async def _validated_transport_evidence(self, attempt):
@@ -258,26 +293,30 @@ class Mole:
 
     async def _validate_current_attempt(self):
         attempt = self._validation_attempt
+        gate, validator = self._validation_gate, self._validator
+        provider = cast(ProtonProvider, self.provider)
         deadline = time.monotonic() + 20
         try:
-            if (attempt is None or attempt.generation != self.state.generation or
-                    attempt.process_identity != _process_identity(os.getpid())):
+            if (gate is None or validator is None or attempt is None or attempt.generation != self.state.generation or
+                    attempt.process_identity != _process_identity(os.getpid()) or
+                    not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('stale validation identity')
-            revision = await self._validator.describe(self._validation_config_digest(), deadline)
+            revision = await validator.describe(self._validation_config_digest(), deadline)
             if revision != attempt.policy_revision:
                 raise RuntimeError('authorization policy changed')
-            round_ = await self._validation_gate.prepare_round(attempt)
-            evidence = await self._validator.validate(attempt, round_, self._validated_transport_evidence, deadline)
+            round_ = await gate.prepare_round(attempt)
+            evidence = await validator.validate(attempt, round_, self._validated_transport_evidence, deadline)
             if (attempt != self._validation_attempt or attempt.generation != self.state.generation or
-                    self.shutdown_event.is_set()):
+                    self.shutdown_event.is_set() or not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('late validation result')
-            await self._validation_gate.authorize(attempt, round_, evidence)
-            if not await self._validation_gate.verify_open(attempt):
+            await gate.authorize(attempt, round_, evidence,
+                current_check=lambda: provider.authorization_current(attempt.candidate))
+            if not await gate.verify_open(attempt):
                 raise RuntimeError('permission readback failed')
             self.state.authorization_ready = self.state.gate_open = True
             self.state.recovery_mode = 'validated'
-            self.state.authorization_deadline = self._validation_gate.deadline
-            self.state.gate_verification_deadline = min(self._validation_gate.deadline, time.monotonic() + 60)
+            self.state.authorization_deadline = gate.deadline
+            self.state.gate_verification_deadline = min(gate.deadline, time.monotonic() + 60)
             self.state.connected = self.state.tunnel_ready = True
             self.state.tunnel_deadline = evidence['transport_deadline']
             self.state.recovery_reason = 'none'
@@ -286,11 +325,12 @@ class Mole:
         except (Exception, asyncio.CancelledError) as error:
             self.state.authorization_ready = self.state.gate_open = False
             self.state.authorization_deadline = 0
-            self.state.recovery_reason = 'authorization_unknown'
+            self.state.recovery_reason = ('authorization_denied' if isinstance(error, AuthorizationDenied)
+                                          else 'authorization_unknown')
             self.state.last_error = 'validation_failed'
-            if attempt is not None:
+            if attempt is not None and gate is not None:
                 try:
-                    await self._validation_gate.revoke(attempt)
+                    await gate.revoke(attempt)
                 except Exception:
                     await async_disconnect_vpn(self.config)
                     self.state.recovery_reason = 'enforcement_unavailable'
@@ -346,21 +386,21 @@ class Mole:
 
         async def repair():
             proc = getattr(self, '_dns_proc', None)
-            if proc is not None and proc.poll() is None:
-                os.killpg(proc.pid, signal.SIGTERM)
+            if proc is not None:
+                self._signal_dns_group(proc, signal.SIGTERM)
                 until = time.monotonic() + 2
                 while proc.poll() is None and time.monotonic() < until:
                     await asyncio.sleep(.05)
                 # Kill descendants even if the main process exited gracefully.
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self._signal_dns_group(proc, signal.SIGKILL)
                 while proc.poll() is None:
                     await asyncio.sleep(.05)
             self._start_dns_server(repair_cached=True)
+            proc = self._dns_proc
+            if proc is None:
+                return False
             while not self.shutdown_event.is_set():
-                if self._dns_proc.poll() is not None:
+                if proc.poll() is not None:
                     return False
                 if await self._probe_dns():
                     return True
@@ -368,19 +408,32 @@ class Mole:
             return False
         try:
             return await asyncio.wait_for(repair(), 9)
-        except (OSError, asyncio.TimeoutError, asyncio.CancelledError) as error:
+        except (OSError, RuntimeError, asyncio.TimeoutError, asyncio.CancelledError) as error:
             proc = getattr(self, '_dns_proc', None)
             if proc is not None:
-                try:
-                    os.killpg(proc.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
+                self._signal_dns_group(proc, signal.SIGKILL)
                 until = time.monotonic() + 1
                 while proc.poll() is None and time.monotonic() < until:
                     await asyncio.sleep(.02)
             if isinstance(error, asyncio.CancelledError):
                 raise
             return False
+
+    def _signal_dns_group(self, proc, sig):
+        identity = getattr(self, '_dns_proc_identity', None)
+        if identity is None:
+            raise RuntimeError('DNS process group ownership is unknown')
+        try:
+            current = _process_identity(proc.pid)
+        except FileNotFoundError:
+            pass  # The owned group's descendants can outlive its leader.
+        else:
+            if current != identity:
+                raise RuntimeError('DNS process group leader identity changed')
+        try:
+            os.killpg(proc.pid, sig)
+        except ProcessLookupError:
+            pass
 
     async def _check_dns_health(self):
         if (not getattr(self.state, 'authorization_ready', False) or
@@ -445,6 +498,7 @@ class Mole:
             env=self._get_subprocess_env(),
             start_new_session=True,
         )
+        self._dns_proc_identity = _process_identity(self._dns_proc.pid)
         log.info(f"DNS server started (PID: {self._dns_proc.pid})")
 
     def _start_api_server(self):
@@ -530,20 +584,24 @@ class Mole:
         if proc is None:
             return
 
+        if name == 'DNS':
+            self._signal_dns_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            self._signal_dns_group(proc, signal.SIGKILL)
+            proc.wait(timeout=1)
+            return
+
         if proc.poll() is None:  # Still running
             log.info(f"Stopping {name} server (PID: {proc.pid})...")
-            if name == 'DNS':
-                os.killpg(proc.pid, signal.SIGTERM)
-            else:
-                proc.terminate()
+            proc.terminate()
             try:
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 log.warning(f"{name} server did not stop gracefully, killing...")
-                if name == 'DNS':
-                    os.killpg(proc.pid, signal.SIGKILL)
-                else:
-                    proc.kill()
+                proc.kill()
                 proc.wait(timeout=1)
             log.info(f"{name} server stopped")
 
@@ -625,13 +683,15 @@ class Mole:
         self._recovery_not_before = time.monotonic() + delay
         self._recovery_exhaustions = count + 1
         if self._validated_mode:
-            policy = self.provider._policy()
+            policy = cast(ProtonProvider, self.provider)._policy()
             earliest = policy.next_eligible_at(policy._resolved, time.monotonic())
             if earliest is not None and earliest > time.monotonic():
                 self._recovery_not_before = max(self._recovery_not_before, earliest)
-                self.state.recovery_reason = 'pool_cooldown'
+                scheduling_reason = 'pool_cooldown'
             else:
-                self.state.recovery_reason = 'no_eligible_candidates'
+                scheduling_reason = 'no_eligible_candidates'
+            if self.state.recovery_reason in ('none', 'connecting', 'pool_cooldown', 'no_eligible_candidates'):
+                self.state.recovery_reason = scheduling_reason
 
     def _mapping_result(self, success: bool) -> bool:
         if success:
@@ -684,7 +744,7 @@ class Mole:
         installed = getattr(self, '_installed_server', None) or (self.provider._selected_server if proton else None)
         previous = dict(installed) if proton and installed and self.state.tunnel_ready else None
         attempted = set()
-        cycle_deadline = getattr(self, '_cycle_deadline', time.monotonic() + 300)
+        cycle_deadline = getattr(self, '_cycle_deadline', 0) or time.monotonic() + 300
         if reason == 'mapping' and not self._validated_mode:
             if getattr(self, '_mapping_recovered', False):
                 return self.state.connected
@@ -731,7 +791,13 @@ class Mole:
                 break
 
         # Keep a verified private tunnel even when every mapping option failed.
-        if self.state.tunnel_ready:
+        still_verified = self.state.tunnel_ready
+        if self._validated_mode:
+            attempt, gate = getattr(self, '_validation_attempt', None), self._validation_gate
+            still_verified = bool(still_verified and attempt is not None and gate is not None and
+                cast(ProtonProvider, self.provider).authorization_current(attempt.candidate) and
+                await gate.verify_open(attempt))
+        if still_verified:
             self._defer_recovery()
             return True
         # One restoration is allowed only to a previously verified eligible
@@ -770,11 +836,17 @@ class Mole:
             # Step 1: Authenticate
             if self._validated_mode:
                 self._cycle_deadline = time.monotonic() + self.config.proton_recovery_cycle_timeout
-            prepare = self.provider.prepare_recovery if self._validated_mode else self.provider.authenticate
+                cast(ProtonProvider, self.provider).before_recovery_change = self._before_recovery_change
+            prepare = cast(ProtonProvider, self.provider).prepare_recovery if self._validated_mode else self.provider.authenticate
             if not await prepare():
+                if self._validated_mode:
+                    await self._reconcile_current_permission()
                 self.state.last_error = 'authentication_failed'
                 self._defer_recovery()
                 return False
+
+            if self._validated_mode:
+                await self._reconcile_current_permission()
 
             if not await self._recover_candidates(reason):
                 return False
@@ -830,6 +902,7 @@ class Mole:
         self.state.connected = self.state.tunnel_ready = self.state.forwarding_ready = self.state.client_ready = False
         self.state.tunnel_deadline = self.state.port_deadline = 0
         self.state.last_error = 'connecting'
+        self.state.recovery_reason = 'connecting'
         self._publish_readiness()
         if self._validated_mode:
             await self._begin_validated_attempt()
@@ -865,11 +938,13 @@ class Mole:
             result = await async_run_in_netns(["wg-quick", "up", self.config.wg_conf], netns, timeout=30)
         except (asyncio.TimeoutError, OSError, RuntimeError):
             self.state.last_error = 'wireguard_setup_failed'
+            self.state.recovery_reason = 'transport_failed'
             self._publish_readiness()
             log.error('VPN setup command failed')
             return False
         if result.returncode != 0:
             self.state.last_error = 'wireguard_setup_failed'
+            self.state.recovery_reason = 'transport_failed'
             self._publish_readiness()
             log.error("Failed to bring up WireGuard")
             return False
@@ -878,7 +953,8 @@ class Mole:
         self._installed_generation = self.state.generation
 
         if self._validated_mode:
-            if peer_key != self._validation_attempt.candidate['public_key']:
+            attempt = self._validation_attempt
+            if attempt is None or peer_key != attempt.candidate['public_key']:
                 raise RuntimeError('generated peer differs from validated candidate')
             ready = await self._validate_current_attempt()
             if ready:
@@ -1174,9 +1250,12 @@ class Mole:
     async def _check_health(self) -> bool:
         if self._validated_mode:
             attempt = self._validation_attempt
-            current = (attempt is not None and attempt.generation == self.state.generation and
-                       await self._validation_gate.verify_open(attempt))
+            gate = self._validation_gate
+            current = (attempt is not None and gate is not None and attempt.generation == self.state.generation and
+                       await gate.verify_open(attempt))
             self.state.gate_open = self.state.authorization_ready = bool(current)
+            if current:
+                self._supervise_torrent()
             self._publish_readiness()
             return bool(current)
         """Check VPN connection health"""
@@ -1197,15 +1276,7 @@ class Mole:
                 return False
             self._publish_readiness()
 
-            # Client work never owns the tunnel monitoring loop.
-            if self.torrent:
-                if not self.state.client_ready:
-                    self._start_torrent_sync()
-                task = getattr(self, '_listener_task', None)
-                if self.state.port and (task is None or task.done()):
-                    task = asyncio.create_task(self._check_torrent_listener())
-                    self._listener_task = task
-                    task.add_done_callback(self._listener_finished)
+            self._supervise_torrent()
 
             return True
 
@@ -1215,6 +1286,17 @@ class Mole:
             self._publish_readiness()
             log.error("VPN health check failed")
             return False
+
+    def _supervise_torrent(self):
+        # Client work never owns or restarts the tunnel monitoring loop.
+        if self.torrent:
+            if not self.state.client_ready:
+                self._start_torrent_sync()
+            task = getattr(self, '_listener_task', None)
+            if self.state.port and (task is None or task.done()):
+                task = asyncio.create_task(self._check_torrent_listener())
+                self._listener_task = task
+                task.add_done_callback(self._listener_finished)
 
     async def _check_torrent_listener(self):
         """Check if torrent client listener is bound; fix via port toggle if not."""

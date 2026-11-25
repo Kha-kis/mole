@@ -52,8 +52,9 @@ def resolve():
 
 
 class BoundHTTPS(http.client.HTTPSConnection):
-    def __init__(self, target, timeout):
-        super().__init__(target['host'], port=443, timeout=timeout, context=ssl.create_default_context())
+    def __init__(self, target, timeout, *, context=None):
+        self.tls_context = context if context is not None else ssl.create_default_context()
+        super().__init__(target['host'], port=443, timeout=timeout, context=self.tls_context)
         self.address = target['ip']
 
     def connect(self):
@@ -62,7 +63,7 @@ class BoundHTTPS(http.client.HTTPSConnection):
             raw.settimeout(self.timeout)
             raw.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b'mole\0')
             raw.connect((self.address, 443))
-            self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+            self.sock = self.tls_context.wrap_socket(raw, server_hostname=self.host)
         except BaseException:
             raw.close()
             raise

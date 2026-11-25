@@ -179,6 +179,42 @@ class OfflinePreparation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([c.args[0] for c in provider._run_sdk_job.call_args_list].count('refresh'), 1)
         self.assertNotIn('authenticate', [c.args[0] for c in provider._run_sdk_job.call_args_list])
 
+    async def test_malformed_global_catalogue_preserves_cache_and_blocks_reuse(self):
+        provider = self.provider()
+        self.assertTrue(await provider.prepare_recovery())
+        path = self.path / 'proton_discovery.json'
+        original = path.read_bytes()
+        provider.logical = None
+        provider = self.provider()
+        job = provider._run_sdk_job.side_effect
+        async def malformed(operation, endpoint='', method='GET', data=None):
+            if endpoint == '/vpn/logicals':
+                return dict(Code=1000, LogicalServers=[{'Servers': []}])
+            return await job(operation, endpoint, method, data)
+        provider._run_sdk_job.side_effect = malformed
+        self.assertFalse(await provider.prepare_recovery())
+        self.assertEqual(path.read_bytes(), original)
+        self.assertFalse(await self.provider('transient').prepare_recovery())
+
+    async def test_callback_closes_old_eligibility_before_withdrawal_is_persisted(self):
+        provider = self.provider()
+        self.assertTrue(await provider.prepare_recovery())
+        old = list(provider._validated_candidates)
+        path = self.path / 'proton_discovery.json'
+        before = path.read_bytes()
+        calls = []
+        async def close_first(candidates, scope):
+            if not candidates:
+                self.assertEqual(path.read_bytes(), before)
+                self.assertEqual(provider._validated_candidates, old)
+                calls.append('closed_before_publish')
+        provider.before_recovery_change = close_first
+        self.logical['Status'] = 0
+        self.assertTrue(await provider.prepare_recovery())
+        self.assertEqual(calls, ['closed_before_publish'])
+        self.assertFalse(provider.authorization_current(old[0]))
+        self.assertEqual(json.loads(path.read_text())['candidates'], [])
+
 
 class ProtonWorkers(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -198,6 +234,13 @@ class ProtonWorkers(unittest.IsolatedAsyncioTestCase):
 
     def require_interface(self):
         self.assertTrue(callable(getattr(self.provider, '_run_sdk_job', None)))
+
+    async def test_local_load_timeout_is_not_a_network_transient(self):
+        from unittest.mock import AsyncMock
+        with patch.object(proton, 'async_run_command', new=AsyncMock(side_effect=asyncio.TimeoutError)):
+            with self.assertRaises(proton.SDKFailure) as caught:
+                await self.provider._run_sdk_job('load')
+        self.assertEqual(caught.exception.kind, 'local_state')
 
     async def wait_marker(self):
         for _ in range(200):

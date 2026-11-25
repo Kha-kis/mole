@@ -281,3 +281,12 @@ class ReviewedCompatibility(unittest.TestCase):
                 'assert get_vpn_provider(Config("/nonexistent"), VPNState()).name == "PIA"')
         result = subprocess.run([sys.executable, '-c', code], capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_both_entrypoints_reject_observer_fixture_flags_before_runtime(self):
+        root = Path(__file__).resolve().parents[1]
+        for entry in ([sys.executable, str(root / 'mole')], [sys.executable, '-m', 'mole_pkg']):
+            with self.subTest(entry=entry):
+                result = subprocess.run(entry + ['run', '--validation-test-ca', '/nonexistent'],
+                                        cwd=root, capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn('unrecognized arguments', result.stderr)

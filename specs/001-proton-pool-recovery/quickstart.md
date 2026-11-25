@@ -1,7 +1,8 @@
 # Validation And Rollout Guide
 
-This is an execution guide for the future implementation, not evidence that the
-feature exists or passed. Never run packet tests in the production namespace.
+This guide covers the implemented, unreleased feature. Passing source or
+synthetic tests is not provider/deployment acceptance. Never run packet tests
+in the production namespace.
 
 ## Prepare
 
@@ -38,7 +39,7 @@ sudo env PYTHONDONTWRITEBYTECODE=1 TMPDIR="$QA_RUN/tmp" \
   --run-dir "$QA_RUN" --synthetic-only
 ```
 
-The future runner must reject an absent lifecycle receipt and reserved live
+The runner rejects an absent lifecycle receipt and never uses reserved live
 namespace/interface names. Before creating interfaces or any networks, compare
 all host/VPN routes and Docker subnets for overlap. Use unique task-owned names
 and isolated documentation-address fixtures; no household address space, Docker
@@ -63,7 +64,13 @@ packets and expected positive controls, not a blank capture alone. Check the
 existing iptables and wg-quick table interaction as well as the new guard.
 
 Each runner exit cleans up only its owned namespaces, cgroups/interfaces and
-table. Retain compact captures/reports privately; no global prune or snapshots.
+table. A private per-invocation resource receipt supports interrupted-run review.
+`--quick` is explicitly partial and cannot qualify full expiry acceptance. The
+full run also exercises the real observer with local TLS: valid SNI, bad trust/
+hostname, redirects, conflicting replies, body limit and cancellation after
+cgroup admission. Test injection exists only through Python construction;
+production entrypoints reject fixture flags. Retain evidence privately; no global
+prune or snapshots.
 
 ## Private Candidate Qualification
 

@@ -1,10 +1,11 @@
 # Feature Specification: Validated Proton Pool Recovery
 
-**Feature Branch**: not created; documentation-only specification on existing checkout
+**Feature Branch**: `feat/validated-proton-recovery`
 
 **Created**: 2026-11-24
 
-**Status**: Owner approved 2026-11-24; detailed design/implementation approval pending
+**Status**: Detailed design and isolated implementation approved 2026-11-24;
+implemented and tested in isolation. Merge, release and production rollout remain separate.
 
 **Input**: Improve Mole's endpoint discovery, approved fallback pool, bounded
 recovery and truthful health reporting; use Spec Kit. Retain the existing VPN

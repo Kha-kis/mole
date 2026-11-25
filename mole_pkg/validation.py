@@ -13,8 +13,13 @@ import sys
 import time
 from dataclasses import dataclass
 from types import MappingProxyType
+from typing import Any, Mapping
 
 from .discovery import HEX, canonical_candidate, public_ipv4
+
+
+class AuthorizationDenied(ValueError):
+    """A well-formed, identity-bound explicit policy denial."""
 
 
 def configuration_digest(config):
@@ -32,6 +37,7 @@ def trusted_executable(path):
         info = component.lstat()
         if info.st_uid != 0 or info.st_mode & 0o022 or stat.S_ISLNK(info.st_mode):
             raise ValueError('validator path is not trusted')
+    info = value.lstat()
     if not stat.S_ISREG(info.st_mode) or not info.st_mode & 0o111:
         raise ValueError('validator is not executable')
     return str(value)
@@ -82,6 +88,8 @@ async def owned_child(command):
 
 
 async def _json_line(process):
+    if process.stdout is None:
+        raise ValueError('helper output pipe unavailable')
     line = await process.stdout.readline()
     if not line or len(line) > 65536:
         raise ValueError('invalid helper reply')
@@ -98,6 +106,8 @@ async def bounded_json_command(command, request, timeout):
 
     async def execute():
         async with owned_child(command) as process:
+            if process.stdin is None or process.stdout is None:
+                raise RuntimeError('helper pipes unavailable')
             process.stdin.write(encoded)
             await process.stdin.drain()
             process.stdin.close()
@@ -116,8 +126,11 @@ async def bounded_json_command(command, request, timeout):
 
 class ExitValidator:
     """Only the observer's cgroup receives temporary namespace connectivity."""
-    def __init__(self, config, gate):
+    def __init__(self, config, gate, *, _observer_command=None, _resolve_targets=None):
         self.config, self.gate = config, gate
+        # Constructor-only test seams; no config, environment or CLI can set them.
+        self._observer_command = _observer_command
+        self._resolve_targets = _resolve_targets
 
     async def describe(self, config_digest, deadline):
         executable = trusted_executable(self.config.get('PROTON_EXIT_VALIDATOR', ''))
@@ -135,15 +148,19 @@ class ExitValidator:
         return group
 
     async def observe(self, attempt, round_, deadline):
-        targets_reply = await bounded_json_command(
-            [sys.executable, '-m', 'mole_pkg.validation_worker', 'resolve'], {},
-            min(3, deadline - time.monotonic()))
+        if self._resolve_targets is None:
+            targets_reply = await bounded_json_command(
+                [sys.executable, '-m', 'mole_pkg.validation_worker', 'resolve'], {},
+                min(3, deadline - time.monotonic()))
+            targets = targets_reply.get('targets')
+        else:
+            targets = await self._resolve_targets(deadline)
         from .validation_worker import validate_targets
-        targets = validate_targets(targets_reply.get('targets'))
+        targets = validate_targets(targets)
         group = self._create_cgroup(attempt, round_)
         try:
-            async with owned_child(['ip', 'netns', 'exec', self.config.netns, sys.executable,
-                                    '-m', 'mole_pkg.validation_worker']) as process:
+            command = self._observer_command or [sys.executable, '-m', 'mole_pkg.validation_worker']
+            async with owned_child(['ip', 'netns', 'exec', self.config.netns] + list(command)) as process:
                 ready = await asyncio.wait_for(_json_line(process), 2)
                 if ready != {'ready': True, 'pid': process.pid}:
                     raise RuntimeError('observer barrier failed')
@@ -153,6 +170,8 @@ class ExitValidator:
                     raise RuntimeError('observer cgroup membership failed')
                 await self.gate.prepare_probe(attempt, round_, group, targets)
                 request = dict(targets=targets, nonce=attempt.nonce, round_id=round_.id)
+                if process.stdin is None:
+                    raise RuntimeError('observer input pipe unavailable')
                 process.stdin.write(json.dumps(request).encode() + b'\n')
                 await process.stdin.drain()
                 process.stdin.close()
@@ -180,7 +199,7 @@ class ExitValidator:
         return await asyncio.wait_for(execute(), deadline - time.monotonic())
 
 
-def _finite(value, minimum=0):
+def _finite(value: Any, minimum=0) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
         raise ValueError('invalid evidence time')
     return value
@@ -191,7 +210,7 @@ class Attempt:
     process_identity: str
     generation: int
     nonce: str
-    candidate: dict
+    candidate: Mapping[str, Any]
     policy_revision: str
     deadline: float
 
@@ -204,7 +223,9 @@ class Attempt:
                 not isinstance(self.policy_revision, str) or not HEX.fullmatch(self.policy_revision)):
             raise ValueError('invalid attempt identity')
         _finite(self.deadline)
-        object.__setattr__(self, 'candidate', MappingProxyType(canonical_candidate(self.candidate)))
+        if not isinstance(self.candidate, Mapping):
+            raise ValueError('invalid candidate mapping')
+        object.__setattr__(self, 'candidate', MappingProxyType(canonical_candidate(dict(self.candidate))))
 
     def to_dict(self):
         return dict(process_identity=self.process_identity, generation=self.generation,
@@ -252,7 +273,11 @@ def parse_evidence(data, round_, exit_ip, *, now_wall, now_mono, transport_deadl
     if data['allowed'] != (data['reason'] == 'authorized'):
         raise ValueError('inconsistent authorization')
     deadline = now_mono + expires - now_wall
-    if (not data['allowed'] or min(deadline, _finite(transport_deadline)) <
+    if not data['allowed']:
+        if data['reason'] == 'denied':
+            raise AuthorizationDenied('exit policy denied')
+        raise ValueError('authorization unavailable')
+    if (min(deadline, _finite(transport_deadline)) <
             round_.acknowledged_mono + round_.fence_max_ttl):
         raise ValueError('proof does not cover fence')
     return dict(data, authorization_deadline=deadline, transport_deadline=transport_deadline)

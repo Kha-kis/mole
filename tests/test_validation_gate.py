@@ -11,7 +11,7 @@ from test_validation import attempt
 
 class ValidationGateTests(unittest.IsolatedAsyncioTestCase):
     def gate(self):
-        return ValidationGate('qa-fixture', '10.200.200.0/24')
+        return ValidationGate('qa-fixture', '10.200.200.1/32')
 
     async def test_closed_rules_cover_all_hooks_before_established_and_no_uid_bypass(self):
         gate = self.gate()
@@ -47,6 +47,20 @@ class ValidationGateTests(unittest.IsolatedAsyncioTestCase):
         gate = self.gate()
         with self.assertRaises(RuntimeError):
             await gate.authorize(attempt(), None, {})
+
+    async def test_pending_round_does_not_hide_the_previous_current_permission(self):
+        gate = self.gate()
+        value = attempt()
+        active = ValidationRound('c' * 64, value, time.monotonic(), 90)
+        gate.attempt, gate.round, gate.active_round = value, active, active
+        gate.deadline = time.monotonic() + 80
+        entries = [{'set': dict(name=name, elem=[0])} for name in gate._names(active)]
+        gate._table = AsyncMock(return_value=entries)
+        gate._verify_base = AsyncMock(return_value=entries)
+        gate._command = AsyncMock()
+        pending = await gate.prepare_round(value)
+        self.assertNotEqual(pending.id, active.id)
+        self.assertTrue(await gate.verify_open(value))
 
     async def test_replacement_waits_for_cancelled_mutation_cleanup(self):
         gate = self.gate()

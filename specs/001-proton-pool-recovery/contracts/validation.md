@@ -75,6 +75,9 @@ must apply before any peer replacement, including startup with an old namespace.
 Cover OUTPUT, tunnel INPUT and FORWARD; preserve only explicit management,
 WireGuard outer transport, probe traffic and their strictly identified responses.
 IPv6 remains denied with checked rules. No global flush or unrelated table edit.
+Management is limited to the exact host address and host-initiated connections:
+INPUT original direction and OUTPUT reply direction. Neither new nor established
+namespace-initiated connections to a host proxy or DNS service are exempt.
 
 OPEN requires two independent kernel predicates, the validation round's deadline
 fence AND its grant. prepare_probe creates the 90-second fence, receives commit
@@ -86,7 +89,10 @@ its controller dies. A state file cannot open traffic.
 
 Each refresh uses a new ValidationRound ID, fence and fresh bound proof; old
 proof cannot authorize a new fence. Every grant/active-reference update checks
-installed peer, process, generation and policy. A new candidate closes immediately.
+installed peer, process, generation, policy and current provider authorization.
+Pending refresh rounds leave readiness tied to the still-valid active round.
+Changed eligibility or durable rejection closes and drains existing permission
+before publishing the change. A new candidate closes immediately.
 
 Serialize all gate mutations and peer replacement under one owner/lock, including
 the asynchronous kernel commit. Cancel/drain old commands before replacement.
