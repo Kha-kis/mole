@@ -91,6 +91,25 @@ class ValidatedLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, ['fence', 'revoke'])
         self.mole._restart_torrent_service.assert_not_awaited()
 
+    async def test_validation_failure_logs_stage_without_exception_content(self):
+        self.mole._validator.validate.side_effect = RuntimeError('secret-account-token')
+        with patch('mole_pkg.mole.log.warning') as warning:
+            self.assertFalse(await self.mole._validate_current_attempt())
+        text = ' '.join(str(call) for call in warning.call_args_list)
+        self.assertIn('validation', text)
+        self.assertNotIn('secret-account-token', text)
+        self.assertEqual(self.calls, ['fence', 'revoke'])
+        self.assertEqual(self.mole.state.last_error, 'validation_failed')
+
+    async def test_enforcement_failure_reports_failed_step_and_still_revokes(self):
+        self.gate.authorize.side_effect = RuntimeError('secret-gate-detail')
+        with patch('mole_pkg.mole.log.warning') as warning:
+            self.assertFalse(await self.mole._validate_current_attempt())
+        text = ' '.join(str(call) for call in warning.call_args_list)
+        self.assertIn('grant', text)
+        self.assertNotIn('secret-gate-detail', text)
+        self.assertIn('revoke', self.calls)
+
     async def test_dns_failure_is_repaired_locally_without_rotating_peer(self):
         self.mole.state.authorization_ready = self.mole.state.gate_open = True
         self.mole.state.authorization_deadline = time.monotonic() + 90

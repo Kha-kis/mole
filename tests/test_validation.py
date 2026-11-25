@@ -104,6 +104,114 @@ class RestrictedObservation(unittest.TestCase):
 
 
 class OwnedValidatorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_stage_context_preserves_denial_and_cancellation(self):
+        import asyncio
+        from mole_pkg.validation import AuthorizationDenied, validation_stage
+        for error in (AuthorizationDenied('denied'), asyncio.CancelledError()):
+            with self.subTest(kind=type(error)), self.assertRaises(type(error)) as caught:
+                with validation_stage('evidence'):
+                    raise error
+            self.assertIs(caught.exception, error)
+
+    async def test_stage_codes_cannot_include_external_error_text(self):
+        from mole_pkg.validation import ValidationStageError, validation_stage
+        self.assertEqual(ValidationStageError('secret-dynamic-stage').stage, 'validation')
+        with self.assertRaises(ValidationStageError) as caught:
+            with validation_stage('validation'):
+                with validation_stage('transport'):
+                    raise RuntimeError('secret-provider-response')
+        self.assertEqual(caught.exception.stage, 'transport')
+        self.assertNotIn('secret-provider-response', str(caught.exception))
+
+    async def test_authorizer_and_evidence_failures_have_distinct_stages(self):
+        from unittest.mock import AsyncMock, Mock, patch
+        from mole_pkg.config import Config
+        from mole_pkg.validation import ExitValidator
+        validator = ExitValidator(Config('/nonexistent'), Mock())
+        validator.observe = AsyncMock(return_value='1.1.1.1')
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        for response, expected in ((RuntimeError('secret-helper-detail'), 'authorizer'), ({}, 'evidence')):
+            with self.subTest(stage=expected):
+                helper = AsyncMock(side_effect=response) if isinstance(response, Exception) else AsyncMock(return_value=response)
+                with patch('mole_pkg.validation.trusted_executable', return_value='/usr/bin/true'), \
+                        patch('mole_pkg.validation.bounded_json_command', new=helper), \
+                        self.assertRaises(RuntimeError) as caught:
+                    await validator.validate(value, round_, AsyncMock(return_value=time.monotonic()+120), time.monotonic()+2)
+                self.assertEqual(caught.exception.stage, expected)
+                self.assertNotIn('secret-helper-detail', str(caught.exception))
+
+    async def test_total_deadline_retains_the_last_validation_stage(self):
+        import asyncio
+        from unittest.mock import AsyncMock, Mock
+        from mole_pkg.validation import ExitValidator
+        validator = ExitValidator(Mock(), Mock())
+        validator.observe = AsyncMock(return_value='1.1.1.1')
+        async def blocked_transport(value):
+            await asyncio.sleep(30)
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        with self.assertRaises(RuntimeError) as caught:
+            await validator.validate(value, round_, blocked_transport, time.monotonic()+.02)
+        self.assertEqual(caught.exception.stage, 'transport')
+
+    async def test_total_deadline_retains_bootstrap_substage(self):
+        import asyncio
+        from unittest.mock import Mock
+        from mole_pkg.validation import ExitValidator
+        async def blocked_resolver(deadline):
+            await asyncio.sleep(30)
+        validator = ExitValidator(Mock(), Mock(), _resolve_targets=blocked_resolver)
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        with self.assertRaises(RuntimeError) as caught:
+            await validator.validate(value, round_, Mock(), time.monotonic()+.02)
+        self.assertEqual(caught.exception.stage, 'bootstrap')
+
+    async def test_nested_observer_deadlines_keep_the_innermost_stage(self):
+        import asyncio
+        from unittest.mock import Mock
+        from mole_pkg.validation import ExitValidator, validation_stage
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        for stage in ('admission', 'observation', 'cleanup'):
+            async def blocked_observer(*args):
+                with validation_stage('admission'):
+                    with validation_stage(stage):
+                        await asyncio.sleep(30)
+            validator = ExitValidator(Mock(), Mock())
+            validator.observe = blocked_observer
+            with self.subTest(stage=stage), self.assertRaises(RuntimeError) as caught:
+                await validator.validate(value, round_, Mock(), time.monotonic()+.02)
+            self.assertEqual(caught.exception.stage, stage)
+
+    async def test_transport_failure_has_fixed_stage_without_inner_message(self):
+        from unittest.mock import AsyncMock, Mock
+        from mole_pkg.validation import ExitValidator
+        validator = ExitValidator(Mock(), Mock())
+        validator.observe = AsyncMock(return_value='1.1.1.1')
+        transport = AsyncMock(side_effect=RuntimeError('secret-handshake-detail'))
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        with self.assertRaises(RuntimeError) as caught:
+            await validator.validate(value, round_, transport, time.monotonic() + 2)
+        self.assertEqual(getattr(caught.exception, 'stage', None), 'transport')
+        self.assertNotIn('secret-handshake-detail', str(caught.exception))
+
+    async def test_bootstrap_failure_is_identified_before_cgroup_creation(self):
+        from unittest.mock import AsyncMock, Mock
+        from mole_pkg.validation import ExitValidator
+        resolver = AsyncMock(side_effect=RuntimeError('secret-bootstrap-detail'))
+        validator = ExitValidator(Mock(), Mock(), _resolve_targets=resolver)
+        validator._create_cgroup = Mock()
+        value = attempt()
+        round_ = ValidationRound('c' * 64, value, time.monotonic())
+        with self.assertRaises(RuntimeError) as caught:
+            await validator.observe(value, round_, time.monotonic() + 2)
+        self.assertEqual(getattr(caught.exception, 'stage', None), 'bootstrap')
+        self.assertNotIn('secret-bootstrap-detail', str(caught.exception))
+        validator._create_cgroup.assert_not_called()
+
     async def test_oversized_timeout_and_secret_stderr_are_fixed_failures(self):
         import sys
         from mole_pkg.validation import bounded_json_command

@@ -21,7 +21,8 @@ from . import __version__
 from .config import Config
 from .constants import DEFAULT_CONFIG_FILE
 from .network import async_setup_namespace, async_disconnect_vpn, async_allow_vpn_server_ip, ValidationGate
-from .validation import Attempt, ExitValidator, AuthorizationDenied, configuration_digest
+from .validation import (Attempt, ExitValidator, AuthorizationDenied, configuration_digest,
+                         ValidationStageError, VALIDATION_STAGES)
 from .providers import PIAProvider, ProtonProvider
 from .services import QBittorrentClient
 from .utils import (
@@ -296,21 +297,28 @@ class Mole:
         gate, validator = self._validation_gate, self._validator
         provider = cast(ProtonProvider, self.provider)
         deadline = time.monotonic() + 20
+        stage = 'identity'
         try:
             if (gate is None or validator is None or attempt is None or attempt.generation != self.state.generation or
                     attempt.process_identity != _process_identity(os.getpid()) or
                     not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('stale validation identity')
+            stage = 'policy'
             revision = await validator.describe(self._validation_config_digest(), deadline)
             if revision != attempt.policy_revision:
                 raise RuntimeError('authorization policy changed')
+            stage = 'round'
             round_ = await gate.prepare_round(attempt)
+            stage = 'validation'
             evidence = await validator.validate(attempt, round_, self._validated_transport_evidence, deadline)
+            stage = 'identity'
             if (attempt != self._validation_attempt or attempt.generation != self.state.generation or
                     self.shutdown_event.is_set() or not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('late validation result')
+            stage = 'grant'
             await gate.authorize(attempt, round_, evidence,
                 current_check=lambda: provider.authorization_current(attempt.candidate))
+            stage = 'readback'
             if not await gate.verify_open(attempt):
                 raise RuntimeError('permission readback failed')
             self.state.authorization_ready = self.state.gate_open = True
@@ -323,6 +331,11 @@ class Mole:
             self.state.last_error = ''
             return True
         except (Exception, asyncio.CancelledError) as error:
+            if isinstance(error, ValidationStageError):
+                stage = error.stage if error.stage in VALIDATION_STAGES else 'validation'
+            outcome = ('cancelled' if isinstance(error, asyncio.CancelledError) else
+                       'denied' if isinstance(error, AuthorizationDenied) else 'failed')
+            log.warning('Validation %s at stage=%s', outcome, stage)
             self.state.authorization_ready = self.state.gate_open = False
             self.state.authorization_deadline = 0
             self.state.recovery_reason = ('authorization_denied' if isinstance(error, AuthorizationDenied)
@@ -332,6 +345,7 @@ class Mole:
                 try:
                     await gate.revoke(attempt)
                 except Exception:
+                    log.warning('Validation failed at stage=revoke')
                     await async_disconnect_vpn(self.config)
                     self.state.recovery_reason = 'enforcement_unavailable'
             if isinstance(error, asyncio.CancelledError):

@@ -10,6 +10,7 @@ import sys
 import time
 
 from .discovery import public_ipv4
+from .dns_health import healthy_reply
 
 ADAPTERS = {'api.ipify.org': '/?format=json', 'ifconfig.co': '/json'}
 LIMIT = 65536
@@ -113,16 +114,16 @@ def probe_dns(request):
     for server in servers:
         address = ipaddress.IPv4Address(server)
         identifier = os.urandom(2)
-        query = identifier + struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0) + b'\x07example\x03com\0\0\x01\0\x01'
+        label = b'mole-health-' + os.urandom(16).hex().encode('ascii')
+        question = bytes([len(label)]) + label + b'\x07example\x03com\0\0\x01\0\x01'
+        query = identifier + struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0) + question
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
             connection.settimeout(.7)
             try:
                 connection.connect((str(address), port))
                 connection.send(query)
                 response = connection.recv(4096)
-                if (len(response) >= 12 and response[:2] == identifier and
-                        response[2] & 0x80 and response[3] & 0x0f == 0 and
-                        struct.unpack('!H', response[6:8])[0] > 0):
+                if healthy_reply(response, query):
                     return {'dns_ready': True}
             except OSError:
                 continue

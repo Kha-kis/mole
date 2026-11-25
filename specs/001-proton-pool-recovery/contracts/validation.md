@@ -110,3 +110,18 @@ workloads; a degraded cleanup is an explicit operational failure.
 Threat model: trusted host administration and service supervisor. A privileged
 workload capable of rewriting netfilter or escaping cgroups is outside this
 boundary; this feature does not claim isolation from hostile host root.
+
+## Failure Diagnostics and Resolver Freshness
+
+Validation failure logs identify only a fixed implementation stage and outcome.
+Never interpolate exception messages, helper output, requests or account data.
+Classifying a failure must not change denial, cancellation, revocation, timeout
+or disconnect semantics. The aggregate readiness error remains compatible.
+
+DNS health queries the configured resolver with a fresh 128-bit random label
+under example.com, not a fixed cacheable name or a direct public resolver.
+Validate transaction, question, flags and complete bounded record framing.
+Accept a positive IPv4 answer or a well-formed SOA-backed negative response;
+empty local filtering responses, SERVFAIL, mismatched and truncated replies are
+not health evidence. Ordinary caching and filtering remain unchanged. This
+checks resolver/upstream behavior, not tracker registration or provider uptime.
