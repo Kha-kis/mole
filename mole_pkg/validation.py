@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 from .discovery import HEX, canonical_candidate, public_ipv4
 from .utils import log
+from .validation_worker import OBSERVATION_REASONS, TRANSIENT_OBSERVATION_REASONS
 
 
 class AuthorizationDenied(ValueError):
@@ -29,9 +30,30 @@ VALIDATION_STAGES = frozenset(('identity', 'policy', 'round', 'validation', 'boo
 
 class ValidationStageError(RuntimeError):
     """Only fixed identifiers, never inner errors or helper output, are public."""
-    def __init__(self, stage):
+    def __init__(self, stage, reason=None):
         self.stage = stage if stage in VALIDATION_STAGES else 'validation'
+        self.reason = reason if (self.stage == 'observation' and isinstance(reason, str) and
+                                 reason in OBSERVATION_REASONS) else None
+        self.retryable = self.reason in TRANSIENT_OBSERVATION_REASONS
         super().__init__('validation failed at ' + self.stage)
+
+
+def parse_observation_reply(reply, returncode, attempt, round_):
+    if (not isinstance(reply, dict) or reply.get('nonce') != attempt.nonce or
+            reply.get('round_id') != round_.id):
+        raise ValidationStageError('observation')
+    if returncode != 0:
+        if (set(reply) == {'error', 'reason', 'nonce', 'round_id'} and
+                reply.get('error') == 'observation_unavailable' and
+                isinstance(reply.get('reason'), str) and reply['reason'] in OBSERVATION_REASONS):
+            raise ValidationStageError('observation', reply['reason'])
+        raise ValidationStageError('observation')
+    if set(reply) != {'exit_ip', 'nonce', 'round_id'}:
+        raise ValidationStageError('observation')
+    try:
+        return public_ipv4(reply['exit_ip'])
+    except (ValueError, TypeError):
+        raise ValidationStageError('observation', 'response_invalid') from None
 
 
 @contextlib.contextmanager
@@ -208,10 +230,7 @@ class ExitValidator:
                         await process.stdin.drain()
                         process.stdin.close()
                         reply = await asyncio.wait_for(_json_line(process), min(10, deadline - time.monotonic()))
-                        if (await process.wait() != 0 or reply.get('nonce') != attempt.nonce or
-                                reply.get('round_id') != round_.id):
-                            raise RuntimeError('exit observation failed')
-                        return public_ipv4(reply.get('exit_ip'))
+                        return parse_observation_reply(reply, await process.wait(), attempt, round_)
         except asyncio.CancelledError as error:
             cancellation = error
             raise

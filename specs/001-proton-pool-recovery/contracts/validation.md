@@ -130,3 +130,30 @@ Accept a positive IPv4 answer or a well-formed SOA-backed negative response;
 empty local filtering responses, SERVFAIL, mismatched and truncated replies are
 not health evidence. Ordinary caching and filtering remain unchanged. This
 checks resolver/upstream behavior, not tracker registration or provider uptime.
+
+## Bounded Cold Observation Retries
+
+During cold-connect only, a fixed `network_timeout` or `network_unreachable`
+observation outcome may use another round for the same installed Attempt and
+generation. Nonzero helper replies must echo the current nonce and round ID,
+have exactly the supported fields and use an allowlisted reason. Unknown,
+malformed, contradictory, TLS-verification, explicit-denial, identity/policy,
+cleanup and enforcement failures are not transient retry permission.
+
+Before retry, successful cleanup/revocation and kernel readback must confirm
+empty workload/probe chains and no active grant. A readback or revocation failure
+attempts interface-down and aborts recovery, not another candidate. Cancellation
+propagates even if cleanup/disconnect fails; no background retry follows it.
+
+Use fresh rounds/fences and observations, at most three cold rounds, with at
+most one-second backoff. The absolute cold deadline is the earlier of the
+existing candidate/cycle deadline and VPN_READY_TIMEOUT from cold validation
+start. Each aggregate round remains at most twenty seconds; observation's
+parent cap remains ten seconds. The worker uses nine seconds internally to
+leave reply margin for sequential socket timeouts. Each adapter's request,
+headers and body share an absolute deadline of at most five seconds, capped by
+the worker deadline. The dedicated synchronous child owns a temporary POSIX
+alarm so slow-drip reads cannot reset that deadline. It refuses an already-owned
+timer and restores the previous handler; the controller owns no such alarm.
+Deadlines are not reset by
+retry, and ordinary permission refresh has no added retry loop.

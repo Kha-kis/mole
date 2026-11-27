@@ -250,6 +250,15 @@ class ValidationGate:
             self.active_round = None
 
     @_bounded_gate
+    async def verify_closed(self, attempt):
+        async with self.lock:
+            self._current(attempt)
+            entries = await self._verify_base()
+            return bool(self.deadline == 0 and self.active_round is None and not any(
+                entry.get('rule', {}).get('chain') in ('workload', 'probes_out', 'probes_in')
+                for entry in entries))
+
+    @_bounded_gate
     async def verify_open(self, attempt):
         async with self.lock:
             self._current(attempt)
