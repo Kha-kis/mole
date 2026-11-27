@@ -16,10 +16,59 @@ from types import MappingProxyType
 from typing import Any, Mapping
 
 from .discovery import HEX, canonical_candidate, public_ipv4
+from .utils import log
+from .validation_worker import OBSERVATION_REASONS, TRANSIENT_OBSERVATION_REASONS
 
 
 class AuthorizationDenied(ValueError):
     """A well-formed, identity-bound explicit policy denial."""
+
+
+VALIDATION_STAGES = frozenset(('identity', 'policy', 'round', 'validation', 'bootstrap',
+    'admission', 'observation', 'cleanup', 'transport', 'authorizer', 'evidence', 'grant', 'readback'))
+
+
+class ValidationStageError(RuntimeError):
+    """Only fixed identifiers, never inner errors or helper output, are public."""
+    def __init__(self, stage, reason=None):
+        self.stage = stage if stage in VALIDATION_STAGES else 'validation'
+        self.reason = reason if (self.stage == 'observation' and isinstance(reason, str) and
+                                 reason in OBSERVATION_REASONS) else None
+        self.retryable = self.reason in TRANSIENT_OBSERVATION_REASONS
+        super().__init__('validation failed at ' + self.stage)
+
+
+def parse_observation_reply(reply, returncode, attempt, round_):
+    if (not isinstance(reply, dict) or reply.get('nonce') != attempt.nonce or
+            reply.get('round_id') != round_.id):
+        raise ValidationStageError('observation')
+    if returncode != 0:
+        if (set(reply) == {'error', 'reason', 'nonce', 'round_id'} and
+                reply.get('error') == 'observation_unavailable' and
+                isinstance(reply.get('reason'), str) and reply['reason'] in OBSERVATION_REASONS):
+            raise ValidationStageError('observation', reply['reason'])
+        raise ValidationStageError('observation')
+    if set(reply) != {'exit_ip', 'nonce', 'round_id'}:
+        raise ValidationStageError('observation')
+    try:
+        return public_ipv4(reply['exit_ip'])
+    except (ValueError, TypeError):
+        raise ValidationStageError('observation', 'response_invalid') from None
+
+
+@contextlib.contextmanager
+def validation_stage(stage):
+    try:
+        yield
+    except asyncio.CancelledError as error:
+        # Preserve cancellation itself; wait_for retains it as the timeout cause.
+        if not hasattr(error, '_mole_validation_stage'):
+            error._mole_validation_stage = stage if stage in VALIDATION_STAGES else 'validation'
+        raise
+    except (AuthorizationDenied, ValidationStageError):
+        raise
+    except Exception:
+        raise ValidationStageError(stage) from None
 
 
 def configuration_digest(config):
@@ -148,55 +197,80 @@ class ExitValidator:
         return group
 
     async def observe(self, attempt, round_, deadline):
-        if self._resolve_targets is None:
-            targets_reply = await bounded_json_command(
-                [sys.executable, '-m', 'mole_pkg.validation_worker', 'resolve'], {},
-                min(3, deadline - time.monotonic()))
-            targets = targets_reply.get('targets')
-        else:
-            targets = await self._resolve_targets(deadline)
-        from .validation_worker import validate_targets
-        targets = validate_targets(targets)
-        group = self._create_cgroup(attempt, round_)
+        with validation_stage('bootstrap'):
+            if self._resolve_targets is None:
+                targets_reply = await bounded_json_command(
+                    [sys.executable, '-m', 'mole_pkg.validation_worker', 'resolve'], {},
+                    min(3, deadline - time.monotonic()))
+                targets = targets_reply.get('targets')
+            else:
+                targets = await self._resolve_targets(deadline)
+            from .validation_worker import validate_targets
+            targets = validate_targets(targets)
+        with validation_stage('admission'):
+            group = self._create_cgroup(attempt, round_)
+        cancellation = None
         try:
             command = self._observer_command or [sys.executable, '-m', 'mole_pkg.validation_worker']
-            async with owned_child(['ip', 'netns', 'exec', self.config.netns] + list(command)) as process:
-                ready = await asyncio.wait_for(_json_line(process), 2)
-                if ready != {'ready': True, 'pid': process.pid}:
-                    raise RuntimeError('observer barrier failed')
-                (group / 'cgroup.procs').write_text(str(process.pid))
-                expected = '0::/' + str(group.relative_to('/sys/fs/cgroup'))
-                if Path('/proc/{}/cgroup'.format(process.pid)).read_text().strip() != expected:
-                    raise RuntimeError('observer cgroup membership failed')
-                await self.gate.prepare_probe(attempt, round_, group, targets)
-                request = dict(targets=targets, nonce=attempt.nonce, round_id=round_.id)
-                if process.stdin is None:
-                    raise RuntimeError('observer input pipe unavailable')
-                process.stdin.write(json.dumps(request).encode() + b'\n')
-                await process.stdin.drain()
-                process.stdin.close()
-                reply = await asyncio.wait_for(_json_line(process), min(10, deadline - time.monotonic()))
-                if (await process.wait() != 0 or reply.get('nonce') != attempt.nonce or
-                        reply.get('round_id') != round_.id):
-                    raise RuntimeError('exit observation failed')
-                return public_ipv4(reply.get('exit_ip'))
+            with validation_stage('admission'):
+                async with owned_child(['ip', 'netns', 'exec', self.config.netns] + list(command)) as process:
+                    ready = await asyncio.wait_for(_json_line(process), 2)
+                    if ready != {'ready': True, 'pid': process.pid}:
+                        raise RuntimeError('observer barrier failed')
+                    (group / 'cgroup.procs').write_text(str(process.pid))
+                    expected = '0::/' + str(group.relative_to('/sys/fs/cgroup'))
+                    if Path('/proc/{}/cgroup'.format(process.pid)).read_text().strip() != expected:
+                        raise RuntimeError('observer cgroup membership failed')
+                    await self.gate.prepare_probe(attempt, round_, group, targets)
+                    with validation_stage('observation'):
+                        request = dict(targets=targets, nonce=attempt.nonce, round_id=round_.id)
+                        if process.stdin is None:
+                            raise RuntimeError('observer input pipe unavailable')
+                        process.stdin.write(json.dumps(request).encode() + b'\n')
+                        await process.stdin.drain()
+                        process.stdin.close()
+                        reply = await asyncio.wait_for(_json_line(process), min(10, deadline - time.monotonic()))
+                        return parse_observation_reply(reply, await process.wait(), attempt, round_)
+        except asyncio.CancelledError as error:
+            cancellation = error
+            raise
         finally:
             # Remove identity permissions before allowing inode/cgroup reuse.
-            await self.gate.remove_probe(attempt, round_)
-            group.rmdir()
+            try:
+                with validation_stage('cleanup'):
+                    await self.gate.remove_probe(attempt, round_)
+                    group.rmdir()
+            except (Exception, asyncio.CancelledError):
+                if cancellation is None:
+                    raise
+                log.warning('Validation cleanup failed during cancellation')
+                cancellation._mole_validation_stage = 'cleanup'
+                raise cancellation from None
 
     async def validate(self, attempt, round_, transport_probe, deadline):
+        stage = 'observation'
         async def execute():
+            nonlocal stage
             exit_ip = await self.observe(attempt, round_, deadline)
-            transport_deadline = await transport_probe(attempt)
-            executable = trusted_executable(self.config.get('PROTON_EXIT_VALIDATOR', ''))
-            response = await bounded_json_command([executable], dict(
-                operation='validate', attempt=attempt.to_dict(), round_id=round_.id,
-                exit_ip=exit_ip, policy_revision=attempt.policy_revision,
-                config_digest=configuration_digest(self.config)), deadline - time.monotonic())
-            return parse_evidence(response, round_, exit_ip, now_wall=time.time(), now_mono=time.monotonic(),
-                                  transport_deadline=transport_deadline)
-        return await asyncio.wait_for(execute(), deadline - time.monotonic())
+            stage = 'transport'
+            with validation_stage(stage):
+                transport_deadline = await transport_probe(attempt)
+            stage = 'authorizer'
+            with validation_stage(stage):
+                executable = trusted_executable(self.config.get('PROTON_EXIT_VALIDATOR', ''))
+                response = await bounded_json_command([executable], dict(
+                    operation='validate', attempt=attempt.to_dict(), round_id=round_.id,
+                    exit_ip=exit_ip, policy_revision=attempt.policy_revision,
+                    config_digest=configuration_digest(self.config)), deadline - time.monotonic())
+            stage = 'evidence'
+            with validation_stage(stage):
+                return parse_evidence(response, round_, exit_ip, now_wall=time.time(), now_mono=time.monotonic(),
+                                      transport_deadline=transport_deadline)
+        try:
+            return await asyncio.wait_for(execute(), deadline - time.monotonic())
+        except asyncio.TimeoutError as error:
+            interrupted = getattr(error.__cause__, '_mole_validation_stage', stage)
+            raise ValidationStageError(interrupted) from None
 
 
 def _finite(value: Any, minimum=0) -> float:

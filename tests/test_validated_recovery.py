@@ -91,6 +91,59 @@ class ValidatedLifecycle(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.calls, ['fence', 'revoke'])
         self.mole._restart_torrent_service.assert_not_awaited()
 
+    async def test_validation_failure_logs_stage_without_exception_content(self):
+        self.mole._validator.validate.side_effect = RuntimeError('secret-account-token')
+        with patch('mole_pkg.mole.log.warning') as warning:
+            self.assertFalse(await self.mole._validate_current_attempt())
+        text = ' '.join(str(call) for call in warning.call_args_list)
+        self.assertIn('validation', text)
+        self.assertNotIn('secret-account-token', text)
+        self.assertEqual(self.calls, ['fence', 'revoke'])
+        self.assertEqual(self.mole.state.last_error, 'validation_failed')
+
+    async def test_cancelled_probe_cleanup_failure_revokes_and_never_returns_a_retry(self):
+        from contextlib import asynccontextmanager
+        from mole_pkg.validation import ExitValidator
+        for revoke_failure in (False, True):
+            with self.subTest(revoke_failure=revoke_failure):
+                cancelled = asyncio.CancelledError()
+                @asynccontextmanager
+                async def child(command):
+                    raise cancelled
+                    yield
+                validator = ExitValidator(self.mole.config, self.gate, _resolve_targets=AsyncMock(return_value=[
+                    dict(host='api.ipify.org', path='/?format=json', ip='1.1.1.1')]))
+                validator.describe = AsyncMock(return_value='b' * 64)
+                group = Mock()
+                validator._create_cgroup = Mock(return_value=group)
+                self.mole._validator = validator
+                self.gate.remove_probe = AsyncMock(side_effect=OSError('secret-cleanup-detail'))
+                self.gate.revoke = AsyncMock(side_effect=OSError('secret-revoke-detail') if revoke_failure else None)
+                self.mole._restart_torrent_service = AsyncMock()
+                with patch('mole_pkg.validation.owned_child', child), \
+                        patch('mole_pkg.mole.async_disconnect_vpn', new=AsyncMock()) as down, \
+                        patch('mole_pkg.utils.log.warning') as warning, \
+                        self.assertRaises(asyncio.CancelledError) as caught:
+                    await self.mole._validate_current_attempt()
+                self.assertIs(caught.exception, cancelled)
+                self.gate.revoke.assert_awaited_once_with(self.attempt)
+                self.gate.authorize.assert_not_awaited()
+                self.assertFalse(self.mole.state.authorization_ready)
+                self.assertFalse(self.mole.state.gate_open)
+                self.assertEqual(down.await_count, int(revoke_failure))
+                self.mole._restart_torrent_service.assert_not_awaited()
+                group.rmdir.assert_not_called()
+                self.assertNotIn('secret-', str(warning.call_args_list))
+
+    async def test_enforcement_failure_reports_failed_step_and_still_revokes(self):
+        self.gate.authorize.side_effect = RuntimeError('secret-gate-detail')
+        with patch('mole_pkg.mole.log.warning') as warning:
+            self.assertFalse(await self.mole._validate_current_attempt())
+        text = ' '.join(str(call) for call in warning.call_args_list)
+        self.assertIn('grant', text)
+        self.assertNotIn('secret-gate-detail', text)
+        self.assertIn('revoke', self.calls)
+
     async def test_dns_failure_is_repaired_locally_without_rotating_peer(self):
         self.mole.state.authorization_ready = self.mole.state.gate_open = True
         self.mole.state.authorization_deadline = time.monotonic() + 90

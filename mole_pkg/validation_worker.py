@@ -1,18 +1,32 @@
 """Fixed exit adapters. The observer waits for cgroup admission before sockets."""
 import ctypes
+import contextlib
+import errno
 import http.client
 import json
 import os
+import signal
 import socket
 import ssl
 import struct
 import sys
 import time
 
-from .discovery import public_ipv4
+from .discovery import HEX, public_ipv4
+from .dns_health import healthy_reply
 
 ADAPTERS = {'api.ipify.org': '/?format=json', 'ifconfig.co': '/json'}
 LIMIT = 65536
+TRANSIENT_OBSERVATION_REASONS = frozenset(('network_timeout', 'network_unreachable'))
+OBSERVATION_REASONS = TRANSIENT_OBSERVATION_REASONS | frozenset((
+    'tls_failed', 'http_rejected', 'response_invalid', 'conflicting_exits', 'observer_failed'))
+
+
+class ObservationFailure(ValueError):
+    """A fixed reason, never a response body or underlying exception message."""
+    def __init__(self, reason):
+        self.reason = reason if isinstance(reason, str) and reason in OBSERVATION_REASONS else 'observer_failed'
+        super().__init__(self.reason)
 
 
 def validate_targets(targets):
@@ -69,6 +83,35 @@ class BoundHTTPS(http.client.HTTPSConnection):
             raise
 
 
+@contextlib.contextmanager
+def observer_timeout(seconds):
+    """The dedicated synchronous observer owns its timer, not another process."""
+    if seconds <= 0:
+        raise TimeoutError
+    if any(signal.getitimer(signal.ITIMER_REAL)):
+        raise RuntimeError('observer timer already owned')
+    previous = signal.getsignal(signal.SIGALRM)
+    def expired(signum, frame):
+        raise TimeoutError
+    signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, seconds)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def _observer_remaining(connection, deadline):
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError
+    connection.timeout = remaining
+    if connection.sock is not None:
+        connection.sock.settimeout(remaining)
+    return remaining
+
+
 def observe(targets):
     validate_targets(targets)
     # Do not retain namespace/firewall administration after admission.
@@ -78,30 +121,61 @@ def observe(targets):
         os.setuid(65534)
     if ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0) != 0:
         raise RuntimeError('cannot restrict observer privileges')
-    deadline = time.monotonic() + 10
+    # Leave time for the fixed JSON reply before the parent's ten-second cap.
+    deadline = time.monotonic() + 9
     values = []
+    failures = []
     for target in targets:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             break
+        adapter_deadline = min(deadline, time.monotonic() + 5)
         connection = BoundHTTPS(target, min(5, remaining))
         try:
-            connection.request('GET', target['path'], headers={'Accept': 'application/json',
-                               'User-Agent': 'mole-exit-validation/1', 'Connection': 'close'})
-            response = connection.getresponse()
-            if response.status != 200:
-                continue
-            data = response.read(LIMIT + 1)
+            with observer_timeout(_observer_remaining(connection, adapter_deadline)):
+                connection.request('GET', target['path'], headers={'Accept': 'application/json',
+                                   'User-Agent': 'mole-exit-validation/1', 'Connection': 'close'})
+                _observer_remaining(connection, adapter_deadline)
+                response = connection.getresponse()
+                if response.status != 200:
+                    failures.append('http_rejected')
+                    continue
+                _observer_remaining(connection, adapter_deadline)
+                data = response.read(LIMIT + 1)
+                _observer_remaining(connection, adapter_deadline)
             if len(data) > LIMIT:
-                raise ValueError('oversized probe response')
-            value = json.loads(data)
-            public_ipv4(value.get('ip'))
+                raise ObservationFailure('response_invalid')
+            try:
+                value = json.loads(data)
+                if not isinstance(value, dict):
+                    raise ValueError
+                public_ipv4(value.get('ip'))
+            except (ValueError, TypeError):
+                raise ObservationFailure('response_invalid') from None
             values.append(value)
-        except (OSError, http.client.HTTPException):
-            continue
+        except ssl.SSLError:
+            raise ObservationFailure('tls_failed') from None
+        except (TimeoutError, socket.timeout):
+            failures.append('network_timeout')
+        except OSError as error:
+            if isinstance(error, ConnectionError) or error.errno in (
+                    errno.ENETUNREACH, errno.EHOSTUNREACH, errno.ENETDOWN,
+                    errno.ECONNRESET, errno.ECONNREFUSED, errno.ETIMEDOUT, errno.EPIPE):
+                failures.append('network_unreachable')
+            else:
+                raise ObservationFailure('observer_failed') from None
+        except http.client.HTTPException:
+            raise ObservationFailure('response_invalid') from None
         finally:
             connection.close()
-    return parse_observations(values)
+    if not values:
+        reason = next((item for item in failures if item not in TRANSIENT_OBSERVATION_REASONS),
+                      failures[0] if failures else 'observer_failed')
+        raise ObservationFailure(reason)
+    try:
+        return parse_observations(values)
+    except ValueError:
+        raise ObservationFailure('conflicting_exits') from None
 
 
 def probe_dns(request):
@@ -113,16 +187,16 @@ def probe_dns(request):
     for server in servers:
         address = ipaddress.IPv4Address(server)
         identifier = os.urandom(2)
-        query = identifier + struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0) + b'\x07example\x03com\0\0\x01\0\x01'
+        label = b'mole-health-' + os.urandom(16).hex().encode('ascii')
+        question = bytes([len(label)]) + label + b'\x07example\x03com\0\0\x01\0\x01'
+        query = identifier + struct.pack('!HHHHH', 0x0100, 1, 0, 0, 0) + question
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as connection:
             connection.settimeout(.7)
             try:
                 connection.connect((str(address), port))
                 connection.send(query)
                 response = connection.recv(4096)
-                if (len(response) >= 12 and response[:2] == identifier and
-                        response[2] & 0x80 and response[3] & 0x0f == 0 and
-                        struct.unpack('!H', response[6:8])[0] > 0):
+                if healthy_reply(response, query):
                     return {'dns_ready': True}
             except OSError:
                 continue
@@ -130,6 +204,7 @@ def probe_dns(request):
 
 
 def main():
+    request = None
     try:
         if sys.argv[1:] == ['resolve']:
             result = {'targets': resolve()}
@@ -145,12 +220,22 @@ def main():
             if len(line) > LIMIT:
                 raise ValueError
             request = json.loads(line)
+            if (not isinstance(request, dict) or any(not isinstance(request.get(key), str) or
+                    not HEX.fullmatch(request[key]) for key in ('nonce', 'round_id'))):
+                raise ValueError
             result = dict(exit_ip=observe(request['targets']), nonce=request['nonce'],
                           round_id=request['round_id'])
         else:
             raise ValueError
         print(json.dumps(result), flush=True)
         return 0
+    except ObservationFailure as error:
+        if isinstance(request, dict):
+            print(json.dumps(dict(error='observation_unavailable', reason=error.reason,
+                nonce=request['nonce'], round_id=request['round_id'])), flush=True)
+        else:
+            print(json.dumps({'error': 'observation_unavailable'}), flush=True)
+        return 1
     except Exception:
         print(json.dumps({'error': 'observation_unavailable'}), flush=True)
         return 1

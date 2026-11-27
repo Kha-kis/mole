@@ -48,6 +48,27 @@ class ValidationGateTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await gate.authorize(attempt(), None, {})
 
+    async def test_closed_readback_requires_empty_workload_and_probe_chains(self):
+        gate = self.gate()
+        gate.attempt = value = attempt()
+        gate._verify_base = AsyncMock(return_value=[])
+        self.assertTrue(await gate.verify_closed(value))
+        for chain in ('workload', 'probes_out', 'probes_in'):
+            gate._verify_base.return_value = [{'rule': dict(chain=chain)}]
+            self.assertFalse(await gate.verify_closed(value))
+        gate._verify_base.return_value = []
+        gate.deadline = time.monotonic()+60
+        self.assertFalse(await gate.verify_closed(value))
+
+    async def test_closed_readback_rejects_stale_owner_and_unknown_kernel_state(self):
+        gate = self.gate()
+        with self.assertRaises(RuntimeError):
+            await gate.verify_closed(attempt())
+        gate.attempt = value = attempt()
+        gate._verify_base = AsyncMock(side_effect=RuntimeError('private-kernel'))
+        with self.assertRaises(RuntimeError):
+            await gate.verify_closed(value)
+
     async def test_pending_round_does_not_hide_the_previous_current_permission(self):
         gate = self.gate()
         value = attempt()

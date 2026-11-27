@@ -21,7 +21,8 @@ from . import __version__
 from .config import Config
 from .constants import DEFAULT_CONFIG_FILE
 from .network import async_setup_namespace, async_disconnect_vpn, async_allow_vpn_server_ip, ValidationGate
-from .validation import Attempt, ExitValidator, AuthorizationDenied, configuration_digest
+from .validation import (Attempt, ExitValidator, AuthorizationDenied, configuration_digest,
+                         ValidationStageError, VALIDATION_STAGES)
 from .providers import PIAProvider, ProtonProvider
 from .services import QBittorrentClient
 from .utils import (
@@ -291,26 +292,34 @@ class Mole:
         # This follows a successful bound HTTPS observation in the same round.
         return time.monotonic() + 120
 
-    async def _validate_current_attempt(self):
+    async def _validate_current_attempt(self, deadline=None):
+        self._validation_failure = None
         attempt = self._validation_attempt
         gate, validator = self._validation_gate, self._validator
         provider = cast(ProtonProvider, self.provider)
-        deadline = time.monotonic() + 20
+        deadline = min(time.monotonic() + 20, deadline) if deadline is not None else time.monotonic() + 20
+        stage = 'identity'
         try:
             if (gate is None or validator is None or attempt is None or attempt.generation != self.state.generation or
                     attempt.process_identity != _process_identity(os.getpid()) or
                     not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('stale validation identity')
+            stage = 'policy'
             revision = await validator.describe(self._validation_config_digest(), deadline)
             if revision != attempt.policy_revision:
                 raise RuntimeError('authorization policy changed')
+            stage = 'round'
             round_ = await gate.prepare_round(attempt)
+            stage = 'validation'
             evidence = await validator.validate(attempt, round_, self._validated_transport_evidence, deadline)
+            stage = 'identity'
             if (attempt != self._validation_attempt or attempt.generation != self.state.generation or
                     self.shutdown_event.is_set() or not provider.authorization_current(attempt.candidate)):
                 raise RuntimeError('late validation result')
+            stage = 'grant'
             await gate.authorize(attempt, round_, evidence,
                 current_check=lambda: provider.authorization_current(attempt.candidate))
+            stage = 'readback'
             if not await gate.verify_open(attempt):
                 raise RuntimeError('permission readback failed')
             self.state.authorization_ready = self.state.gate_open = True
@@ -323,6 +332,14 @@ class Mole:
             self.state.last_error = ''
             return True
         except (Exception, asyncio.CancelledError) as error:
+            if isinstance(error, ValidationStageError):
+                stage = error.stage if error.stage in VALIDATION_STAGES else 'validation'
+            outcome = ('cancelled' if isinstance(error, asyncio.CancelledError) else
+                       'denied' if isinstance(error, AuthorizationDenied) else 'failed')
+            if isinstance(error, ValidationStageError) and error.reason is not None:
+                log.warning('Validation %s at stage=%s reason=%s', outcome, stage, error.reason)
+            else:
+                log.warning('Validation %s at stage=%s', outcome, stage)
             self.state.authorization_ready = self.state.gate_open = False
             self.state.authorization_deadline = 0
             self.state.recovery_reason = ('authorization_denied' if isinstance(error, AuthorizationDenied)
@@ -331,14 +348,67 @@ class Mole:
             if attempt is not None and gate is not None:
                 try:
                     await gate.revoke(attempt)
-                except Exception:
-                    await async_disconnect_vpn(self.config)
+                    if isinstance(error, ValidationStageError):
+                        self._validation_failure = error
+                except (Exception, asyncio.CancelledError) as cleanup_error:
+                    log.warning('Validation failed at stage=revoke')
                     self.state.recovery_reason = 'enforcement_unavailable'
+                    try:
+                        await async_disconnect_vpn(self.config)
+                    except (Exception, asyncio.CancelledError) as disconnect_error:
+                        if isinstance(error, asyncio.CancelledError):
+                            raise error from None
+                        if isinstance(cleanup_error, asyncio.CancelledError):
+                            raise cleanup_error from None
+                        if isinstance(disconnect_error, asyncio.CancelledError):
+                            raise disconnect_error from None
+                        raise RuntimeError('validation disconnect failed') from None
+                    if isinstance(cleanup_error, asyncio.CancelledError):
+                        raise cleanup_error
             if isinstance(error, asyncio.CancelledError):
                 raise
             return False
         finally:
             self._publish_readiness()
+
+    async def _wait_for_validated_readiness(self, attempt):
+        deadline = min(time.monotonic() + self.config.vpn_ready_timeout, attempt.deadline)
+        for index in range(3):
+            if (time.monotonic() >= deadline or self.shutdown_event.is_set() or
+                    attempt != self._validation_attempt or attempt.generation != self.state.generation or
+                    attempt.process_identity != _process_identity(os.getpid()) or
+                    not self.provider.authorization_current(attempt.candidate)):
+                return False
+            try:
+                ready = await asyncio.wait_for(self._validate_current_attempt(deadline),
+                                               max(0, deadline - time.monotonic()))
+            except asyncio.TimeoutError:
+                if self.state.recovery_reason == 'enforcement_unavailable':
+                    raise RuntimeError('validation enforcement unavailable') from None
+                return False
+            if ready:
+                return True
+            if self.state.recovery_reason == 'enforcement_unavailable':
+                raise RuntimeError('validation enforcement unavailable')
+            failure = getattr(self, '_validation_failure', None)
+            if index == 2 or not isinstance(failure, ValidationStageError) or not failure.retryable:
+                return False
+            if time.monotonic() >= deadline:
+                return False
+            try:
+                closed = await asyncio.wait_for(self._validation_gate.verify_closed(attempt),
+                                                deadline - time.monotonic())
+            except Exception:
+                closed = False
+            if closed is not True:
+                self.state.recovery_reason = 'enforcement_unavailable'
+                try:
+                    await async_disconnect_vpn(self.config)
+                except Exception:
+                    raise RuntimeError('validation disconnect failed') from None
+                raise RuntimeError('closed validation gate not verified')
+            await asyncio.sleep(min(1, max(0, deadline - time.monotonic())))
+        return False
 
     async def _validation_refresh_loop(self):
         while not self.shutdown_event.is_set():
@@ -956,7 +1026,7 @@ class Mole:
             attempt = self._validation_attempt
             if attempt is None or peer_key != attempt.candidate['public_key']:
                 raise RuntimeError('generated peer differs from validated candidate')
-            ready = await self._validate_current_attempt()
+            ready = await self._wait_for_validated_readiness(attempt)
             if ready:
                 self._validation_task = asyncio.create_task(self._validation_refresh_loop())
         else:
